@@ -7,81 +7,380 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; }
-        .result-card { margin-top: 20px; }
         .price-up { color: #dc3545; font-weight: bold; }
         .price-down { color: #198754; font-weight: bold; }
         .price-neutral { color: #6c757d; font-weight: bold; }
-        .container { max-width: 600px; margin-top: 50px; }
+        .main-container { margin-top: 30px; margin-bottom: 40px; }
+        .card-title-small { font-size: 1rem; }
+        @media (min-width: 992px) {
+            .main-container { margin-top: 40px; }
+        }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <div class="card shadow-sm">
-        <div class="card-header bg-primary text-white">
-            <h3 class="mb-0">8848 Strategy Analyzer</h3>
-        </div>
-        <div class="card-body">
-            <form action="/analyze" method="post">
-                <div class="mb-3">
-                    <label for="stock_code" class="form-label">Stock Code (e.g., 600519 or 000001)</label>
-                    <input type="text" class="form-control" id="stock_code" name="stock_code" placeholder="Enter Stock Code" required value="{{ last_code }}">
-                </div>
-                <button type="submit" class="btn btn-primary w-100">Analyze</button>
-            </form>
-        </div>
-    </div>
-
-    {% if result %}
-        {% if result.error %}
-            <div class="alert alert-danger mt-3" role="alert">
-                Error: {{ result.error }}
-            </div>
-        {% else %}
-            <div class="card result-card shadow-sm">
-                <div class="card-header bg-light">
-                    <h5 class="mb-0">{{ result.name }} ({{ result.code }})</h5>
+<div class="container-fluid main-container">
+    <div class="row g-3">
+        <!-- 左侧：单股查询 + 当前结果 + 最近5日 -->
+        <div class="col-12 col-lg-7">
+            <div class="card shadow-sm mb-3">
+                <div class="card-header bg-primary text-white">
+                    <h3 class="mb-0">8848 Strategy Analyzer</h3>
                 </div>
                 <div class="card-body">
-                    <div class="row text-center mb-3">
-                        <div class="col">
-                            <small class="text-muted">Current Price</small>
-                            <h2 class="price-neutral">{{ result.current_price }}</h2>
+                    <form id="analyze-form" action="/analyze" method="post">
+                        <div class="mb-3">
+                            <label for="stock_code" class="form-label">Stock Code (e.g., 600519 or 000001)</label>
+                            <input type="text" class="form-control" id="stock_code" name="stock_code"
+                                   placeholder="Enter Stock Code" required value="{{ last_code }}">
                         </div>
-                        <div class="col">
-                            <small class="text-muted">Avg Price (ZSTJJ)</small>
-                            <h4 class="text-secondary">{{ result.avg_price }}</h4>
-                        </div>
-                    </div>
-
-                    <ul class="list-group list-group-flush">
-                        <li class="list-group-item d-flex justify-content-between align-items-center bg-danger-subtle">
-                            <span>High / Resistance (Avg / 0.98848)</span>
-                            <span class="fs-5 price-up">{{ result.upper_line }}</span>
-                        </li>
-                        <li class="list-group-item d-flex justify-content-between align-items-center bg-success-subtle">
-                            <span>Low / Support (Avg * 0.98848)</span>
-                            <span class="fs-5 price-down">{{ result.lower_line }}</span>
-                        </li>
-                    </ul>
-                    
-                    <div class="mt-3 text-center">
-                        <small class="text-muted">
-                            {% if result.current_price > result.upper_line %}
-                                <span class="badge bg-danger">Overbought? (Above Red Line)</span>
-                            {% elif result.current_price < result.lower_line %}
-                                <span class="badge bg-success">Oversold? (Below Green Line)</span>
-                            {% else %}
-                                <span class="badge bg-secondary">Neutral Zone</span>
-                            {% endif %}
-                        </small>
-                    </div>
+                        <button id="analyze-btn" type="submit" class="btn btn-primary w-100 mb-2">Analyze</button>
+                    </form>
+                    <p class="text-muted small mb-0">
+                        支持 A 股代码（如 600519、000001），实时计算当日均价及 8848 上下轨。
+                    </p>
                 </div>
             </div>
-        {% endif %}
-    {% endif %}
+
+            {% if result %}
+                {% if result.error %}
+                    <div class="alert alert-danger" role="alert">
+                        Error: {{ result.error }}
+                    </div>
+                {% else %}
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header bg-light">
+                            <h5 class="mb-0">{{ result.name }} ({{ result.code }})</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="row text-center mb-3">
+                                <div class="col-6">
+                                    <small class="text-muted">Current Price</small>
+                                    <h2 class="price-neutral mb-0">{{ result.current_price }}</h2>
+                                </div>
+                                <div class="col-6">
+                                    <small class="text-muted">Avg Price (ZSTJJ)</small>
+                                    <h4 class="text-secondary mb-0">{{ result.avg_price }}</h4>
+                                </div>
+                            </div>
+
+                            <ul class="list-group list-group-flush">
+                                <li class="list-group-item d-flex justify-content-between align-items-center bg-danger-subtle">
+                                    <span>High / Resistance (Avg / 0.98848)</span>
+                                    <span class="fs-5 price-up">{{ result.upper_line }}</span>
+                                </li>
+                                <li class="list-group-item d-flex justify-content-between align-items-center bg-success-subtle">
+                                    <span>Low / Support (Avg * 0.98848)</span>
+                                    <span class="fs-5 price-down">{{ result.lower_line }}</span>
+                                </li>
+                            </ul>
+
+                            <div class="mt-3 text-center">
+                                <small class="text-muted">
+                                    {% if result.current_price > result.upper_line %}
+                                        <span class="badge bg-danger">Overbought? (Above Red Line)</span>
+                                    {% elif result.current_price < result.lower_line %}
+                                        <span class="badge bg-success">Oversold? (Below Green Line)</span>
+                                    {% else %}
+                                        <span class="badge bg-secondary">Neutral Zone</span>
+                                    {% endif %}
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                {% endif %}
+            {% endif %}
+
+            {# 最近 5 个交易日峰值/低值区域，占位，后端提供 history_results 后生效 #}
+            {% if history_results %}
+                <div class="card shadow-sm">
+                    <div class="card-header bg-white">
+                        <h6 class="mb-0">最近 5 个交易日 8848 区间</h6>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="table-responsive">
+                            <table class="table table-striped table-sm mb-0">
+                                <thead>
+                                <tr>
+                                    <th scope="col">日期</th>
+                                    <th scope="col">收盘价</th>
+                                    <th scope="col">日均价</th>
+                                    <th scope="col">上轨</th>
+                                    <th scope="col">下轨</th>
+                                    <th scope="col">状态</th>
+                                </tr>
+                                </thead>
+                                <tbody>
+                                {% for item in history_results %}
+                                    <tr>
+                                        <td>{{ item.date }}</td>
+                                        <td>{{ item.close }}</td>
+                                        <td>{{ item.avg_price }}</td>
+                                        <td>{{ item.upper_line }}</td>
+                                        <td>{{ item.lower_line }}</td>
+                                        <td>
+                                            {% if item.position == 'high' %}
+                                                <span class="badge bg-danger">高位</span>
+                                            {% elif item.position == 'low' %}
+                                                <span class="badge bg-success">低位</span>
+                                            {% else %}
+                                                <span class="badge bg-secondary">中性</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            {% endif %}
+        </div>
+
+        <!-- 右侧：常用股票 + 批量分析 + 历史查询记录 -->
+        <div class="col-12 col-lg-5">
+            <div class="card shadow-sm mb-3">
+                <div class="card-header bg-white d-flex justify-content-between align-items-center">
+                    <span class="card-title-small fw-semibold">常用股票</span>
+                </div>
+                <div class="card-body">
+                    {% if common_stocks %}
+                        <div class="table-responsive mb-2">
+                            <table class="table table-sm table-hover mb-0">
+                                <thead>
+                                <tr>
+                                    <th scope="col">代码</th>
+                                    <th scope="col">名称</th>
+                                </tr>
+                                </thead>
+                                <tbody>
+                                {% for s in common_stocks %}
+                                    <tr>
+                                        <td>{{ s.code }}</td>
+                                        <td>{{ s.name }}</td>
+                                    </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        <form id="batch-form" action="/analyze_batch" method="post">
+                            <button id="batch-btn" type="submit" class="btn btn-outline-primary btn-sm w-100">
+                                批量分析常用股票
+                            </button>
+                        </form>
+                    {% else %}
+                        <p class="text-muted small mb-0">
+                            未配置常用股票，可在 <code>.env</code> 中设置
+                            <code>COMMON_STOCK_CODES=600519,000001,300750</code>。
+                        </p>
+                    {% endif %}
+                </div>
+            </div>
+
+            {% if batch_results %}
+                <div class="card shadow-sm mb-3">
+                    <div class="card-header bg-white">
+                        <h6 class="mb-0">批量分析结果</h6>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="table-responsive">
+                            <table class="table table-striped table-sm mb-0">
+                                <thead>
+                                <tr>
+                                    <th scope="col">代码</th>
+                                    <th scope="col">名称</th>
+                                    <th scope="col">当前价</th>
+                                    <th scope="col">均价</th>
+                                    <th scope="col">上轨</th>
+                                    <th scope="col">下轨</th>
+                                </tr>
+                                </thead>
+                                <tbody>
+                                {% for r in batch_results %}
+                                    <tr>
+                                        <td>{{ r.code }}</td>
+                                        <td>{{ r.name }}</td>
+                                        <td>{{ r.current_price }}</td>
+                                        <td>{{ r.avg_price }}</td>
+                                        <td>{{ r.upper_line }}</td>
+                                        <td>{{ r.lower_line }}</td>
+                                    </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            {% endif %}
+
+            <div class="card shadow-sm">
+                <div class="card-header bg-white d-flex justify-content-between align-items-center">
+                    <span class="card-title-small fw-semibold">历史查询记录（本机浏览器）</span>
+                    <button id="clear-history" type="button" class="btn btn-link btn-sm text-danger p-0">
+                        清空
+                    </button>
+                </div>
+                <div class="card-body">
+                    <ul id="history-list" class="list-group small">
+                        <!-- 由 JS 填充 -->
+                    </ul>
+                    <p class="text-muted small mt-2 mb-0">
+                        仅保存在当前浏览器中，最多保留最近 50 条。
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    (function () {
+        const STORAGE_KEY = 'md_history';
+        const MAX_ITEMS = 50;
+
+        function loadHistory() {
+            try {
+                const raw = localStorage.getItem(STORAGE_KEY);
+                if (!raw) return [];
+                const parsed = JSON.parse(raw);
+                return Array.isArray(parsed) ? parsed : [];
+            } catch (e) {
+                console.warn('Failed to parse history from localStorage', e);
+                localStorage.removeItem(STORAGE_KEY);
+                return [];
+            }
+        }
+
+        function saveHistory(list) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, MAX_ITEMS)));
+            } catch (e) {
+                console.warn('Failed to save history to localStorage', e);
+            }
+        }
+
+        function renderHistory() {
+            const container = document.getElementById('history-list');
+            if (!container) return;
+
+            const list = loadHistory();
+            container.innerHTML = '';
+
+            if (list.length === 0) {
+                const li = document.createElement('li');
+                li.className = 'list-group-item text-muted text-center';
+                li.textContent = '暂无历史记录';
+                container.appendChild(li);
+                return;
+            }
+
+            list.forEach(item => {
+                const li = document.createElement('li');
+                li.className = 'list-group-item d-flex justify-content-between align-items-center';
+
+                const info = document.createElement('div');
+                info.className = 'me-2';
+                const display = item.name ? (item.name + ' (' + item.code + ')') : item.code;
+                info.innerHTML = '<div class="fw-semibold">' + display + '</div>' +
+                    '<div class="text-muted small">' + (item.time || '') + '</div>';
+
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'btn btn-outline-primary btn-sm';
+                btn.textContent = '再次查询';
+                btn.addEventListener('click', function () {
+                    const input = document.getElementById('stock_code');
+                    if (!input) return;
+                    input.value = item.code;
+                    input.form && input.form.submit();
+                });
+
+                li.appendChild(info);
+                li.appendChild(btn);
+                container.appendChild(li);
+            });
+        }
+
+        function appendCurrentToHistory() {
+            try {
+                const input = document.getElementById('stock_code');
+                if (!input || !input.value) return;
+
+                const code = input.value.trim();
+                if (!code) return;
+
+                // 从当前结果卡片标题中尝试解析股票名称，例如 “贵州茅台 (600519)”
+                let name = '';
+                const titleEl = document.querySelector('.card-header.bg-light h5');
+                if (titleEl && titleEl.textContent) {
+                    const text = titleEl.textContent.trim();
+                    const idx = text.lastIndexOf('(');
+                    if (idx > 0) {
+                        name = text.slice(0, idx).trim();
+                    }
+                }
+
+                const now = new Date();
+                const time = now.getFullYear() + '-' +
+                    String(now.getMonth() + 1).padStart(2, '0') + '-' +
+                    String(now.getDate()).padStart(2, '0') + ' ' +
+                    String(now.getHours()).padStart(2, '0') + ':' +
+                    String(now.getMinutes()).padStart(2, '0');
+
+                const list = loadHistory();
+                const filtered = list.filter(item => item.code !== code);
+                filtered.unshift({code: code, name: name, time: time});
+                saveHistory(filtered);
+            } catch (e) {
+                console.warn('Failed to append current query to history', e);
+            }
+        }
+
+        function attachLoadingEffects() {
+            const analyzeForm = document.getElementById('analyze-form');
+            const analyzeBtn = document.getElementById('analyze-btn');
+            if (analyzeForm && analyzeBtn) {
+                analyzeForm.addEventListener('submit', function () {
+                    if (analyzeBtn.disabled) return;
+                    analyzeBtn.disabled = true;
+                    analyzeBtn.innerHTML =
+                        '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>' +
+                        '分析中...';
+                });
+            }
+
+            const batchForm = document.getElementById('batch-form');
+            const batchBtn = document.getElementById('batch-btn');
+            if (batchForm && batchBtn) {
+                batchForm.addEventListener('submit', function () {
+                    if (batchBtn.disabled) return;
+                    batchBtn.disabled = true;
+                    batchBtn.innerHTML =
+                        '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>' +
+                        '批量分析中...';
+                });
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            // 如果本次有 result（由后端通过 last_code 判断），则将当前查询加入历史
+            {% if result and not result.error %}
+            appendCurrentToHistory();
+            {% endif %}
+
+            renderHistory();
+            attachLoadingEffects();
+
+            const clearBtn = document.getElementById('clear-history');
+            if (clearBtn) {
+                clearBtn.addEventListener('click', function () {
+                    localStorage.removeItem(STORAGE_KEY);
+                    renderHistory();
+                });
+            }
+        });
+    })();
+</script>
 </body>
 </html>
