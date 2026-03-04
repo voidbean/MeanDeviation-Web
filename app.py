@@ -34,10 +34,11 @@ STOCK_NAME_CACHE = {}
 DB_PATH = os.path.join(os.path.dirname(__file__), "stock_cache.db")
 
 
-def init_cache_db():
+def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
         try:
+            # Existing cache table
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS stock_name_cache (
@@ -47,11 +48,38 @@ def init_cache_db():
                 )
                 """
             )
+            # New table for daily records
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_records (
+                    date TEXT,
+                    code TEXT,
+                    name TEXT,
+                    close REAL,
+                    high REAL,
+                    low REAL,
+                    avg_price REAL,
+                    PRIMARY KEY (date, code)
+                )
+                """
+            )
+            # New table for portfolio settings
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    code TEXT PRIMARY KEY,
+                    cost_price REAL DEFAULT 0,
+                    stage_high REAL DEFAULT 0,
+                    stage_low REAL DEFAULT 0,
+                    updated_at INTEGER
+                )
+                """
+            )
             conn.commit()
         finally:
             conn.close()
     except Exception as e:
-        print(f"Failed to init cache db: {e}")
+        print(f"Failed to init db: {e}")
 
 
 def get_cached_name(code: str) -> str:
@@ -106,7 +134,7 @@ def set_cached_name(code: str, name: str) -> None:
         print(f"Failed to write cache for {code}: {e}")
 
 
-init_cache_db()
+init_db()
 
 
 def load_common_stocks():
@@ -151,6 +179,166 @@ def build_common_stocks_with_name():
 
         entries.append({"code": code, "name": name})
     return entries
+def save_daily_record(code: str, name: str, data: dict):
+    """
+    Save daily record to DB.
+    data includes: price (close), high, low, avg_price (vwap)
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        today = time.strftime("%Y-%m-%d")
+        conn.execute(
+            """
+            INSERT INTO daily_records(date, code, name, close, high, low, avg_price)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date, code) DO UPDATE SET
+                close = excluded.close,
+                high = excluded.high,
+                low = excluded.low,
+                avg_price = excluded.avg_price,
+                name = excluded.name
+            """,
+            (today, code, name, data['price'], data['high'], data['low'], data['avg_price'])
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to save daily record for {code}: {e}")
+
+def get_portfolio(code: str):
+    """
+    Get portfolio settings for a stock.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("SELECT cost_price, stage_high, stage_low FROM portfolio WHERE code = ?", (code,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {"cost": row[0], "stage_high": row[1], "stage_low": row[2]}
+    except Exception as e:
+        logger.error(f"Failed to get portfolio for {code}: {e}")
+    return {"cost": 0, "stage_high": 0, "stage_low": 0}
+
+def save_portfolio(code: str, cost: float, high: float, low: float):
+    """
+    Save portfolio settings.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        ts_now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO portfolio(code, cost_price, stage_high, stage_low, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                cost_price = excluded.cost_price,
+                stage_high = excluded.stage_high,
+                stage_low = excluded.stage_low,
+                updated_at = excluded.updated_at
+            """,
+            (code, cost, high, low, ts_now)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to save portfolio for {code}: {e}")
+
+def get_n_day_stats(code: str, days: int = 20):
+    """
+    Get N-day high/low from daily_records.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """
+            SELECT MAX(high), MIN(low) FROM daily_records
+            WHERE code = ? AND date >= date('now', ?)
+            """,
+            (code, f'-{days} days')
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0] is not None:
+             return {"n_high": row[0], "n_low": row[1]}
+    except Exception as e:
+        logger.error(f"Failed to get stats for {code}: {e}")
+    return {"n_high": 0, "n_low": 0}
+
+def calculate_strategy(now, cost, st_high, stage_high, stage_low):
+    """
+    Implement the strategy logic from stock.html
+    """
+    signal = "观望"
+    advice_class = "advice-normal" # mapping to Bootstrap colors: advice-danger->danger, advice-gold->warning, advice-blue->primary, advice-cyan->info
+    
+    # Calculate Fibonacci
+    diff = stage_high - stage_low
+    f382 = stage_high - diff * 0.382
+    f618 = stage_high - diff * 0.618
+    f786 = stage_high - diff * 0.786
+    
+    is_break_low = False
+    
+    if cost > 0:
+        # === Position Mode ===
+        profit_rate = (now - cost) / cost if cost > 0 else 0
+        max_profit_rate = (st_high - cost) / cost if cost > 0 else 0
+        
+        if now < cost * 0.93:
+            signal = "止损离场"
+            advice_class = "danger"
+        elif max_profit_rate >= 0.20:
+             profit_limit = st_high - (st_high - cost) * 0.3
+             if now <= profit_limit:
+                 signal = "动态止盈"
+                 advice_class = "warning"
+             else:
+                 signal = "奔跑中"
+                 advice_class = "info"
+        elif max_profit_rate >= 0.10:
+             profit_limit = max(st_high - (st_high - cost) * 0.5, cost * 1.03)
+             if now <= profit_limit:
+                 signal = "落袋/保本"
+                 advice_class = "warning"
+             else:
+                 signal = "持有中"
+                 advice_class = "info"
+        else:
+             signal = "持有中"
+             advice_class = "info"
+             
+    else:
+        # === Observation Mode ===
+        if stage_low > 0 and now < stage_low:
+            is_break_low = True
+            signal = "破位严禁"
+            advice_class = "danger"
+        elif stage_low > 0 and now <= f786:
+            signal = "黄金坑"
+            advice_class = "warning"
+        elif stage_low > 0 and now <= f618:
+            signal = "强支撑"
+            advice_class = "primary"
+        elif stage_low > 0 and now <= f382:
+            signal = "常规买点"
+            advice_class = "info"
+        elif stage_high > 0 and now > stage_high:
+            signal = "突破跟进"
+            advice_class = "danger"
+        else:
+            signal = "观望"
+            advice_class = "secondary"
+
+    return {
+        "signal": signal,
+        "advice_class": advice_class,
+        "f382": round(f382, 3),
+        "f618": round(f618, 3),
+        "f786": round(f786, 3),
+        "is_break_low": is_break_low
+    }
+
 def calculate_8848(code: str):
     try:
         # Fetch real-time data
@@ -165,13 +353,9 @@ def calculate_8848(code: str):
         # 更新名称缓存（内存 + SQLite），供常用股票列表等复用
         set_cached_name(code, name)
         price = float(df.loc[0, 'price'])
-        # Tushare volume is in shares (hand * 100), amount is in Yuan
-        # However, get_realtime_quotes returns volume in 'hands' (100 shares) usually?
-        # Let's check the raw values carefully. 
-        # Actually standard Sina source: volume is in Shares, amount is in Yuan.
-        # But sometimes amount is in 10k. 
-        # Let's use a heuristic: Average price should be close to current price.
-        
+        high = float(df.loc[0, 'high'])
+        low = float(df.loc[0, 'low'])
+
         volume = float(df.loc[0, 'volume']) # Volume in shares
         amount = float(df.loc[0, 'amount']) # Amount in Yuan
         
@@ -182,26 +366,37 @@ def calculate_8848(code: str):
              return {"error": "Current price is 0, cannot calculate (Stock might be suspended)."}
 
         # Calculate Intraday Average Price (ZSTJJ)
-        # Verify unit scaling. If avg_price is way off price, adjust.
         avg_price = amount / volume
         
-        # Heuristic check: if avg_price is 100x smaller than price, volume might be in shares but amount in 100s? 
-        # Or if volume is in hands.
-        # Standard Sina API: volume (shares), amount (yuan).
-        # But let's add a safety factor.
+        # Heuristic check
         if abs(avg_price - price) / price > 0.5:
-             # If significant deviation, maybe volume is in hands?
-             # Try adjusting by 100
              if abs((avg_price * 100) - price) / price < 0.5:
                  avg_price *= 100
         
-        # 8848 Formula
-        # Red Line (Resistance/High) = ZSTJJ / 0.98848
-        upper_line = avg_price / 0.98848
+        # Save daily record
+        save_daily_record(code, name, {
+            "price": price, "high": high, "low": low, "avg_price": avg_price
+        })
+
+        # Load Portfolio Settings
+        portfolio = get_portfolio(code)
+        cost_price = portfolio['cost']
+        stage_high = portfolio['stage_high'] or high # Default to day high if not set
+        stage_low = portfolio['stage_low'] or low   # Default to day low if not set
         
-        # Green Line (Support/Low) = ZSTJJ * 0.98848
+        # Short-term high logic: For simplicity, use max of stage_high and day high
+        st_high = max(stage_high, high)
+
+        # Strategy Logic
+        strat = calculate_strategy(price, cost_price, st_high, stage_high, stage_low)
+        
+        # 8848 Formula
+        upper_line = avg_price / 0.98848
         lower_line = avg_price * 0.98848
         
+        # N-Day Stats
+        n_day = get_n_day_stats(code)
+
         return {
             "code": code,
             "name": name,
@@ -209,11 +404,36 @@ def calculate_8848(code: str):
             "avg_price": round(avg_price, 3),
             "upper_line": round(upper_line, 3),
             "lower_line": round(lower_line, 3),
-            "status": "success"
+            "status": "success",
+            # New Fields
+            "high": high,
+            "low": low,
+            "cost_price": cost_price,
+            "stage_high": stage_high,
+            "stage_low": stage_low,
+            "signal": strat["signal"],
+            "advice_class": strat["advice_class"],
+            "f382": strat["f382"],
+            "f618": strat["f618"],
+            "f786": strat["f786"],
+            "n_day_high": n_day["n_high"],
+            "n_day_low": n_day["n_low"]
         }
 
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/update_portfolio", response_class=HTMLResponse)
+async def update_portfolio(
+    request: Request, 
+    code: str = Form(...),
+    cost_price: float = Form(0.0),
+    stage_high: float = Form(0.0),
+    stage_low: float = Form(0.0)
+):
+    save_portfolio(code, cost_price, stage_high, stage_low)
+    # Redirect back to analyze
+    return await analyze_stock(request, stock_code=code)
 
 
 def calculate_8848_history(code: str, days: int = 5):
