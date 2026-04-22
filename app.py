@@ -76,6 +76,21 @@ def init_db():
                 """
             )
             conn.commit()
+
+            # 迁移：为 portfolio 表新增 max_price 字段（记录持仓以来历史最高价）
+            # SQLite 不支持 ALTER TABLE ADD COLUMN IF NOT EXISTS，用 try/except 实现幂等
+            try:
+                conn.execute(
+                    "ALTER TABLE portfolio ADD COLUMN max_price REAL DEFAULT 0"
+                )
+                conn.commit()
+                print("Migration: added max_price column to portfolio table.")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e).lower():
+                    pass  # 字段已存在，忽略
+                else:
+                    raise
+
         finally:
             conn.close()
     except Exception as e:
@@ -211,16 +226,24 @@ def get_portfolio(code: str):
     """
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute("SELECT cost_price, stage_high, stage_low FROM portfolio WHERE code = ?", (code,))
+        cur = conn.execute(
+            "SELECT cost_price, stage_high, stage_low, max_price FROM portfolio WHERE code = ?",
+            (code,)
+        )
         row = cur.fetchone()
         conn.close()
         if row:
-            return {"cost": row[0], "stage_high": row[1], "stage_low": row[2]}
+            return {
+                "cost":       row[0],
+                "stage_high": row[1],
+                "stage_low":  row[2],
+                "max_price":  row[3] if row[3] is not None else 0.0,
+            }
     except Exception as e:
         logger.error(f"Failed to get portfolio for {code}: {e}")
-    return {"cost": 0, "stage_high": 0, "stage_low": 0}
+    return {"cost": 0, "stage_high": 0, "stage_low": 0, "max_price": 0.0}
 
-def save_portfolio(code: str, cost: float, high: float, low: float):
+def save_portfolio(code: str, cost: float, high: float, low: float, max_price: float = 0.0):
     """
     Save portfolio settings.
     """
@@ -229,106 +252,131 @@ def save_portfolio(code: str, cost: float, high: float, low: float):
         ts_now = int(time.time())
         conn.execute(
             """
-            INSERT INTO portfolio(code, cost_price, stage_high, stage_low, updated_at)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO portfolio(code, cost_price, stage_high, stage_low, max_price, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 cost_price = excluded.cost_price,
                 stage_high = excluded.stage_high,
-                stage_low = excluded.stage_low,
+                stage_low  = excluded.stage_low,
+                max_price  = excluded.max_price,
                 updated_at = excluded.updated_at
             """,
-            (code, cost, high, low, ts_now)
+            (code, cost, high, low, max_price, ts_now)
         )
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"Failed to save portfolio for {code}: {e}")
 
-def get_n_day_stats(code: str, days: int = 20):
+def get_n_day_stats(code: str):
     """
-    Get N-day high/low from daily_records.
+    同时返回 20 日和 60 日的高低点，供页面展示建议值。
+    数据来源：daily_records 表（由 fetch_history.py 定时补充）。
     """
+    result = {
+        "n20_high": 0, "n20_low": 0,
+        "n60_high": 0, "n60_low": 0,
+    }
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute(
-            """
-            SELECT MAX(high), MIN(low) FROM daily_records
-            WHERE code = ? AND date >= date('now', ?)
-            """,
-            (code, f'-{days} days')
-        )
-        row = cur.fetchone()
+        for days, high_key, low_key in [
+            (20, "n20_high", "n20_low"),
+            (60, "n60_high", "n60_low"),
+        ]:
+            cur = conn.execute(
+                """
+                SELECT MAX(high), MIN(low) FROM daily_records
+                WHERE code = ? AND date >= date('now', ?)
+                """,
+                (code, f'-{days} days'),
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                result[high_key] = row[0]
+                result[low_key]  = row[1]
         conn.close()
-        if row and row[0] is not None:
-             return {"n_high": row[0], "n_low": row[1]}
     except Exception as e:
         logger.error(f"Failed to get stats for {code}: {e}")
-    return {"n_high": 0, "n_low": 0}
+    return result
 
-def calculate_strategy(now, cost, st_high, stage_high, stage_low):
+def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
     """
     Implement the strategy logic from stock.html
     """
     signal = "观望"
-    advice_class = "advice-normal" # mapping to Bootstrap colors: advice-danger->danger, advice-gold->warning, advice-blue->primary, advice-cyan->info
-    
-    # Calculate Fibonacci
-    diff = stage_high - stage_low
-    f382 = stage_high - diff * 0.382
-    f618 = stage_high - diff * 0.618
-    f786 = stage_high - diff * 0.786
-    
+    advice_class = "secondary"
+
+    # 斐波那契三条线：只有 stage_params_set=True 时才有意义
+    # stage_params_set 已保证 stage_high > stage_low > 0，diff > 0
+    if stage_params_set:
+        diff = stage_high - stage_low
+        f382 = stage_high - diff * 0.382
+        f618 = stage_high - diff * 0.618
+        f786 = stage_high - diff * 0.786
+    else:
+        diff = f382 = f618 = f786 = 0.0  # 未设置时全部为 0，前端据此显示提示
+
     is_break_low = False
-    
+
     if cost > 0:
-        # === Position Mode ===
-        profit_rate = (now - cost) / cost if cost > 0 else 0
+        # === 持仓模式 ===
         max_profit_rate = (st_high - cost) / cost if cost > 0 else 0
-        
+
         if now < cost * 0.93:
             signal = "止损离场"
             advice_class = "danger"
         elif max_profit_rate >= 0.20:
-             profit_limit = st_high - (st_high - cost) * 0.3
-             if now <= profit_limit:
-                 signal = "动态止盈"
-                 advice_class = "warning"
-             else:
-                 signal = "奔跑中"
-                 advice_class = "info"
+            profit_limit = st_high - (st_high - cost) * 0.3
+            if now <= profit_limit:
+                signal = "动态止盈"
+                advice_class = "warning"
+            else:
+                signal = "奔跑中"
+                advice_class = "info"
         elif max_profit_rate >= 0.10:
-             profit_limit = max(st_high - (st_high - cost) * 0.5, cost * 1.03)
-             if now <= profit_limit:
-                 signal = "落袋/保本"
-                 advice_class = "warning"
-             else:
-                 signal = "持有中"
-                 advice_class = "info"
+            profit_limit = max(st_high - (st_high - cost) * 0.5, cost * 1.03)
+            if now <= profit_limit:
+                signal = "落袋/保本"
+                advice_class = "warning"
+            else:
+                signal = "持有中"
+                advice_class = "info"
         else:
-             signal = "持有中"
-             advice_class = "info"
-             
-    else:
-        # === Observation Mode ===
-        if stage_low > 0 and now < stage_low:
-            is_break_low = True
-            signal = "破位严禁"
-            advice_class = "danger"
-        elif stage_low > 0 and now <= f786:
-            signal = "黄金坑"
-            advice_class = "warning"
-        elif stage_low > 0 and now <= f618:
-            signal = "强支撑"
-            advice_class = "primary"
-        elif stage_low > 0 and now <= f382:
-            signal = "常规买点"
+            signal = "持有中"
             advice_class = "info"
-        elif stage_high > 0 and now > stage_high:
-            signal = "突破跟进"
-            advice_class = "danger"
+
+    else:
+        # === 观望模式 ===
+        if not stage_params_set:
+            # 阶段参数未有效设置，斐波那契信号全部跳过
+            # 仅保留"突破跟进"（只需 stage_high > 0，不依赖 diff）
+            if stage_high > 0 and now > stage_high:
+                signal = "突破跟进"
+                advice_class = "danger"
+            else:
+                signal = "观望"
+                advice_class = "secondary"
         else:
-            signal = "观望"
-            advice_class = "secondary"
+            # stage_params_set=True：stage_high > stage_low > 0，diff > 0，斐波那契全部有效
+            if now < stage_low:
+                is_break_low = True
+                signal = "破位严禁"
+                advice_class = "danger"
+            elif now <= f786:
+                signal = "黄金坑"
+                advice_class = "warning"
+            elif now <= f618:
+                signal = "强支撑"
+                advice_class = "primary"
+            elif now <= f382:
+                signal = "常规买点"
+                advice_class = "info"
+            elif now > stage_high:
+                signal = "突破跟进"
+                advice_class = "danger"
+            else:
+                signal = "观望"
+                advice_class = "secondary"
 
     return {
         "signal": signal,
@@ -336,7 +384,7 @@ def calculate_strategy(now, cost, st_high, stage_high, stage_low):
         "f382": round(f382, 3),
         "f618": round(f618, 3),
         "f786": round(f786, 3),
-        "is_break_low": is_break_low
+        "is_break_low": is_break_low,
     }
 
 def calculate_8848(code: str):
@@ -381,20 +429,33 @@ def calculate_8848(code: str):
         # Load Portfolio Settings
         portfolio = get_portfolio(code)
         cost_price = portfolio['cost']
-        stage_high = portfolio['stage_high'] or high # Default to day high if not set
-        stage_low = portfolio['stage_low'] or low   # Default to day low if not set
-        
-        # Short-term high logic: For simplicity, use max of stage_high and day high
-        st_high = max(stage_high, high)
+        stage_high = portfolio['stage_high']  # 保留原始值，0 表示未设置
+        stage_low  = portfolio['stage_low']   # 保留原始值，0 表示未设置
+        max_price  = portfolio['max_price']   # 持仓以来历史最高价
+
+        # 自动维护 max_price：仅在持仓时，用当日最高价刷新历史最高价
+        if cost_price > 0 and high > max_price:
+            max_price = high
+            save_portfolio(code, cost_price, stage_high, stage_low, max_price)
+
+        # st_high：持仓以来历史最高价（用于动态止盈线计算），首次持仓当日 fallback 到当日最高
+        st_high = max_price if max_price > 0 else high
+
+        # stage_params_set：用户是否设置了有效的阶段高低点
+        stage_params_set = (
+            stage_high > 0
+            and stage_low > 0
+            and stage_high > stage_low  # 合理性校验，防止 diff 为负
+        )
 
         # Strategy Logic
-        strat = calculate_strategy(price, cost_price, st_high, stage_high, stage_low)
-        
+        strat = calculate_strategy(price, cost_price, st_high, stage_high, stage_low, stage_params_set)
+
         # 8848 Formula
         upper_line = avg_price / 0.98848
         lower_line = avg_price * 0.98848
-        
-        # N-Day Stats
+
+        # N-Day Stats（20日 + 60日，用于页面展示建议值）
         n_day = get_n_day_stats(code)
 
         return {
@@ -405,19 +466,22 @@ def calculate_8848(code: str):
             "upper_line": round(upper_line, 3),
             "lower_line": round(lower_line, 3),
             "status": "success",
-            # New Fields
             "high": high,
             "low": low,
             "cost_price": cost_price,
             "stage_high": stage_high,
             "stage_low": stage_low,
+            "max_price": round(max_price, 3),
+            "stage_params_set": stage_params_set,
             "signal": strat["signal"],
             "advice_class": strat["advice_class"],
             "f382": strat["f382"],
             "f618": strat["f618"],
             "f786": strat["f786"],
-            "n_day_high": n_day["n_high"],
-            "n_day_low": n_day["n_low"]
+            "n20_high": n_day["n20_high"],
+            "n20_low":  n_day["n20_low"],
+            "n60_high": n_day["n60_high"],
+            "n60_low":  n_day["n60_low"],
         }
 
     except Exception as e:
@@ -425,14 +489,17 @@ def calculate_8848(code: str):
 
 @app.post("/update_portfolio", response_class=HTMLResponse)
 async def update_portfolio(
-    request: Request, 
-    code: str = Form(...),
+    request: Request,
+    code:       str   = Form(...),
     cost_price: float = Form(0.0),
     stage_high: float = Form(0.0),
-    stage_low: float = Form(0.0)
+    stage_low:  float = Form(0.0),
+    max_price:  float = Form(0.0),  # 允许用户手动修正历史最高价
 ):
-    save_portfolio(code, cost_price, stage_high, stage_low)
-    # Redirect back to analyze
+    # 若表单传入的 max_price > 0 则使用表单值，否则保留数据库中的旧值，防止意外清零
+    current = get_portfolio(code)
+    effective_max_price = max_price if max_price > 0 else current['max_price']
+    save_portfolio(code, cost_price, stage_high, stage_low, effective_max_price)
     return await analyze_stock(request, stock_code=code)
 
 

@@ -85,55 +85,117 @@
                             </ul>
 
                             <!-- Strategy / Fibonacci Levels -->
-                            <h6 class="border-bottom pb-2 mb-2">Strategy & Fibonacci (Observation)</h6>
+                            <h6 class="border-bottom pb-2 mb-2">斐波那契支撑位（观望模式）</h6>
+                            {% if result.stage_params_set %}
                             <div class="row g-2 mb-3">
                                 <div class="col-4">
                                     <div class="p-2 border rounded bg-light text-center">
-                                        <small class="d-block text-muted">0.382 (Buy)</small>
+                                        <small class="d-block text-muted">0.382（常规买点）</small>
                                         <strong>{{ result.f382 }}</strong>
                                     </div>
                                 </div>
                                 <div class="col-4">
                                     <div class="p-2 border rounded bg-light text-center">
-                                        <small class="d-block text-muted">0.618 (Support)</small>
+                                        <small class="d-block text-muted">0.618（强支撑）</small>
                                         <strong>{{ result.f618 }}</strong>
                                     </div>
                                 </div>
                                 <div class="col-4">
                                     <div class="p-2 border rounded bg-light text-center">
-                                        <small class="d-block text-muted">0.786 (Gold Pit)</small>
+                                        <small class="d-block text-muted">0.786（黄金坑）</small>
                                         <strong>{{ result.f786 }}</strong>
                                     </div>
                                 </div>
                             </div>
-                            
-                            <!-- N-Day Stats -->
-                            <div class="alert alert-secondary py-2 small">
-                                <strong>20-Day Stats:</strong> High: {{ result.n_day_high }} | Low: {{ result.n_day_low }}
+                            {% else %}
+                            <div class="alert alert-warning py-2 mb-3 d-flex align-items-center" role="alert">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor"
+                                     class="bi bi-exclamation-triangle-fill flex-shrink-0 me-2" viewBox="0 0 16 16">
+                                    <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
+                                </svg>
+                                <small>请在下方设置<strong>阶段高点</strong>和<strong>阶段低点</strong>，以启用斐波那契支撑位计算。</small>
                             </div>
-
+                            {% endif %}
+                            
                             <!-- Portfolio Settings Form -->
                             <div class="card mt-3">
-                                <div class="card-header bg-white py-1">
-                                    <small class="fw-bold">Portfolio / Stage Settings</small>
+                                <div class="card-header bg-white py-1 d-flex justify-content-between align-items-center">
+                                    <small class="fw-bold">持仓 / 阶段参数设置</small>
+                                    {% if result.stage_params_set %}
+                                        <span class="badge bg-success">✓ 参数已设置</span>
+                                    {% else %}
+                                        <span class="badge bg-warning text-dark">⚠ 未设置阶段高低点</span>
+                                    {% endif %}
                                 </div>
                                 <div class="card-body p-2">
-                                    <form action="/update_portfolio" method="post" class="row g-2">
+
+                                    {# ── 建议值参考区（点击填入，不自动提交）── #}
+                                    {% if result.n20_high or result.n60_high %}
+                                    <div class="mb-2 p-2 rounded" style="background:#f0f4ff;">
+                                        <div class="d-flex align-items-center mb-1">
+                                            <small class="text-muted me-2">📊 区间参考（点击填入，需手动保存）</small>
+                                        </div>
+                                        <div class="d-flex gap-2 flex-wrap">
+                                            {% if result.n20_high %}
+                                            <button type="button" class="btn btn-outline-secondary btn-sm"
+                                                    onclick="fillStage({{ result.n20_high }}, {{ result.n20_low }})">
+                                                20日&nbsp;
+                                                <span class="text-danger">↑{{ result.n20_high }}</span>
+                                                &nbsp;/&nbsp;
+                                                <span class="text-success">↓{{ result.n20_low }}</span>
+                                            </button>
+                                            {% endif %}
+                                            {% if result.n60_high %}
+                                            <button type="button" class="btn btn-outline-secondary btn-sm"
+                                                    onclick="fillStage({{ result.n60_high }}, {{ result.n60_low }})">
+                                                60日&nbsp;
+                                                <span class="text-danger">↑{{ result.n60_high }}</span>
+                                                &nbsp;/&nbsp;
+                                                <span class="text-success">↓{{ result.n60_low }}</span>
+                                            </button>
+                                            {% endif %}
+                                        </div>
+                                    </div>
+                                    {% endif %}
+
+                                    <form id="portfolio-form" action="/update_portfolio" method="post" class="row g-2">
                                         <input type="hidden" name="code" value="{{ result.code }}">
+                                        <input type="hidden" name="max_price" value="{{ result.max_price }}">
                                         <div class="col-4">
-                                            <label class="form-label small mb-0">Cost Price</label>
-                                            <input type="number" step="0.01" class="form-control form-control-sm" name="cost_price" value="{{ result.cost_price }}">
+                                            <label class="form-label small mb-0">成本价</label>
+                                            <input type="number" step="0.01" class="form-control form-control-sm"
+                                                   name="cost_price"
+                                                   value="{{ result.cost_price if result.cost_price > 0 else '' }}"
+                                                   placeholder="未持仓">
                                         </div>
                                         <div class="col-4">
-                                            <label class="form-label small mb-0">Stage High</label>
-                                            <input type="number" step="0.01" class="form-control form-control-sm" name="stage_high" value="{{ result.stage_high }}">
+                                            <label class="form-label small mb-0">
+                                                阶段高点{% if not result.stage_params_set %}<span class="text-danger">*</span>{% endif %}
+                                            </label>
+                                            <input id="input-stage-high" type="number" step="0.01"
+                                                   class="form-control form-control-sm {% if not result.stage_params_set %}border-warning{% endif %}"
+                                                   name="stage_high"
+                                                   value="{{ result.stage_high if result.stage_high > 0 else '' }}"
+                                                   placeholder="请输入阶段高点">
                                         </div>
                                         <div class="col-4">
-                                            <label class="form-label small mb-0">Stage Low</label>
-                                            <input type="number" step="0.01" class="form-control form-control-sm" name="stage_low" value="{{ result.stage_low }}">
+                                            <label class="form-label small mb-0">
+                                                阶段低点{% if not result.stage_params_set %}<span class="text-danger">*</span>{% endif %}
+                                            </label>
+                                            <input id="input-stage-low" type="number" step="0.01"
+                                                   class="form-control form-control-sm {% if not result.stage_params_set %}border-warning{% endif %}"
+                                                   name="stage_low"
+                                                   value="{{ result.stage_low if result.stage_low > 0 else '' }}"
+                                                   placeholder="请输入阶段低点">
                                         </div>
-                                        <div class="col-12 text-end">
-                                            <button type="submit" class="btn btn-sm btn-outline-primary">Update Settings</button>
+                                        <div class="col-8">
+                                            <label class="form-label small mb-0 text-muted">持仓最高价（自动维护）</label>
+                                            <input type="text" class="form-control form-control-sm bg-light"
+                                                   value="{{ result.max_price if result.max_price > 0 else '持仓后自动记录' }}"
+                                                   readonly>
+                                        </div>
+                                        <div class="col-4 d-flex align-items-end">
+                                            <button type="submit" class="btn btn-sm btn-outline-primary w-100">保存设置</button>
                                         </div>
                                     </form>
                                 </div>
@@ -414,6 +476,17 @@
                         '批量分析中...';
                 });
             }
+        }
+
+        // 将建议值填入阶段高低点输入框（不自动提交，需用户确认后手动保存）
+        function fillStage(high, low) {
+            const highInput = document.getElementById('input-stage-high');
+            const lowInput  = document.getElementById('input-stage-low');
+            if (highInput) highInput.value = high;
+            if (lowInput)  lowInput.value  = low;
+            // 填入后去掉警告边框，给视觉反馈
+            if (highInput) highInput.classList.remove('border-warning');
+            if (lowInput)  lowInput.classList.remove('border-warning');
         }
 
         document.addEventListener('DOMContentLoaded', function () {
