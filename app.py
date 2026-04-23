@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import tushare as ts
 import os
@@ -72,6 +72,19 @@ def init_db():
                     stage_high REAL DEFAULT 0,
                     stage_low REAL DEFAULT 0,
                     updated_at INTEGER
+                )
+                """
+            )
+            conn.commit()
+
+            # 查询历史记录表
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS query_history (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code       TEXT,
+                    name       TEXT,
+                    queried_at TEXT
                 )
                 """
             )
@@ -165,6 +178,32 @@ def load_common_stocks():
 
 
 COMMON_STOCKS = load_common_stocks()
+
+
+def _update_env_key(path: str, key: str, value: str) -> None:
+    """在 .env 文件中更新或新增指定 key 的值（幂等）。"""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        else:
+            lines = []
+
+        prefix = f"{key}="
+        new_line = f"{key}={value}\n"
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith(prefix):
+                lines[i] = new_line
+                found = True
+                break
+        if not found:
+            lines.append(new_line)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        logger.error(f"Failed to update .env key {key}: {e}")
 
 
 def build_common_stocks_with_name():
@@ -267,6 +306,39 @@ def save_portfolio(code: str, cost: float, high: float, low: float, max_price: f
         conn.close()
     except Exception as e:
         logger.error(f"Failed to save portfolio for {code}: {e}")
+
+def save_query_history(code: str, name: str) -> None:
+    """记录一次查询到 query_history 表，只保留最近 50 条。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO query_history(code, name, queried_at) VALUES(?, ?, ?)",
+            (code, name, time.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.execute(
+            "DELETE FROM query_history WHERE id NOT IN "
+            "(SELECT id FROM query_history ORDER BY id DESC LIMIT 50)"
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to save query history for {code}: {e}")
+
+
+def get_query_history() -> list:
+    """返回最近 50 条查询历史，供模板渲染。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            "SELECT code, name, queried_at FROM query_history ORDER BY id DESC LIMIT 50"
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [{"code": r[0], "name": r[1], "queried_at": r[2]} for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to get query history: {e}")
+    return []
+
 
 def get_n_day_stats(code: str):
     """
@@ -610,7 +682,6 @@ async def analyze_batch(request: Request):
         if res.get("status") == "success":
             results.append(res)
         else:
-            # 简单忽略失败的个股，保持页面整洁
             continue
 
     return templates.TemplateResponse(
@@ -622,6 +693,7 @@ async def analyze_batch(request: Request):
             "common_stocks": build_common_stocks_with_name(),
             "batch_results": results,
             "history_results": None,
+            "query_history": get_query_history(),
         },
     )
 
@@ -635,23 +707,21 @@ async def read_root(request: Request):
             "batch_results": None,
             "history_results": None,
             "last_code": "",
+            "query_history": get_query_history(),
         },
     )
 
 @app.post("/analyze", response_class=HTMLResponse)
 async def analyze_stock(request: Request, stock_code: str = Form(...)):
-    # Basic validation for stock code (add sh/sz if missing)
-    # Tushare usually expects 6 digits.
-    # If purely digits, we might need to guess the market, but get_realtime_quotes works with just 6 digits often.
-    # However, for uniqueness, let's keep it as is or try to append likely suffix if it fails?
-    # Actually get_realtime_quotes is smart enough with just '600519' etc.
-
     logger.info("analyze_stock: start code=%s", stock_code)
     result = calculate_8848(stock_code)
-    # 为了提升速度，这里暂时不再请求近 5 日日线历史
-    history_results = []
+
+    # 查询成功时记录历史
+    if isinstance(result, dict) and result.get("status") == "success":
+        save_query_history(result["code"], result["name"])
+
     logger.info(
-        "analyze_stock: done code=%s status=%s history_len=0",
+        "analyze_stock: done code=%s status=%s",
         stock_code,
         result.get("status") if isinstance(result, dict) else "unknown",
     )
@@ -663,6 +733,35 @@ async def analyze_stock(request: Request, stock_code: str = Form(...)):
             "last_code": stock_code,
             "common_stocks": build_common_stocks_with_name(),
             "batch_results": None,
-            "history_results": history_results,
+            "history_results": [],
+            "query_history": get_query_history(),
         },
     )
+
+@app.post("/update_common_stocks", response_class=HTMLResponse)
+async def update_common_stocks(request: Request, codes: str = Form(...)):
+    """页面内管理常用股票：更新 .env 并热重载全局变量。"""
+    global COMMON_STOCKS
+    code_list = [c.strip() for c in codes.replace("，", ",").split(",") if c.strip()]
+    new_val = ",".join(code_list)
+
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    _update_env_key(env_path, "COMMON_STOCK_CODES", new_val)
+
+    load_dotenv(override=True)
+    COMMON_STOCKS = load_common_stocks()
+
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/clear_history", response_class=HTMLResponse)
+async def clear_history(request: Request):
+    """清空查询历史记录。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM query_history")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to clear query history: {e}")
+    return RedirectResponse(url="/", status_code=303)

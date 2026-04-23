@@ -6,7 +6,8 @@ fetch_history.py — 历史日线数据采集脚本
     写入 daily_records 表，供 get_n_day_stats() 使用。
 
 用法：
-    uv run python fetch_history.py
+    uv run python fetch_history.py              # 常规模式：拉取最近 60 个交易日
+    uv run python fetch_history.py --backfill   # 回填模式：拉取最近 90 个交易日，用于首次部署初始化
 
 crontab 示例（每个工作日 15:35 收盘后自动运行）：
     35 15 * * 1-5 cd /path/to/MeanDeviation-Web && uv run python fetch_history.py >> fetch_history.log 2>&1
@@ -15,6 +16,7 @@ crontab 示例（每个工作日 15:35 收盘后自动运行）：
 import os
 import sqlite3
 import logging
+import argparse
 from datetime import datetime
 
 import tushare as ts
@@ -123,7 +125,7 @@ def upsert_daily_record(
 
 
 # ── 核心逻辑 ─────────────────────────────────────────────────────────────────
-def fetch_one(pro, conn: sqlite3.Connection, code: str) -> int:
+def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS) -> int:
     """
     拉取单只股票的历史日线数据并写入 DB。
     返回成功写入的记录条数，失败时抛出异常。
@@ -131,8 +133,8 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str) -> int:
     ts_code = to_ts_code(code)
     name = get_cached_name(conn, code)
 
-    logger.info("拉取 %s (%s)，limit=%d", ts_code, name or "未知", FETCH_DAYS)
-    df = pro.daily(ts_code=ts_code, limit=FETCH_DAYS)
+    logger.info("拉取 %s (%s)，limit=%d", ts_code, name or "未知", limit)
+    df = pro.daily(ts_code=ts_code, limit=limit)
 
     if df is None or df.empty:
         logger.warning("%s 返回空数据，可能停牌或代码有误", ts_code)
@@ -183,6 +185,17 @@ def load_common_codes() -> list[str]:
 
 # ── 入口 ─────────────────────────────────────────────────────────────────────
 def main() -> None:
+    parser = argparse.ArgumentParser(description="拉取常用股票历史日线数据")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="回填模式：拉取最近 90 个交易日数据，用于首次部署初始化",
+    )
+    args = parser.parse_args()
+
+    limit = 90 if args.backfill else FETCH_DAYS
+    mode_label = "回填模式（90日）" if args.backfill else f"常规模式（{FETCH_DAYS}日）"
+
     load_dotenv()
 
     token = os.getenv("TUSHARE_TOKEN", "")
@@ -206,11 +219,12 @@ def main() -> None:
 
         success, failed = 0, 0
         start_time = datetime.now()
-        logger.info("=== 开始拉取历史数据，共 %d 只股票 ===", len(codes))
+        logger.info("=== 开始拉取历史数据 [%s]，共 %d 只股票 ===", mode_label, len(codes))
+        print(f"模式：{mode_label}，共 {len(codes)} 只股票")
 
         for code in codes:
             try:
-                n = fetch_one(pro, conn, code)
+                n = fetch_one(pro, conn, code, limit=limit)
                 success += 1
                 print(f"  ✓ {code}  写入 {n} 条")
             except Exception as e:

@@ -254,6 +254,11 @@
 
         <!-- 右侧：常用股票 + 批量分析 + 历史查询记录 -->
         <div class="col-12 col-lg-5">
+            {# 隐藏 form：删除/新增股票时由 JS 填入 codes 后提交 #}
+            <form id="common-stocks-form" action="/update_common_stocks" method="post" class="d-none">
+                <input type="hidden" id="common-stocks-codes" name="codes" value="">
+            </form>
+
             <div class="card shadow-sm mb-3">
                 <div class="card-header bg-white d-flex justify-content-between align-items-center">
                     <span class="card-title-small fw-semibold">常用股票</span>
@@ -266,6 +271,7 @@
                                 <tr>
                                     <th scope="col">代码</th>
                                     <th scope="col">名称</th>
+                                    <th scope="col"></th>
                                 </tr>
                                 </thead>
                                 <tbody>
@@ -273,6 +279,11 @@
                                     <tr>
                                         <td>{{ s.code }}</td>
                                         <td>{{ s.name }}</td>
+                                        <td>
+                                            <button type="button"
+                                                    class="btn btn-link btn-sm text-danger p-0"
+                                                    onclick="removeStock('{{ s.code }}')">✕</button>
+                                        </td>
                                     </tr>
                                 {% endfor %}
                                 </tbody>
@@ -284,11 +295,16 @@
                             </button>
                         </form>
                     {% else %}
-                        <p class="text-muted small mb-0">
-                            未配置常用股票，可在 <code>.env</code> 中设置
-                            <code>COMMON_STOCK_CODES=600519,000001,300750</code>。
-                        </p>
+                        <p class="text-muted small mb-2">暂无常用股票。</p>
                     {% endif %}
+
+                    {# 新增股票输入区 #}
+                    <div class="input-group input-group-sm mt-2">
+                        <input type="text" id="add-stock-input" class="form-control"
+                               placeholder="输入代码，如 000001">
+                        <button type="button" class="btn btn-outline-success"
+                                onclick="addStock()">添加</button>
+                    </div>
                 </div>
             </div>
 
@@ -308,6 +324,7 @@
                                     <th scope="col">均价</th>
                                     <th scope="col">上轨</th>
                                     <th scope="col">下轨</th>
+                                    <th scope="col">信号</th>
                                 </tr>
                                 </thead>
                                 <tbody>
@@ -319,6 +336,7 @@
                                         <td>{{ r.avg_price }}</td>
                                         <td>{{ r.upper_line }}</td>
                                         <td>{{ r.lower_line }}</td>
+                                        <td><span class="badge bg-{{ r.advice_class }}">{{ r.signal }}</span></td>
                                     </tr>
                                 {% endfor %}
                                 </tbody>
@@ -330,18 +348,31 @@
 
             <div class="card shadow-sm">
                 <div class="card-header bg-white d-flex justify-content-between align-items-center">
-                    <span class="card-title-small fw-semibold">历史查询记录（本机浏览器）</span>
-                    <button id="clear-history" type="button" class="btn btn-link btn-sm text-danger p-0">
-                        清空
-                    </button>
+                    <span class="card-title-small fw-semibold">历史查询记录</span>
+                    <form action="/clear_history" method="post" class="d-inline">
+                        <button type="submit" class="btn btn-link btn-sm text-danger p-0">清空</button>
+                    </form>
                 </div>
                 <div class="card-body">
-                    <ul id="history-list" class="list-group small">
-                        <!-- 由 JS 填充 -->
+                    <ul class="list-group small">
+                        {% if query_history %}
+                            {% for item in query_history %}
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                <div class="me-2">
+                                    <div class="fw-semibold">
+                                        {% if item.name %}{{ item.name }} ({{ item.code }}){% else %}{{ item.code }}{% endif %}
+                                    </div>
+                                    <div class="text-muted small">{{ item.queried_at }}</div>
+                                </div>
+                                <button type="button" class="btn btn-outline-primary btn-sm"
+                                        onclick="requery('{{ item.code }}')">再次查询</button>
+                            </li>
+                            {% endfor %}
+                        {% else %}
+                            <li class="list-group-item text-muted text-center">暂无历史记录</li>
+                        {% endif %}
                     </ul>
-                    <p class="text-muted small mt-2 mb-0">
-                        仅保存在当前浏览器中，最多保留最近 50 条。
-                    </p>
+                    <p class="text-muted small mt-2 mb-0">最多保留最近 50 条。</p>
                 </div>
             </div>
         </div>
@@ -358,152 +389,67 @@
         if (lowInput)  { lowInput.value  = low;  lowInput.classList.remove('border-warning');  }
     }
 
-    (function () {
-        const STORAGE_KEY = 'md_history';
-        const MAX_ITEMS = 50;
+    // 再次查询：填入代码并提交表单
+    function requery(code) {
+        const input = document.getElementById('stock_code');
+        if (!input) return;
+        input.value = code;
+        input.form && input.form.submit();
+    }
 
-        function loadHistory() {
-            try {
-                const raw = localStorage.getItem(STORAGE_KEY);
-                if (!raw) return [];
-                const parsed = JSON.parse(raw);
-                return Array.isArray(parsed) ? parsed : [];
-            } catch (e) {
-                console.warn('Failed to parse history from localStorage', e);
-                localStorage.removeItem(STORAGE_KEY);
-                return [];
-            }
+    // 当前常用股票代码列表（由 Jinja2 渲染）
+    const _currentCodes = [{% for s in common_stocks %}'{{ s.code }}'{% if not loop.last %},{% endif %}{% endfor %}];
+
+    function _submitCommonStocks(codes) {
+        const form = document.getElementById('common-stocks-form');
+        const input = document.getElementById('common-stocks-codes');
+        if (!form || !input) return;
+        input.value = codes.join(',');
+        form.submit();
+    }
+
+    function removeStock(code) {
+        const updated = _currentCodes.filter(c => c !== code);
+        _submitCommonStocks(updated);
+    }
+
+    function addStock() {
+        const addInput = document.getElementById('add-stock-input');
+        if (!addInput) return;
+        const code = addInput.value.trim();
+        if (!code) return;
+        if (_currentCodes.includes(code)) {
+            alert('该股票代码已在列表中：' + code);
+            return;
         }
+        _submitCommonStocks([..._currentCodes, code]);
+    }
 
-        function saveHistory(list) {
-            try {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, MAX_ITEMS)));
-            } catch (e) {
-                console.warn('Failed to save history to localStorage', e);
-            }
-        }
-
-        function renderHistory() {
-            const container = document.getElementById('history-list');
-            if (!container) return;
-
-            const list = loadHistory();
-            container.innerHTML = '';
-
-            if (list.length === 0) {
-                const li = document.createElement('li');
-                li.className = 'list-group-item text-muted text-center';
-                li.textContent = '暂无历史记录';
-                container.appendChild(li);
-                return;
-            }
-
-            list.forEach(item => {
-                const li = document.createElement('li');
-                li.className = 'list-group-item d-flex justify-content-between align-items-center';
-
-                const info = document.createElement('div');
-                info.className = 'me-2';
-                const display = item.name ? (item.name + ' (' + item.code + ')') : item.code;
-                info.innerHTML = '<div class="fw-semibold">' + display + '</div>' +
-                    '<div class="text-muted small">' + (item.time || '') + '</div>';
-
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.className = 'btn btn-outline-primary btn-sm';
-                btn.textContent = '再次查询';
-                btn.addEventListener('click', function () {
-                    const input = document.getElementById('stock_code');
-                    if (!input) return;
-                    input.value = item.code;
-                    input.form && input.form.submit();
-                });
-
-                li.appendChild(info);
-                li.appendChild(btn);
-                container.appendChild(li);
+    document.addEventListener('DOMContentLoaded', function () {
+        const analyzeForm = document.getElementById('analyze-form');
+        const analyzeBtn = document.getElementById('analyze-btn');
+        if (analyzeForm && analyzeBtn) {
+            analyzeForm.addEventListener('submit', function () {
+                if (analyzeBtn.disabled) return;
+                analyzeBtn.disabled = true;
+                analyzeBtn.innerHTML =
+                    '<span class=”spinner-border spinner-border-sm me-1” role=”status” aria-hidden=”true”></span>' +
+                    '分析中...';
             });
         }
 
-        function appendCurrentToHistory() {
-            try {
-                const input = document.getElementById('stock_code');
-                if (!input || !input.value) return;
-
-                const code = input.value.trim();
-                if (!code) return;
-
-                // 从当前结果卡片标题中尝试解析股票名称，例如 “贵州茅台 (600519)”
-                let name = '';
-                const titleEl = document.querySelector('.card-header.bg-light h5');
-                if (titleEl && titleEl.textContent) {
-                    const text = titleEl.textContent.trim();
-                    const idx = text.lastIndexOf('(');
-                    if (idx > 0) {
-                        name = text.slice(0, idx).trim();
-                    }
-                }
-
-                const now = new Date();
-                const time = now.getFullYear() + '-' +
-                    String(now.getMonth() + 1).padStart(2, '0') + '-' +
-                    String(now.getDate()).padStart(2, '0') + ' ' +
-                    String(now.getHours()).padStart(2, '0') + ':' +
-                    String(now.getMinutes()).padStart(2, '0');
-
-                const list = loadHistory();
-                const filtered = list.filter(item => item.code !== code);
-                filtered.unshift({code: code, name: name, time: time});
-                saveHistory(filtered);
-            } catch (e) {
-                console.warn('Failed to append current query to history', e);
-            }
+        const batchForm = document.getElementById('batch-form');
+        const batchBtn = document.getElementById('batch-btn');
+        if (batchForm && batchBtn) {
+            batchForm.addEventListener('submit', function () {
+                if (batchBtn.disabled) return;
+                batchBtn.disabled = true;
+                batchBtn.innerHTML =
+                    '<span class=”spinner-border spinner-border-sm me-1” role=”status” aria-hidden=”true”></span>' +
+                    '批量分析中...';
+            });
         }
-
-        function attachLoadingEffects() {
-            const analyzeForm = document.getElementById('analyze-form');
-            const analyzeBtn = document.getElementById('analyze-btn');
-            if (analyzeForm && analyzeBtn) {
-                analyzeForm.addEventListener('submit', function () {
-                    if (analyzeBtn.disabled) return;
-                    analyzeBtn.disabled = true;
-                    analyzeBtn.innerHTML =
-                        '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>' +
-                        '分析中...';
-                });
-            }
-
-            const batchForm = document.getElementById('batch-form');
-            const batchBtn = document.getElementById('batch-btn');
-            if (batchForm && batchBtn) {
-                batchForm.addEventListener('submit', function () {
-                    if (batchBtn.disabled) return;
-                    batchBtn.disabled = true;
-                    batchBtn.innerHTML =
-                        '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>' +
-                        '批量分析中...';
-                });
-            }
-        }
-
-        document.addEventListener('DOMContentLoaded', function () {
-            // 如果本次有 result（由后端通过 last_code 判断），则将当前查询加入历史
-            {% if result and not result.error %}
-            appendCurrentToHistory();
-            {% endif %}
-
-            renderHistory();
-            attachLoadingEffects();
-
-            const clearBtn = document.getElementById('clear-history');
-            if (clearBtn) {
-                clearBtn.addEventListener('click', function () {
-                    localStorage.removeItem(STORAGE_KEY);
-                    renderHistory();
-                });
-            }
-        });
-    })();
+    });
 </script>
 </body>
 </html>
