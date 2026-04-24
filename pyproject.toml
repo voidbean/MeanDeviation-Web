@@ -12,4 +12,7 @@ dependencies = [
     "tushare>=1.4.24",
     "uvicorn>=0.41.0",
     "python-multipart",
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "google-generativeai>=0.8.0",
 ]

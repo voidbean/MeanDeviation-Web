@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 # 基本日志配置，输出到 app.log，方便排查 tushare 等问题
@@ -21,6 +22,19 @@ load_dotenv()
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
+
+# ── AI 分析配置 ──────────────────────────────────────────────
+AI_PROVIDER      = os.getenv("AI_PROVIDER", "claude").lower()
+CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY", "")
+CLAUDE_MODEL     = os.getenv("CLAUDE_MODEL", "claude-opus-4-5")
+CLAUDE_BASE_URL  = os.getenv("CLAUDE_BASE_URL", "")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_BASE_URL  = os.getenv("OPENAI_BASE_URL", "")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+
+SKILLS_DIR = Path(__file__).parent / "skills"
 
 # Tushare Token (Optional for basic realtime quotes, but recommended for stability)
 TS_TOKEN = os.getenv("TUSHARE_TOKEN", "")
@@ -453,11 +467,145 @@ def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_s
     return {
         "signal": signal,
         "advice_class": advice_class,
-        "f382": round(f382, 3),
-        "f618": round(f618, 3),
-        "f786": round(f786, 3),
+        "f382": round(f382, 4),
+        "f618": round(f618, 4),
+        "f786": round(f786, 4),
         "is_break_low": is_break_low,
     }
+
+def load_skills() -> str:
+    """读取 skills/ 目录下所有 .md 文件，拼接为字符串"""
+    if not SKILLS_DIR.exists():
+        return ""
+    parts = []
+    for f in sorted(SKILLS_DIR.glob("*.md")):
+        parts.append(f"## {f.name}\n\n" + f.read_text(encoding="utf-8"))
+    return "\n\n---\n\n".join(parts)
+
+
+def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "") -> str:
+    """将股票数据 + 持仓参数 + 历史数据组装成分析 prompt
+    mode: 'intraday' = 盘中（今天怎么操作）| 'next_day' = 盘后（明天怎么操作）
+    """
+    history_text = "\n".join(
+        f"  {r['date']}: 收{r['close']} 高{r['high']} 低{r['low']} 均价{r['avg_price']}"
+        for r in history
+    )
+    holding = result['cost_price'] > 0
+    fib_text = (
+        f"斐波那契 38.2%: {result['f382']}  61.8%: {result['f618']}  78.6%: {result['f786']}"
+        if result.get('stage_params_set')
+        else "（未设置阶段高低点，斐波那契不可用）"
+    )
+
+    if mode == "intraday":
+        mode_context = "【分析时机】盘中分析，当前行情仍在进行中。"
+        op3_focus = (
+            "当前持仓，重点关注：今天是否需要减仓或止盈？当前价位是否已到卖点？还是应该继续持有等待？"
+            if holding else
+            "当前未持仓，重点关注：今天是否有买入机会？当前价位是否是合适的介入点？还是应该继续观望？"
+        )
+        op3_label = "今日操作建议"
+        extra_instruction = (
+            "请特别给出今日具体的操作价位建议（如：可在 XX 附近买入 / 涨到 XX 可减仓），"
+            "结合今日已有的高低点和当前价格判断当下时机，不要只给方向性建议。"
+        )
+    else:
+        mode_context = "【分析时机】收盘后复盘，今日行情已结束，分析明日操作计划。"
+        op3_focus = (
+            "当前持仓，重点关注：明天是否需要操作？持仓逻辑是否仍然成立？止盈/止损位在哪里？"
+            if holding else
+            "当前未持仓，重点关注：明天是否有买入机会？需要关注哪些信号来确认入场时机？"
+        )
+        op3_label = "明日操作计划"
+        extra_instruction = (
+            "请给出明日具体的操作预案（如：若明日高开则 XX，若低开则 XX），"
+            "结合今日收盘价和历史数据给出明日的关键价位参考，帮助提前做好应对准备。"
+        )
+
+    return f"""{mode_context}
+
+【当前股票信息】
+股票代码：{result['code']}
+股票名称：{result['name']}
+当日价格：{result['current_price']}（今日高:{result['high']} 低:{result['low']}）
+VWAP均价：{result['avg_price']}
+8848上轨：{result['upper_line']}
+8848下轨：{result['lower_line']}
+持仓状态：{"持仓中，成本价 " + str(result['cost_price']) if holding else "未持仓"}
+阶段高点：{result['stage_high'] if result['stage_high'] > 0 else "未设置"}
+阶段低点：{result['stage_low'] if result['stage_low'] > 0 else "未设置"}
+{fib_text}
+20日高点：{result['n20_high']}  20日低点：{result['n20_low']}
+60日高点：{result['n60_high']}  60日低点：{result['n60_low']}
+现有规则信号：{result['signal']}
+
+【近期历史数据（最近60日，按日期倒序）】
+{history_text if history_text else "暂无历史数据"}
+
+【分析要求】
+请按以下结构输出，每个部分控制在3-5句话以内，简洁直接：
+
+1. **股票类型判断**（参考 Skill 11）：这只股票属于哪种类型（A/B/C/D/E类及子类），判断依据是什么？
+
+2. **量价状态**（参考 Skill 05）：从历史数据看，近期量能趋势如何？是放量还是缩量？结合均价走势推断资金动向。
+
+3. **{op3_label}**（参考 Skill 03 + 对应类型操作规则）：结合现有规则信号（{result['signal']}），{op3_focus}
+{extra_instruction}
+
+4. **风险提示**（参考 Skill 07）：当前主要风险点是什么？有哪些需要特别注意的信号？
+
+注意：分析基于当前有限数据，仅供参考，不构成投资建议。
+{"" if not user_hint else chr(10) + "【用户补充说明】" + chr(10) + user_hint.strip()}"""
+
+
+def call_ai_model(system_prompt: str, user_prompt: str) -> str:
+    """统一调用接口，根据 AI_PROVIDER 分发到对应模型"""
+    provider = AI_PROVIDER
+
+    if provider == "claude":
+        import anthropic
+        kwargs: dict = {"api_key": CLAUDE_API_KEY}
+        if CLAUDE_BASE_URL:
+            kwargs["base_url"] = CLAUDE_BASE_URL
+        client = anthropic.Anthropic(**kwargs)
+        msg = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return msg.content[0].text
+
+    elif provider == "openai":
+        from openai import OpenAI
+        kwargs = {"api_key": OPENAI_API_KEY}
+        if OPENAI_BASE_URL:
+            kwargs["base_url"] = OPENAI_BASE_URL
+        client = OpenAI(**kwargs)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_tokens=1024,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+        )
+        return resp.choices[0].message.content
+
+    elif provider == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=system_prompt,
+        )
+        resp = model.generate_content(user_prompt)
+        return resp.text
+
+    else:
+        raise ValueError(f"不支持的 AI_PROVIDER: {provider}，请设置为 claude / openai / gemini")
+
 
 def calculate_8848(code: str):
     try:
@@ -534,16 +682,16 @@ def calculate_8848(code: str):
             "code": code,
             "name": name,
             "current_price": price,
-            "avg_price": round(avg_price, 3),
-            "upper_line": round(upper_line, 3),
-            "lower_line": round(lower_line, 3),
+            "avg_price": round(avg_price, 4),
+            "upper_line": round(upper_line, 4),
+            "lower_line": round(lower_line, 4),
             "status": "success",
             "high": high,
             "low": low,
             "cost_price": cost_price,
             "stage_high": stage_high,
             "stage_low": stage_low,
-            "max_price": round(max_price, 3),
+            "max_price": round(max_price, 4),
             "stage_params_set": stage_params_set,
             "signal": strat["signal"],
             "advice_class": strat["advice_class"],
@@ -652,10 +800,10 @@ def calculate_8848_history(code: str, days: int = 5):
         records.append(
             {
                 "date": str(row.get("trade_date", "")),
-                "close": round(close_price, 3),
-                "avg_price": round(avg_price, 3),
-                "upper_line": round(upper_line, 3),
-                "lower_line": round(lower_line, 3),
+                "close": round(close_price, 4),
+                "avg_price": round(avg_price, 4),
+                "upper_line": round(upper_line, 4),
+                "lower_line": round(lower_line, 4),
                 "position": position,
             }
         )
@@ -694,6 +842,11 @@ async def analyze_batch(request: Request):
             "batch_results": results,
             "history_results": None,
             "query_history": get_query_history(),
+            "ai_analysis": None,
+            "ai_error": None,
+            "ai_provider": AI_PROVIDER,
+            "ai_mode": "intraday",
+            "user_hint": "",
         },
     )
 
@@ -708,6 +861,11 @@ async def read_root(request: Request):
             "history_results": None,
             "last_code": "",
             "query_history": get_query_history(),
+            "ai_analysis": None,
+            "ai_error": None,
+            "ai_provider": AI_PROVIDER,
+            "ai_mode": "intraday",
+            "user_hint": "",
         },
     )
 
@@ -735,6 +893,92 @@ async def analyze_stock(request: Request, stock_code: str = Form(...)):
             "batch_results": None,
             "history_results": [],
             "query_history": get_query_history(),
+            "ai_analysis": None,
+            "ai_error": None,
+            "ai_provider": AI_PROVIDER,
+            "ai_mode": "intraday",
+            "user_hint": "",
+        },
+    )
+
+
+@app.post("/ai_analyze", response_class=HTMLResponse)
+async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str = Form("intraday"), user_hint: str = Form("")):
+    """手动触发 AI 分析，基于阿狼技能库给出操作建议
+    ai_mode: 'intraday' = 盘中分析 | 'next_day' = 盘后/明日计划
+    """
+    logger.info("ai_analyze: start code=%s provider=%s mode=%s", stock_code, AI_PROVIDER, ai_mode)
+
+    # 1. 先跑一次 8848 获取最新数据
+    result = calculate_8848(stock_code)
+    if result.get("error"):
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "result": result,
+                "last_code": stock_code,
+                "common_stocks": build_common_stocks_with_name(),
+                "batch_results": None,
+                "history_results": [],
+                "query_history": get_query_history(),
+                "ai_analysis": None,
+                "ai_error": f"获取股票数据失败：{result.get('error')}",
+                "ai_provider": AI_PROVIDER,
+                "ai_mode": ai_mode,
+                "user_hint": user_hint,
+            },
+        )
+
+    # 2. 取近 60 日历史数据
+    history = []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT date, close, high, low, avg_price FROM daily_records "
+            "WHERE code = ? ORDER BY date DESC LIMIT 60",
+            (stock_code,),
+        ).fetchall()
+        conn.close()
+        history = [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("ai_analyze: failed to load history for %s: %s", stock_code, e)
+
+    # 3. 加载 skills + 构建 prompt
+    skills_text = load_skills()
+    system_prompt = (
+        "你是基于阿狼投资体系的 A 股分析助手。"
+        "以下是完整的阿狼技能库，请严格基于此进行分析，不要引入技能库以外的方法论：\n\n"
+        + skills_text
+    )
+    user_prompt = build_ai_prompt(result, history, mode=ai_mode, user_hint=user_hint)
+
+    # 4. 调用 AI 模型
+    ai_analysis = None
+    ai_error = None
+    try:
+        ai_analysis = call_ai_model(system_prompt, user_prompt)
+        logger.info("ai_analyze: done code=%s", stock_code)
+    except Exception as e:
+        ai_error = str(e)
+        logger.error("ai_analyze: failed code=%s error=%s", stock_code, e)
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "result": result,
+            "last_code": stock_code,
+            "common_stocks": build_common_stocks_with_name(),
+            "batch_results": None,
+            "history_results": [],
+            "query_history": get_query_history(),
+            "ai_analysis": ai_analysis,
+            "ai_error": ai_error,
+            "ai_provider": AI_PROVIDER,
+            "ai_mode": ai_mode,
+            "user_hint": user_hint,
         },
     )
 

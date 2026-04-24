@@ -37,3 +37,6 @@ tzdata==2025.3 ; python_full_version < '3.11' or sys_platform == 'emscripten' or
 urllib3==2.6.3
 uvicorn==0.41.0
 websocket-client==1.9.0
+anthropic>=0.40.0
+openai>=1.50.0
+google-generativeai>=0.8.0

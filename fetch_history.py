@@ -164,7 +164,7 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
                 close=close,
                 high=high,
                 low=low,
-                avg_price=round(avg_price, 3),
+                avg_price=round(avg_price, 4),
             )
             count += 1
         except Exception as e:
