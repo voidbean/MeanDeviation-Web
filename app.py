@@ -562,16 +562,20 @@ VWAP均价：{result['avg_price']}
 def call_ai_model(system_prompt: str, user_prompt: str) -> str:
     """统一调用接口，根据 AI_PROVIDER 分发到对应模型"""
     provider = AI_PROVIDER
+    # 分析报告含4个部分，1024 token 容易截断；放大到 4096 确保输出完整
+    MAX_TOKENS = 4096
+    # 网络请求超时（秒）：连接超时 10s，读取超时 120s
+    TIMEOUT = (10, 120)
 
     if provider == "claude":
         import anthropic
-        kwargs: dict = {"api_key": CLAUDE_API_KEY}
+        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 120.0}
         if CLAUDE_BASE_URL:
             kwargs["base_url"] = CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         msg = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=MAX_TOKENS,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -579,13 +583,13 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
 
     elif provider == "openai":
         from openai import OpenAI
-        kwargs = {"api_key": OPENAI_API_KEY}
+        kwargs = {"api_key": OPENAI_API_KEY, "timeout": 120.0}
         if OPENAI_BASE_URL:
             kwargs["base_url"] = OPENAI_BASE_URL
         client = OpenAI(**kwargs)
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            max_tokens=1024,
+            max_tokens=MAX_TOKENS,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
@@ -595,12 +599,17 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
 
     elif provider == "gemini":
         import google.generativeai as genai
+        from google.generativeai import types as genai_types
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
             system_instruction=system_prompt,
         )
-        resp = model.generate_content(user_prompt)
+        resp = model.generate_content(
+            user_prompt,
+            generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
+            request_options={"timeout": 120},
+        )
         return resp.text
 
     else:
