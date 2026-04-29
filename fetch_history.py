@@ -17,6 +17,7 @@ import os
 import sqlite3
 import logging
 import argparse
+import time
 from datetime import datetime
 
 import tushare as ts
@@ -107,20 +108,22 @@ def upsert_daily_record(
     high: float,
     low: float,
     avg_price: float,
+    amount: float = 0.0,
 ) -> None:
-    """写入一条日线记录，已存在则覆盖（幂等）。"""
+    """写入一条日线记录，已存在则覆盖（幂等）。amount 单位：千元。"""
     conn.execute(
         """
-        INSERT INTO daily_records(date, code, name, close, high, low, avg_price)
-        VALUES(?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO daily_records(date, code, name, close, high, low, avg_price, amount)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date, code) DO UPDATE SET
             close     = excluded.close,
             high      = excluded.high,
             low       = excluded.low,
             avg_price = excluded.avg_price,
-            name      = excluded.name
+            name      = excluded.name,
+            amount    = excluded.amount
         """,
-        (date, code, name, close, high, low, avg_price),
+        (date, code, name, close, high, low, avg_price, amount),
     )
 
 
@@ -165,6 +168,7 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
                 high=high,
                 low=low,
                 avg_price=round(avg_price, 4),
+                amount=round(amount, 2),
             )
             count += 1
         except Exception as e:
@@ -236,6 +240,40 @@ def main() -> None:
         summary = f"完成：成功 {success} 只，失败 {failed} 只，耗时 {elapsed}s"
         logger.info("=== %s ===", summary)
         print(f"\n{summary}")
+
+        # ── 拉取三大指数数据（大盘风向标）────────────────────────────────────
+        INDEX_CODES = [
+            ("000001.SH", "上证指数"),
+            ("399001.SZ", "深证成指"),
+            ("399006.SZ", "创业板指"),
+        ]
+        print("\n── 拉取大盘指数数据 ──")
+        logger.info("=== 开始拉取大盘指数数据，共 %d 个指数 ===", len(INDEX_CODES))
+
+        # 预写指数名称到缓存，保证 fetch_one 能取到正确名称
+        for ts_code, idx_name in INDEX_CODES:
+            conn.execute(
+                "INSERT INTO stock_name_cache(code, name, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(code) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at",
+                (ts_code, idx_name, int(time.time())),
+            )
+        conn.commit()
+
+        idx_success, idx_failed = 0, 0
+        for ts_code, idx_name in INDEX_CODES:
+            try:
+                n = fetch_one(pro, conn, ts_code, limit=limit)
+                idx_success += 1
+                print(f"  ✓ {ts_code}（{idx_name}）写入 {n} 条")
+                logger.info("指数 %s 写入 %d 条", ts_code, n)
+            except Exception as e:
+                idx_failed += 1
+                logger.error("拉取指数 %s 失败：%s", ts_code, e)
+                print(f"  ✗ {ts_code}（{idx_name}）失败：{e}")
+
+        idx_summary = f"指数完成：成功 {idx_success} 个，失败 {idx_failed} 个"
+        logger.info("=== %s ===", idx_summary)
+        print(f"\n{idx_summary}")
 
     finally:
         conn.close()

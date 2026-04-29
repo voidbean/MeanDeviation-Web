@@ -118,6 +118,19 @@ def init_db():
                 else:
                     raise
 
+            # 迁移：为 daily_records 表新增 amount 字段（成交额，千元），用于大盘风向标量能判断
+            try:
+                conn.execute(
+                    "ALTER TABLE daily_records ADD COLUMN amount REAL DEFAULT 0"
+                )
+                conn.commit()
+                print("Migration: added amount column to daily_records table.")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e).lower():
+                    pass  # 字段已存在，忽略
+                else:
+                    raise
+
         finally:
             conn.close()
     except Exception as e:
@@ -385,6 +398,53 @@ def get_n_day_stats(code: str):
         logger.error(f"Failed to get stats for {code}: {e}")
     return result
 
+# 三大指数代码与名称（大盘风向标）
+INDEX_CODES = [
+    ("000001.SH", "上证指数"),
+    ("399001.SZ", "深证成指"),
+    ("399006.SZ", "创业板指"),
+]
+
+
+def get_index_market_data(days: int = 20) -> dict:
+    """
+    从 daily_records 读取三大指数最近 days 日数据，供 AI prompt 使用。
+    返回格式：{ts_code: {"name": str, "records": [{"date", "close", "high", "low", "amount_yi"}]}}
+    amount_yi：成交额（亿元），由 daily_records.amount（千元）换算。
+    数据由 fetch_history.py 定时写入；若尚未运行则返回空列表。
+    """
+    result = {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        for ts_code, idx_name in INDEX_CODES:
+            cur = conn.execute(
+                """
+                SELECT date, close, high, low, COALESCE(amount, 0)
+                FROM daily_records
+                WHERE code = ?
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                (ts_code, days),
+            )
+            rows = cur.fetchall()
+            records = []
+            for r in rows:
+                amount_yi = round(r[4] / 10000, 2) if r[4] else 0  # 千元 → 亿元
+                records.append({
+                    "date":       r[0],
+                    "close":      r[1],
+                    "high":       r[2],
+                    "low":        r[3],
+                    "amount_yi":  amount_yi,
+                })
+            result[ts_code] = {"name": idx_name, "records": records}
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to get index market data: {e}")
+    return result
+
+
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
     """
     Implement the strategy logic from stock.html
@@ -483,9 +543,10 @@ def load_skills() -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "") -> str:
-    """将股票数据 + 持仓参数 + 历史数据组装成分析 prompt
+def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "", index_data: dict = None) -> str:
+    """将股票数据 + 持仓参数 + 历史数据 + 大盘指数数据组装成分析 prompt
     mode: 'intraday' = 盘中（今天怎么操作）| 'next_day' = 盘后（明天怎么操作）
+    index_data: get_index_market_data() 的返回值，None 时不展示大盘段落
     """
     history_text = "\n".join(
         f"  {r['date']}: 收{r['close']} 高{r['high']} 低{r['low']} 均价{r['avg_price']}"
@@ -523,6 +584,24 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
             "结合今日收盘价和历史数据给出明日的关键价位参考，帮助提前做好应对准备。"
         )
 
+    # 构建大盘风向标文本
+    if index_data:
+        index_sections = []
+        for ts_code, data in index_data.items():
+            name = data.get("name", ts_code)
+            records = data.get("records", [])
+            if records:
+                lines = "\n".join(
+                    f"  {r['date']}: 收{r['close']} 高{r['high']} 低{r['low']} 成交额{r['amount_yi']}亿"
+                    for r in records
+                )
+                index_sections.append(f"{name}（{ts_code}）：\n{lines}")
+            else:
+                index_sections.append(f"{name}（{ts_code}）：暂无数据（请先运行 fetch_history.py）")
+        index_text = "\n\n".join(index_sections)
+    else:
+        index_text = "暂无数据（请先运行 fetch_history.py 拉取指数数据）"
+
     return f"""{mode_context}
 
 【当前股票信息】
@@ -543,8 +622,13 @@ VWAP均价：{result['avg_price']}
 【近期历史数据（最近60日，按日期倒序）】
 {history_text if history_text else "暂无历史数据"}
 
+【大盘风向标（近20日，按日期倒序）】
+{index_text}
+
 【分析要求】
 请按以下结构输出，每个部分控制在3-5句话以内，简洁直接：
+
+0. **大盘阶段判断**（参考 Skill 01）：根据三大指数的量能趋势和价格走势，当前大盘处于哪个阶段（3-1/3-2/3-3/3-4/3-5）？对个股操作有何影响？
 
 1. **股票类型判断**（参考 Skill 11）：这只股票属于哪种类型（A/B/C/D/E类及子类），判断依据是什么？
 
@@ -954,14 +1038,15 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
     except Exception as e:
         logger.warning("ai_analyze: failed to load history for %s: %s", stock_code, e)
 
-    # 3. 加载 skills + 构建 prompt
+    # 3. 加载 skills + 大盘数据 + 构建 prompt
     skills_text = load_skills()
     system_prompt = (
         "你是基于阿狼投资体系的 A 股分析助手。"
         "以下是完整的阿狼技能库，请严格基于此进行分析，不要引入技能库以外的方法论：\n\n"
         + skills_text
     )
-    user_prompt = build_ai_prompt(result, history, mode=ai_mode, user_hint=user_hint)
+    index_data = get_index_market_data(days=20)
+    user_prompt = build_ai_prompt(result, history, mode=ai_mode, user_hint=user_hint, index_data=index_data)
 
     # 4. 调用 AI 模型
     ai_analysis = None
