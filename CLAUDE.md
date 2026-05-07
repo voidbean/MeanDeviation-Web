@@ -50,7 +50,8 @@ All application logic lives in `app.py` — no separate modules. Key sections:
   - `query_history` — last 50 queries, shown in the UI sidebar
 - **8848 formula**: `upper_line = avg_price / 0.98848`, `lower_line = avg_price * 0.98848`, where `avg_price = amount / volume` from real-time quote
 - **Strategy signals** (`calculate_strategy()`): holding mode uses dynamic stop-profit based on `max_price`; watching mode uses Fibonacci levels (38.2%, 61.8%, 78.6%) derived from user-set stage high/low
-- **AI analysis** (`/ai_analyze`): loads all `skills/*.md` files as system prompt, builds a structured user prompt with current quote + 60-day history, then calls the selected LLM
+- **AI analysis** (`/ai_analyze`): loads all `skills/*.md` files as system prompt, builds a structured user prompt with current quote + 60-day history + 20-day market index data, then calls `call_ai_model_with_tools()` which runs an agentic tool-use loop
+- **Tool use layer**: `TOOL_DEFINITIONS` → `_build_claude/openai/gemini_tools()` → `execute_tool()` → `_tool_*()` functions. The LLM can call up to `MAX_TOOL_ROUNDS=5` rounds of tools before the loop exits. `call_ai_model()` (no tools) is kept as a fallback.
 
 ### `fetch_history.py`
 Standalone script (not imported by `app.py`) that pulls daily OHLC from Tushare Pro API and upserts into `daily_records`. Run manually or via cron. Requires `TUSHARE_TOKEN`.
@@ -72,10 +73,33 @@ Markdown files (`01_*.md` through `11_*.md`) containing the "阿狼投资体系"
 | `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | — | OpenAI config; `OPENAI_BASE_URL` supports DeepSeek, local Ollama, etc. |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | — | Gemini config |
 
+### Tool Use Architecture
+
+`/ai_analyze` uses an agentic loop: the LLM receives the base prompt and can call Tushare tools to fetch additional data before producing its final analysis.
+
+**Available tools** (defined in `TOOL_DEFINITIONS` in `app.py`):
+
+| Tool | Tushare API | Returns | 阿狼体系 |
+|---|---|---|---|
+| `get_intraday_lines` | `stk_mins` 1min | White line (price) + Yellow line (cumulative avg), sampled every 5min | Skill 06 日内做T |
+| `get_moneyflow` | `moneyflow` | Last 5 days: super-large/large/net flow amounts | Skill 05/08 量价/资金 |
+| `get_top_list` | `top_list` | Dragon-Tiger list entries in last 10 trading days | Skill 08 市场参与者 |
+| `get_daily_basic` | `daily_basic` | Latest PE/PB/turnover rate/market cap | Skill 11 股票类型 |
+
+**Provider-specific tool formats** (all generated from the same `TOOL_DEFINITIONS`):
+- Claude: `input_schema` format, loop exits on `stop_reason == "end_turn"`
+- OpenAI: `{"type": "function"}` format, loop exits on `finish_reason == "stop"`
+- Gemini: `FunctionDeclaration` + `start_chat()` pattern, loop exits when no `function_call` parts
+
+**To add a new tool**: add an entry to `TOOL_DEFINITIONS`, implement `_tool_<name>()`, add a branch in `execute_tool()`. The three provider format builders pick it up automatically.
+
+**`stk_mins` rate limit**: Tushare limits `stk_mins` to 2 calls/day on basic accounts. The tool returns an `{"error": "..."}` JSON on failure — the LLM will proceed without intraday data rather than crashing.
+
 ## Key Design Decisions
 
 - **Schema migrations** are handled inline in `init_db()` using `try/except` around `ALTER TABLE` — SQLite doesn't support `IF NOT EXISTS` for columns.
 - **`COMMON_STOCKS` hot-reload**: `POST /update_common_stocks` writes back to `.env` and calls `load_dotenv(override=True)` to update the global without restarting.
 - **`max_price` auto-update**: on every query while `cost_price > 0`, if today's high exceeds the stored `max_price`, it is saved immediately — no manual intervention needed.
 - **Stock code normalization**: both `app.py` and `fetch_history.py` contain a `to_ts_code()` helper that converts `600519` / `sh600519` / `600519.SH` to Tushare Pro format. Keep them in sync if modifying.
-- **AI timeout**: all LLM calls use a 120-second read timeout and `max_tokens=4096` to avoid truncated analysis reports.
+- **AI timeout**: `call_ai_model_with_tools()` uses 180-second timeout (vs 120s for the no-tool version) to accommodate multi-round tool loops. `MAX_TOOL_ROUNDS=5` prevents infinite loops.
+- **`daily_records.amount` column**: stores trading amount in 千元 (same unit as `pro.daily`). Index data from `pro.index_daily` also uses 千元. Display conversion: `amount / 100000` = 亿元.

@@ -180,6 +180,49 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
     return count
 
 
+def fetch_index_one(pro, conn: sqlite3.Connection, ts_code: str, name: str, limit: int = FETCH_DAYS) -> int:
+    """
+    用 pro.index_daily 拉取单个指数的历史日线数据并写入 DB。
+    amount 单位与 pro.daily 一致（千元），avg_price 用收盘价占位（指数无均价概念）。
+    返回成功写入的记录条数，失败时抛出异常。
+    """
+    logger.info("拉取指数 %s (%s)，limit=%d", ts_code, name, limit)
+    df = pro.index_daily(ts_code=ts_code, limit=limit)
+
+    if df is None or df.empty:
+        logger.warning("%s 返回空数据", ts_code)
+        return 0
+
+    count = 0
+    for _, row in df.iterrows():
+        try:
+            trade_date = str(row["trade_date"])
+            close  = float(row["close"])
+            high   = float(row["high"])
+            low    = float(row["low"])
+            amount = float(row.get("amount", 0) or 0)  # 千元，与个股一致
+
+            upsert_daily_record(
+                conn,
+                date=fmt_date(trade_date),
+                code=ts_code,
+                name=name,
+                close=close,
+                high=high,
+                low=low,
+                avg_price=close,      # 指数无均价概念，用收盘价占位
+                amount=round(amount, 2),
+            )
+            count += 1
+        except Exception as e:
+            logger.warning("%s 某行数据处理失败：%s", ts_code, e)
+            continue
+
+    conn.commit()
+    logger.info("%s 写入 %d 条记录", ts_code, count)
+    return count
+
+
 def load_common_codes() -> list[str]:
     """从 .env 读取 COMMON_STOCK_CODES，返回代码列表。"""
     raw = os.getenv("COMMON_STOCK_CODES", "") or ""
@@ -242,6 +285,7 @@ def main() -> None:
         print(f"\n{summary}")
 
         # ── 拉取三大指数数据（大盘风向标）────────────────────────────────────
+        # 使用 pro.index_daily 接口，amount 单位与 pro.daily 个股一致（千元）
         INDEX_CODES = [
             ("000001.SH", "上证指数"),
             ("399001.SZ", "深证成指"),
@@ -250,7 +294,7 @@ def main() -> None:
         print("\n── 拉取大盘指数数据 ──")
         logger.info("=== 开始拉取大盘指数数据，共 %d 个指数 ===", len(INDEX_CODES))
 
-        # 预写指数名称到缓存，保证 fetch_one 能取到正确名称
+        # 预写指数名称到缓存，保证 fetch_index_one 能取到正确名称
         for ts_code, idx_name in INDEX_CODES:
             conn.execute(
                 "INSERT INTO stock_name_cache(code, name, updated_at) VALUES(?,?,?) "
@@ -262,7 +306,7 @@ def main() -> None:
         idx_success, idx_failed = 0, 0
         for ts_code, idx_name in INDEX_CODES:
             try:
-                n = fetch_one(pro, conn, ts_code, limit=limit)
+                n = fetch_index_one(pro, conn, ts_code, idx_name, limit=limit)
                 idx_success += 1
                 print(f"  ✓ {ts_code}（{idx_name}）写入 {n} 条")
                 logger.info("指数 %s 写入 %d 条", ts_code, n)

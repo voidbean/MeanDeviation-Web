@@ -5,6 +5,7 @@ import tushare as ts
 import os
 import sqlite3
 import time
+import json
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -430,7 +431,7 @@ def get_index_market_data(days: int = 20) -> dict:
             rows = cur.fetchall()
             records = []
             for r in rows:
-                amount_yi = round(r[4] / 10000, 2) if r[4] else 0  # 千元 → 亿元
+                amount_yi = round(r[4] / 100000, 2) if r[4] else 0  # 千元 → 亿元（1亿=10万千元）
                 records.append({
                     "date":       r[0],
                     "close":      r[1],
@@ -641,6 +642,418 @@ VWAP均价：{result['avg_price']}
 
 注意：分析基于当前有限数据，仅供参考，不构成投资建议。
 {"" if not user_hint else chr(10) + "【用户补充说明】" + chr(10) + user_hint.strip()}"""
+
+
+# ── Tool Use 工具层 ──────────────────────────────────────────────────────────
+
+# 工具安全上限：防止 LLM 无限循环调用工具
+MAX_TOOL_ROUNDS = 5
+
+# 统一工具描述（语义层），由此生成各 provider 的格式
+TOOL_DEFINITIONS = [
+    {
+        "name": "get_intraday_lines",
+        "description": (
+            "获取个股今日分时数据，包含白线（每分钟收盘价）和黄线（分时均价，即累计成交额/累计成交量）。"
+            "用于判断日内价格趋势、均价支撑/压力位、做T时机。每5分钟一个采样点。"
+            "仅在交易时段（09:30-15:00）有数据，非交易时段返回空。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH 或 000001.SZ"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_moneyflow",
+        "description": (
+            "获取个股最近5个交易日的主力资金流向数据，包含主力净流入、超大单、大单、中单、小单的净流入金额和占比。"
+            "用于判断主力资金动向、散户情绪，配合量价分析（Skill 05）和市场参与者分析（Skill 08）。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_top_list",
+        "description": (
+            "获取个股最近10个交易日内上榜龙虎榜的记录，包含上榜原因、买入/卖出金额、机构/游资席位信息。"
+            "用于判断市场参与者行为（Skill 08），识别是否有机构/游资介入。"
+            "若近期未上榜则返回空列表。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_daily_basic",
+        "description": (
+            "获取个股最新一日的基本面指标，包含市盈率(PE)、市净率(PB)、换手率、总市值、流通市值、量比等。"
+            "用于股票类型判断（Skill 11）和估值参考，辅助判断是大盘股/中小盘/题材股。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
+]
+
+
+def _today_str() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _tool_get_intraday_lines(ts_code: str) -> dict:
+    """拉取今日分时数据，计算黄白线，每5分钟采样一条。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取分时数据"}
+    today = _today_str()
+    try:
+        df = pro.stk_mins(
+            ts_code=ts_code,
+            freq="1min",
+            start_date=f"{today} 09:30:00",
+            end_date=f"{today} 15:00:00",
+        )
+    except Exception as e:
+        return {"error": f"stk_mins 调用失败: {e}"}
+
+    if df is None or df.empty:
+        return {"error": "暂无分时数据，可能非交易时段或代码有误"}
+
+    df = df.sort_values("trade_time").reset_index(drop=True)
+    df["vol"] = df["vol"].fillna(0).astype(float)
+    df["amount"] = df["amount"].fillna(0).astype(float)
+
+    # 黄线：累计成交额 / 累计成交量（vol 单位手，amount 单位元）
+    cum_vol = df["vol"].cumsum()
+    cum_amount = df["amount"].cumsum()
+    # vol 单位是手（100股），amount 单位是元；均价 = amount(元) / (vol*100 股) = 元/股
+    df["yellow"] = cum_amount / (cum_vol * 100).replace(0, float("nan"))
+
+    # 每5分钟取最后一条（按 trade_time 分钟数整除5分组）
+    def _minute_group(t: str) -> str:
+        # t 格式 "2026-04-29 09:35:00"，取 HH:MM 部分
+        hm = t[11:16]
+        h, m = int(hm[:2]), int(hm[3:])
+        bucket = (m // 5) * 5
+        return f"{h:02d}:{bucket:02d}"
+
+    df["bucket"] = df["trade_time"].apply(_minute_group)
+    sampled = df.groupby("bucket", sort=True).last().reset_index()
+
+    points = []
+    for _, row in sampled.iterrows():
+        price = round(float(row["close"]), 4)
+        yellow = round(float(row["yellow"]), 4) if not (row["yellow"] != row["yellow"]) else None
+        points.append({"time": row["bucket"], "price": price, "avg": yellow})
+
+    latest = points[-1] if points else {}
+    return {
+        "ts_code": ts_code,
+        "date": today,
+        "latest_price": latest.get("price"),
+        "latest_avg": latest.get("avg"),
+        "points": points,
+        "note": "price=白线（每分钟收盘价），avg=黄线（分时均价）",
+    }
+
+
+def _tool_get_moneyflow(ts_code: str, trade_date: str = "") -> dict:
+    """获取最近5日主力资金流向。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN"}
+    try:
+        df = pro.moneyflow(ts_code=ts_code, limit=5)
+    except Exception as e:
+        return {"error": f"moneyflow 调用失败: {e}"}
+    if df is None or df.empty:
+        return {"error": "暂无资金流向数据"}
+
+    fields = ["trade_date", "buy_elg_vol", "buy_elg_amount", "sell_elg_vol", "sell_elg_amount",
+              "buy_lg_vol", "buy_lg_amount", "sell_lg_vol", "sell_lg_amount",
+              "net_mf_vol", "net_mf_amount"]
+    available = [f for f in fields if f in df.columns]
+    records = df[available].sort_values("trade_date", ascending=False).head(5).to_dict("records")
+    return {"ts_code": ts_code, "records": records,
+            "note": "elg=超大单，lg=大单，net_mf=主力净流入，amount单位万元"}
+
+
+def _tool_get_top_list(ts_code: str, trade_date: str = "") -> dict:
+    """获取近10个交易日龙虎榜记录。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN"}
+    try:
+        # 取最近10个交易日范围
+        from datetime import datetime, timedelta
+        end = datetime.today()
+        start = end - timedelta(days=14)
+        df = pro.top_list(
+            ts_code=ts_code,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+    except Exception as e:
+        return {"error": f"top_list 调用失败: {e}"}
+    if df is None or df.empty:
+        return {"ts_code": ts_code, "records": [], "note": "近期未上榜龙虎榜"}
+
+    fields = ["trade_date", "reason", "buy_amount", "sell_amount", "net_amount", "turnover_rate"]
+    available = [f for f in fields if f in df.columns]
+    records = df[available].sort_values("trade_date", ascending=False).head(10).to_dict("records")
+    return {"ts_code": ts_code, "records": records, "note": "amount单位万元"}
+
+
+def _tool_get_daily_basic(ts_code: str, trade_date: str = "") -> dict:
+    """获取最新一日基本面指标。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN"}
+    try:
+        df = pro.daily_basic(ts_code=ts_code, limit=1)
+    except Exception as e:
+        return {"error": f"daily_basic 调用失败: {e}"}
+    if df is None or df.empty:
+        return {"error": "暂无基本面数据"}
+
+    fields = ["trade_date", "pe", "pe_ttm", "pb", "ps_ttm", "dv_ttm",
+              "total_mv", "circ_mv", "turnover_rate", "turnover_rate_f", "volume_ratio"]
+    available = [f for f in fields if f in df.columns]
+    record = df[available].iloc[0].to_dict()
+    return {"ts_code": ts_code, "data": record,
+            "note": "pe=市盈率，pb=市净率，total_mv=总市值(万元)，turnover_rate=换手率(%)"}
+
+
+def execute_tool(tool_name: str, tool_args: dict) -> str:
+    """执行工具调用，返回 JSON 字符串结果（供 LLM 消费）。"""
+    logger.info("execute_tool: name=%s args=%s", tool_name, tool_args)
+    try:
+        if tool_name == "get_intraday_lines":
+            result = _tool_get_intraday_lines(tool_args["ts_code"])
+        elif tool_name == "get_moneyflow":
+            result = _tool_get_moneyflow(tool_args["ts_code"], tool_args.get("trade_date", ""))
+        elif tool_name == "get_top_list":
+            result = _tool_get_top_list(tool_args["ts_code"], tool_args.get("trade_date", ""))
+        elif tool_name == "get_daily_basic":
+            result = _tool_get_daily_basic(tool_args["ts_code"], tool_args.get("trade_date", ""))
+        else:
+            result = {"error": f"未知工具: {tool_name}"}
+    except Exception as e:
+        logger.error("execute_tool error: name=%s error=%s", tool_name, e)
+        result = {"error": str(e)}
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _build_claude_tools() -> list:
+    """将 TOOL_DEFINITIONS 转换为 Anthropic tool_use 格式。"""
+    tools = []
+    for t in TOOL_DEFINITIONS:
+        tools.append({
+            "name": t["name"],
+            "description": t["description"],
+            "input_schema": {
+                "type": "object",
+                "properties": {k: v for k, v in t["parameters"].items()},
+                "required": t["required"],
+            },
+        })
+    return tools
+
+
+def _build_openai_tools() -> list:
+    """将 TOOL_DEFINITIONS 转换为 OpenAI function calling 格式。"""
+    tools = []
+    for t in TOOL_DEFINITIONS:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": {k: v for k, v in t["parameters"].items()},
+                    "required": t["required"],
+                },
+            },
+        })
+    return tools
+
+
+def _build_gemini_tools():
+    """将 TOOL_DEFINITIONS 转换为 Gemini FunctionDeclaration 格式。"""
+    import google.generativeai as genai
+    declarations = []
+    for t in TOOL_DEFINITIONS:
+        props = {}
+        for param_name, param_info in t["parameters"].items():
+            props[param_name] = genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=param_info.get("description", ""),
+            )
+        declarations.append(
+            genai.types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties=props,
+                    required=t["required"],
+                ),
+            )
+        )
+    return genai.types.Tool(function_declarations=declarations)
+
+
+def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
+    """
+    带工具调用的 AI 分析入口。
+    LLM 可在分析过程中主动调用 Tushare 工具获取额外数据（分时黄白线、资金流等）。
+    三个 provider 均支持 tool_use / function calling。
+    """
+    provider = AI_PROVIDER
+    MAX_TOKENS = 4096
+
+    # ── Claude ──────────────────────────────────────────────────────────────
+    if provider == "claude":
+        import anthropic
+        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 180.0}
+        if CLAUDE_BASE_URL:
+            kwargs["base_url"] = CLAUDE_BASE_URL
+        client = anthropic.Anthropic(**kwargs)
+        claude_tools = _build_claude_tools()
+        messages = [{"role": "user", "content": user_prompt}]
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                tools=claude_tools,
+                messages=messages,
+            )
+            logger.info("claude tool_use round=%d stop_reason=%s", _round, resp.stop_reason)
+
+            if resp.stop_reason == "end_turn":
+                return "".join(b.text for b in resp.content if hasattr(b, "text"))
+
+            if resp.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": resp.content})
+                tool_results = []
+                for block in resp.content:
+                    if block.type == "tool_use":
+                        result_str = execute_tool(block.name, block.input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_str,
+                        })
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                # max_tokens 或其他原因，直接返回已有文本
+                return "".join(b.text for b in resp.content if hasattr(b, "text"))
+
+        # 超过最大轮次，返回最后一次响应的文本
+        logger.warning("claude tool_use exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+        return "".join(b.text for b in resp.content if hasattr(b, "text"))
+
+    # ── OpenAI ───────────────────────────────────────────────────────────────
+    elif provider == "openai":
+        from openai import OpenAI
+        kwargs = {"api_key": OPENAI_API_KEY, "timeout": 180.0}
+        if OPENAI_BASE_URL:
+            kwargs["base_url"] = OPENAI_BASE_URL
+        client = OpenAI(**kwargs)
+        openai_tools = _build_openai_tools()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                max_tokens=MAX_TOKENS,
+                tools=openai_tools,
+                messages=messages,
+            )
+            choice = resp.choices[0]
+            logger.info("openai tool_use round=%d finish_reason=%s", _round, choice.finish_reason)
+
+            if choice.finish_reason == "stop":
+                return choice.message.content or ""
+
+            if choice.finish_reason == "tool_calls":
+                msg = choice.message
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.content,
+                    "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+                })
+                for tc in msg.tool_calls:
+                    args = json.loads(tc.function.arguments)
+                    result_str = execute_tool(tc.function.name, args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_str,
+                    })
+            else:
+                return choice.message.content or ""
+
+        logger.warning("openai tool_use exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+        return resp.choices[0].message.content or ""
+
+    # ── Gemini ───────────────────────────────────────────────────────────────
+    elif provider == "gemini":
+        import google.generativeai as genai
+        from google.generativeai import types as genai_types
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_tool = _build_gemini_tools()
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=system_prompt,
+            tools=[gemini_tool],
+        )
+        chat = model.start_chat()
+
+        resp = chat.send_message(
+            user_prompt,
+            generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
+            request_options={"timeout": 180},
+        )
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            # 检查是否有 function_call
+            fc_parts = [p for p in resp.parts if p.function_call.name]
+            logger.info("gemini tool_use round=%d fc_count=%d", _round, len(fc_parts))
+
+            if not fc_parts:
+                # 没有工具调用，返回文本
+                return resp.text
+
+            # 执行所有工具，构造 FunctionResponse 列表
+            fn_responses = []
+            for part in fc_parts:
+                fc = part.function_call
+                result_str = execute_tool(fc.name, dict(fc.args))
+                fn_responses.append(
+                    genai_types.Part.from_function_response(
+                        name=fc.name,
+                        response={"result": result_str},
+                    )
+                )
+
+            resp = chat.send_message(
+                fn_responses,
+                generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
+                request_options={"timeout": 180},
+            )
+
+        logger.warning("gemini tool_use exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+        return resp.text
+
+    else:
+        raise ValueError(f"不支持的 AI_PROVIDER: {provider}，请设置为 claude / openai / gemini")
 
 
 def call_ai_model(system_prompt: str, user_prompt: str) -> str:
@@ -1048,11 +1461,11 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
     index_data = get_index_market_data(days=20)
     user_prompt = build_ai_prompt(result, history, mode=ai_mode, user_hint=user_hint, index_data=index_data)
 
-    # 4. 调用 AI 模型
+    # 4. 调用 AI 模型（带工具调用）
     ai_analysis = None
     ai_error = None
     try:
-        ai_analysis = call_ai_model(system_prompt, user_prompt)
+        ai_analysis = call_ai_model_with_tools(system_prompt, user_prompt)
         logger.info("ai_analyze: done code=%s", stock_code)
     except Exception as e:
         ai_error = str(e)
