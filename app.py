@@ -610,15 +610,15 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
 股票名称：{result['name']}
 当日价格：{result['current_price']}（今日高:{result['high']} 低:{result['low']}）
 VWAP均价：{result['avg_price']}
-8848上轨：{result['upper_line']}
-8848下轨：{result['lower_line']}
+静态8848上轨：{result['upper_line']}
+静态8848下轨：{result['lower_line']}
 持仓状态：{"持仓中，成本价 " + str(result['cost_price']) if holding else "未持仓"}
 阶段高点：{result['stage_high'] if result['stage_high'] > 0 else "未设置"}
 阶段低点：{result['stage_low'] if result['stage_low'] > 0 else "未设置"}
 {fib_text}
 20日高点：{result['n20_high']}  20日低点：{result['n20_low']}
 60日高点：{result['n60_high']}  60日低点：{result['n60_low']}
-现有规则信号：{result['signal']}
+静态规则信号参考：{result['signal']}
 
 【近期历史数据（最近60日，按日期倒序）】
 {history_text if history_text else "暂无历史数据"}
@@ -629,16 +629,18 @@ VWAP均价：{result['avg_price']}
 【分析要求】
 请按以下结构输出，每个部分控制在3-5句话以内，简洁直接：
 
-0. **大盘阶段判断**（参考 Skill 01）：根据三大指数的量能趋势和价格走势，当前大盘处于哪个阶段（3-1/3-2/3-3/3-4/3-5）？对个股操作有何影响？
+0. **对静态信号的批判性评估**：输入数据中的“静态8848上下轨”和“斐波那契”是基于固定参数计算的，它们可能不适用于所有股票和市场情况。请你首先结合当前股票的量价关系、波动性等其他因素，判断这些静态信号在当前场景下的**可靠性**。如果认为信号有误或参考价值不大，请明确指出你的不同观点。
 
-1. **股票类型判断**（参考 Skill 11）：这只股票属于哪种类型（A/B/C/D/E类及子类），判断依据是什么？
+1. **大盘阶段判断**（参考 Skill 01）：根据三大指数的量能趋势和价格走势，当前大盘处于哪个阶段（3-1/3-2/3-3/3-4/3-5）？对个股操作有何影响？
 
-2. **量价状态**（参考 Skill 05）：从历史数据看，近期量能趋势如何？是放量还是缩量？结合均价走势推断资金动向。
+2. **股票类型判断**（参考 Skill 11）：这只股票属于哪种类型（A/B/C/D/E类及子类），判断依据是什么？
 
-3. **{op3_label}**（参考 Skill 03 + 对应类型操作规则）：结合现有规则信号（{result['signal']}），{op3_focus}
+3. **量价状态**（参考 Skill 05）：从历史数据看，近期量能趋势如何？是放量还是缩量？结合均价走势推断资金动向。
+
+4. **{op3_label}**（参考 Skill 03 + 对应类型操作规则）：在完成上述评估后，再结合静态规则信号参考（{result['signal']}），{op3_focus}
 {extra_instruction}
 
-4. **风险提示**（参考 Skill 07）：当前主要风险点是什么？有哪些需要特别注意的信号？
+5. **风险提示**（参考 Skill 07）：当前主要风险点是什么？有哪些需要特别注意的信号？
 
 注意：分析基于当前有限数据，仅供参考，不构成投资建议。
 {"" if not user_hint else chr(10) + "【用户补充说明】" + chr(10) + user_hint.strip()}"""
@@ -933,13 +935,16 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
             )
             logger.info("claude tool_use round=%d stop_reason=%s", _round, resp.stop_reason)
 
+            # Defensive coding: handle cases where content is None (e.g. API error, safety filter)
+            response_content = resp.content or []
+
             if resp.stop_reason == "end_turn":
-                return "".join(b.text for b in resp.content if hasattr(b, "text"))
+                return "".join(b.text for b in response_content if hasattr(b, "text"))
 
             if resp.stop_reason == "tool_use":
-                messages.append({"role": "assistant", "content": resp.content})
+                messages.append({"role": "assistant", "content": response_content})
                 tool_results = []
-                for block in resp.content:
+                for block in response_content:
                     if block.type == "tool_use":
                         result_str = execute_tool(block.name, block.input)
                         tool_results.append({
@@ -949,12 +954,15 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
                         })
                 messages.append({"role": "user", "content": tool_results})
             else:
-                # max_tokens 或其他原因，直接返回已有文本
-                return "".join(b.text for b in resp.content if hasattr(b, "text"))
+                # max_tokens, stop_reason=None, or other reasons
+                if not response_content:
+                    return "AI model returned no content. This might be due to safety settings, a timeout, or an API error."
+                return "".join(b.text for b in response_content if hasattr(b, "text"))
 
         # 超过最大轮次，返回最后一次响应的文本
         logger.warning("claude tool_use exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
-        return "".join(b.text for b in resp.content if hasattr(b, "text"))
+        final_content = resp.content or []
+        return "".join(b.text for b in final_content if hasattr(b, "text"))
 
     # ── OpenAI ───────────────────────────────────────────────────────────────
     elif provider == "openai":
@@ -1453,7 +1461,7 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
     skills_text = load_skills()
     system_prompt = (
         "你是基于阿狼投资体系的 A 股分析助手。"
-        "以下是完整的阿狼技能库，请严格基于此进行分析，不要引入技能库以外的方法论：\n\n"
+        "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
         + skills_text
     )
     index_data = get_index_market_data(days=20)
