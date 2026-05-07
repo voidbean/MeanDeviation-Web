@@ -984,11 +984,9 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
 
             if choice.finish_reason == "tool_calls":
                 msg = choice.message
-                messages.append({
-                    "role": "assistant",
-                    "content": msg.content,
-                    "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-                })
+                # DeepSeek requires passing back 'reasoning_content'.
+                # Dumping the whole message object is the safest way to preserve all fields.
+                messages.append(msg.model_dump())
                 for tc in msg.tool_calls:
                     args = json.loads(tc.function.arguments)
                     result_str = execute_tool(tc.function.name, args)
