@@ -105,6 +105,18 @@ def init_db():
             )
             conn.commit()
 
+            # PRG 临时结果表：POST 完把渲染上下文存这里，redirect 到 GET 后读取并删除
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS temp_results (
+                    result_id  TEXT PRIMARY KEY,
+                    payload    TEXT,
+                    created_at INTEGER
+                )
+                """
+            )
+            conn.commit()
+
             # 迁移：为 portfolio 表新增 max_price 字段（记录持仓以来历史最高价）
             # SQLite 不支持 ALTER TABLE ADD COLUMN IF NOT EXISTS，用 try/except 实现幂等
             try:
@@ -366,6 +378,49 @@ def get_query_history() -> list:
     except Exception as e:
         logger.error(f"Failed to get query history: {e}")
     return []
+
+
+def save_temp_result(result_id: str, payload: dict) -> None:
+    """将模板上下文（不含 request）JSON 序列化后写入 temp_results。
+    同时清理 30 分钟前的旧记录，防止数据库无限增长。
+    """
+    import uuid as _uuid
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        now = int(time.time())
+        conn.execute(
+            "INSERT OR REPLACE INTO temp_results(result_id, payload, created_at) VALUES(?, ?, ?)",
+            (result_id, json.dumps(payload, ensure_ascii=False), now),
+        )
+        # 清理 30 分钟前的旧记录
+        conn.execute("DELETE FROM temp_results WHERE created_at < ?", (now - 1800,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("save_temp_result failed: %s", e)
+
+
+def load_temp_result(result_id: str) -> dict:
+    """读取并立即删除 temp_results 中对应记录（一次性消费）。
+    找不到时返回空 dict。
+    """
+    if not result_id:
+        return {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            "SELECT payload FROM temp_results WHERE result_id = ?", (result_id,)
+        )
+        row = cur.fetchone()
+        if row:
+            conn.execute("DELETE FROM temp_results WHERE result_id = ?", (result_id,))
+            conn.commit()
+            conn.close()
+            return json.loads(row[0])
+        conn.close()
+    except Exception as e:
+        logger.error("load_temp_result failed: %s", e)
+    return {}
 
 
 def get_n_day_stats(code: str):
@@ -1228,11 +1283,29 @@ async def update_portfolio(
     stage_low:  float = Form(0.0),
     max_price:  float = Form(0.0),  # 允许用户手动修正历史最高价
 ):
+    import uuid
     # 若表单传入的 max_price > 0 则使用表单值，否则保留数据库中的旧值，防止意外清零
     current = get_portfolio(code)
     effective_max_price = max_price if max_price > 0 else current['max_price']
     save_portfolio(code, cost_price, stage_high, stage_low, effective_max_price)
-    return await analyze_stock(request, stock_code=code)
+
+    result = calculate_8848(code)
+    if isinstance(result, dict) and result.get("status") == "success":
+        save_query_history(result["code"], result["name"])
+
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "result":          result,
+        "last_code":       code,
+        "batch_results":   None,
+        "history_results": [],
+        "ai_analysis":     None,
+        "ai_error":        None,
+        "ai_provider":     AI_PROVIDER,
+        "ai_mode":         "intraday",
+        "user_hint":       "",
+    })
+    return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
 
 
 def to_ts_code(code: str) -> str:
@@ -1338,6 +1411,7 @@ def calculate_8848_history(code: str, days: int = 5):
 
 @app.post("/analyze_batch", response_class=HTMLResponse)
 async def analyze_batch(request: Request):
+    import uuid
     results = []
     for item in COMMON_STOCKS:
         code = item.get("code")
@@ -1346,48 +1420,45 @@ async def analyze_batch(request: Request):
         res = calculate_8848(code)
         if res.get("status") == "success":
             results.append(res)
-        else:
-            continue
 
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "result": None,
-            "last_code": "",
-            "common_stocks": build_common_stocks_with_name(),
-            "batch_results": results,
-            "history_results": None,
-            "query_history": get_query_history(),
-            "ai_analysis": None,
-            "ai_error": None,
-            "ai_provider": AI_PROVIDER,
-            "ai_mode": "intraday",
-            "user_hint": "",
-        },
-    )
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "result":          None,
+        "last_code":       "",
+        "batch_results":   results,
+        "history_results": None,
+        "ai_analysis":     None,
+        "ai_error":        None,
+        "ai_provider":     AI_PROVIDER,
+        "ai_mode":         "intraday",
+        "user_hint":       "",
+    })
+    return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
 
 @app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "common_stocks": build_common_stocks_with_name(),
-            "batch_results": None,
-            "history_results": None,
-            "last_code": "",
-            "query_history": get_query_history(),
-            "ai_analysis": None,
-            "ai_error": None,
-            "ai_provider": AI_PROVIDER,
-            "ai_mode": "intraday",
-            "user_hint": "",
-        },
-    )
+async def read_root(request: Request, result_id: str = None):
+    defaults = {
+        "common_stocks":   build_common_stocks_with_name(),
+        "batch_results":   None,
+        "history_results": None,
+        "last_code":       "",
+        "query_history":   get_query_history(),
+        "ai_analysis":     None,
+        "ai_error":        None,
+        "ai_provider":     AI_PROVIDER,
+        "ai_mode":         "intraday",
+        "user_hint":       "",
+        "result":          None,
+    }
+    ctx = load_temp_result(result_id) if result_id else {}
+    # query_history 和 common_stocks 总是刷新，不从缓存取
+    ctx.pop("query_history", None)
+    ctx.pop("common_stocks", None)
+    return templates.TemplateResponse("index.html", {"request": request, **defaults, **ctx})
 
 @app.post("/analyze", response_class=HTMLResponse)
 async def analyze_stock(request: Request, stock_code: str = Form(...)):
+    import uuid
     logger.info("analyze_stock: start code=%s", stock_code)
     result = calculate_8848(stock_code)
 
@@ -1400,23 +1471,19 @@ async def analyze_stock(request: Request, stock_code: str = Form(...)):
         stock_code,
         result.get("status") if isinstance(result, dict) else "unknown",
     )
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "result": result,
-            "last_code": stock_code,
-            "common_stocks": build_common_stocks_with_name(),
-            "batch_results": None,
-            "history_results": [],
-            "query_history": get_query_history(),
-            "ai_analysis": None,
-            "ai_error": None,
-            "ai_provider": AI_PROVIDER,
-            "ai_mode": "intraday",
-            "user_hint": "",
-        },
-    )
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "result":          result,
+        "last_code":       stock_code,
+        "batch_results":   None,
+        "history_results": [],
+        "ai_analysis":     None,
+        "ai_error":        None,
+        "ai_provider":     AI_PROVIDER,
+        "ai_mode":         "intraday",
+        "user_hint":       "",
+    })
+    return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
 
 
 @app.post("/ai_analyze", response_class=HTMLResponse)
@@ -1424,28 +1491,25 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
     """手动触发 AI 分析，基于阿狼技能库给出操作建议
     ai_mode: 'intraday' = 盘中分析 | 'next_day' = 盘后/明日计划
     """
+    import uuid
     logger.info("ai_analyze: start code=%s provider=%s mode=%s", stock_code, AI_PROVIDER, ai_mode)
 
     # 1. 先跑一次 8848 获取最新数据
     result = calculate_8848(stock_code)
     if result.get("error"):
-        return templates.TemplateResponse(
-            "index.html",
-            {
-                "request": request,
-                "result": result,
-                "last_code": stock_code,
-                "common_stocks": build_common_stocks_with_name(),
-                "batch_results": None,
-                "history_results": [],
-                "query_history": get_query_history(),
-                "ai_analysis": None,
-                "ai_error": f"获取股票数据失败：{result.get('error')}",
-                "ai_provider": AI_PROVIDER,
-                "ai_mode": ai_mode,
-                "user_hint": user_hint,
-            },
-        )
+        rid = str(uuid.uuid4())
+        save_temp_result(rid, {
+            "result":          result,
+            "last_code":       stock_code,
+            "batch_results":   None,
+            "history_results": [],
+            "ai_analysis":     None,
+            "ai_error":        f"获取股票数据失败：{result.get('error')}",
+            "ai_provider":     AI_PROVIDER,
+            "ai_mode":         ai_mode,
+            "user_hint":       user_hint,
+        })
+        return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
 
     # 2. 取近 60 日历史数据
     history = []
@@ -1482,23 +1546,19 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
         ai_error = str(e)
         logger.error("ai_analyze: failed code=%s error=%s", stock_code, e)
 
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "result": result,
-            "last_code": stock_code,
-            "common_stocks": build_common_stocks_with_name(),
-            "batch_results": None,
-            "history_results": [],
-            "query_history": get_query_history(),
-            "ai_analysis": ai_analysis,
-            "ai_error": ai_error,
-            "ai_provider": AI_PROVIDER,
-            "ai_mode": ai_mode,
-            "user_hint": user_hint,
-        },
-    )
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "result":          result,
+        "last_code":       stock_code,
+        "batch_results":   None,
+        "history_results": [],
+        "ai_analysis":     ai_analysis,
+        "ai_error":        ai_error,
+        "ai_provider":     AI_PROVIDER,
+        "ai_mode":         ai_mode,
+        "user_hint":       user_hint,
+    })
+    return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
 
 @app.post("/update_common_stocks", response_class=HTMLResponse)
 async def update_common_stocks(request: Request, codes: str = Form(...)):
@@ -1818,19 +1878,17 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
 
 
 @app.get("/sector", response_class=HTMLResponse)
-async def sector_page(request: Request):
-    """板块轮动分析页面入口（GET，渲染空页面）。"""
-    return templates.TemplateResponse(
-        "sector.html",
-        {
-            "request":      request,
-            "ai_analysis":  None,
-            "ai_error":     None,
-            "sector_data":  None,
-            "ai_provider":  AI_PROVIDER,
-            "user_hint":    "",
-        },
-    )
+async def sector_page(request: Request, result_id: str = None):
+    """板块轮动分析页面入口（GET，渲染空页面或从临时结果恢复）。"""
+    defaults = {
+        "ai_analysis": None,
+        "ai_error":    None,
+        "sector_data": None,
+        "ai_provider": AI_PROVIDER,
+        "user_hint":   "",
+    }
+    ctx = load_temp_result(result_id) if result_id else {}
+    return templates.TemplateResponse("sector.html", {"request": request, **defaults, **ctx})
 
 
 @app.post("/sector_analyze", response_class=HTMLResponse)
@@ -1867,14 +1925,13 @@ async def sector_analyze(request: Request, user_hint: str = Form("")):
         ai_error = str(e)
         logger.error("sector_analyze: failed error=%s", e)
 
-    return templates.TemplateResponse(
-        "sector.html",
-        {
-            "request":      request,
-            "ai_analysis":  ai_analysis,
-            "ai_error":     ai_error,
-            "sector_data":  sector_data,
-            "ai_provider":  AI_PROVIDER,
-            "user_hint":    user_hint,
-        },
-    )
+    import uuid
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "ai_analysis": ai_analysis,
+        "ai_error":    ai_error,
+        "sector_data": sector_data,
+        "ai_provider": AI_PROVIDER,
+        "user_hint":   user_hint,
+    })
+    return RedirectResponse(url=f"/sector?result_id={rid}", status_code=303)
