@@ -2,12 +2,15 @@
 fetch_history.py — 历史日线数据采集脚本
 
 功能：
-    从 Tushare Pro 拉取 COMMON_STOCKS 最近 60 个交易日的日线数据，
+    从 Tushare Pro 拉取股票/ETF 最近 60 个交易日的日线数据，
     写入 daily_records 表，供 get_n_day_stats() 使用。
+    ETF（上交所 5 开头、深交所 1 开头）自动使用 fund_daily 接口。
 
 用法：
-    uv run python fetch_history.py              # 常规模式：拉取最近 60 个交易日
-    uv run python fetch_history.py --backfill   # 回填模式：拉取最近 90 个交易日，用于首次部署初始化
+    uv run python fetch_history.py                          # 常规模式：拉取 COMMON_STOCK_CODES 最近 60 个交易日
+    uv run python fetch_history.py --backfill               # 回填模式：拉取最近 90 个交易日，用于首次部署初始化
+    uv run python fetch_history.py --codes 600519,588170    # 仅拉取指定股票/ETF，忽略 COMMON_STOCK_CODES
+    uv run python fetch_history.py --codes 600519 --backfill  # 指定代码 + 回填模式
 
 crontab 示例（每个工作日 15:35 收盘后自动运行）：
     35 15 * * 1-5 cd /path/to/MeanDeviation-Web && uv run python fetch_history.py >> fetch_history.log 2>&1
@@ -80,11 +83,27 @@ def to_ts_code(code: str) -> str:
         market = "SH" if raw.startswith("sh") else "SZ"
         return f"{num}.{market}"
     if len(raw) == 6 and raw.isdigit():
-        # 588xxx/589xxx 是上交所 ETF，其余 6 开头也归 SH
-        if raw.startswith(("600", "601", "603", "605", "688", "689", "588", "589")):
+        # 上交所：6/5/688 开头
+        if raw.startswith(("600", "601", "603", "605", "688", "689", "588", "589", "510", "511", "512", "513", "515", "516", "517", "518", "519", "52")):
             return f"{raw}.SH"
+        # 深交所：0/1/2/3 开头（含 ETF 159xxx 等）
         return f"{raw}.SZ"
     raise ValueError(f"无法识别的股票代码格式: {code!r}")
+
+
+def is_etf(ts_code: str) -> bool:
+    """
+    判断一个 ts_code 是否为 ETF/基金，需使用 fund_daily 接口。
+    上交所 ETF：5 开头（510xxx、512xxx、588xxx 等）
+    深交所 ETF：1 开头（159xxx 等）
+    """
+    num = ts_code.split(".")[0]
+    market = ts_code.split(".")[-1].upper()
+    if market == "SH" and num.startswith("5"):
+        return True
+    if market == "SZ" and num.startswith("1"):
+        return True
+    return False
 
 
 def fmt_date(trade_date: str) -> str:
@@ -130,14 +149,20 @@ def upsert_daily_record(
 # ── 核心逻辑 ─────────────────────────────────────────────────────────────────
 def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS) -> int:
     """
-    拉取单只股票的历史日线数据并写入 DB。
+    拉取单只股票或 ETF 的历史日线数据并写入 DB。
+    ETF（上交所 5 开头、深交所 1 开头）自动使用 fund_daily 接口。
     返回成功写入的记录条数，失败时抛出异常。
     """
     ts_code = to_ts_code(code)
     name = get_cached_name(conn, code)
+    use_fund_api = is_etf(ts_code)
+    api_name = "fund_daily" if use_fund_api else "daily"
 
-    logger.info("拉取 %s (%s)，limit=%d", ts_code, name or "未知", limit)
-    df = pro.daily(ts_code=ts_code, limit=limit)
+    logger.info("拉取 %s (%s) via %s，limit=%d", ts_code, name or "未知", api_name, limit)
+    if use_fund_api:
+        df = pro.fund_daily(ts_code=ts_code, limit=limit)
+    else:
+        df = pro.daily(ts_code=ts_code, limit=limit)
 
     if df is None or df.empty:
         logger.warning("%s 返回空数据，可能停牌或代码有误", ts_code)
@@ -232,11 +257,18 @@ def load_common_codes() -> list[str]:
 
 # ── 入口 ─────────────────────────────────────────────────────────────────────
 def main() -> None:
-    parser = argparse.ArgumentParser(description="拉取常用股票历史日线数据")
+    parser = argparse.ArgumentParser(description="拉取股票/ETF 历史日线数据")
     parser.add_argument(
         "--backfill",
         action="store_true",
         help="回填模式：拉取最近 90 个交易日数据，用于首次部署初始化",
+    )
+    parser.add_argument(
+        "--codes",
+        type=str,
+        default="",
+        help="指定要拉取的股票/ETF 代码，逗号分隔，如 600519,588170,159206。"
+             "指定后忽略 COMMON_STOCK_CODES 环境变量。",
     )
     args = parser.parse_args()
 
@@ -251,10 +283,18 @@ def main() -> None:
         print("错误：请在 .env 中配置 TUSHARE_TOKEN")
         return
 
-    codes = load_common_codes()
+    # --codes 优先；未指定则读取环境变量
+    if args.codes.strip():
+        raw_codes = args.codes.replace("，", ",")
+        codes = [c.strip() for c in raw_codes.split(",") if c.strip()]
+        codes_source = f"--codes 参数（{len(codes)} 只）"
+    else:
+        codes = load_common_codes()
+        codes_source = f"COMMON_STOCK_CODES（{len(codes)} 只）"
+
     if not codes:
-        logger.warning("COMMON_STOCK_CODES 为空，无需拉取")
-        print("提示：COMMON_STOCK_CODES 为空，请在 .env 中配置")
+        logger.warning("未指定任何股票代码，无需拉取")
+        print("提示：请通过 --codes 参数或 .env 中的 COMMON_STOCK_CODES 指定股票代码")
         return
 
     ts.set_token(token)
@@ -266,8 +306,8 @@ def main() -> None:
 
         success, failed = 0, 0
         start_time = datetime.now()
-        logger.info("=== 开始拉取历史数据 [%s]，共 %d 只股票 ===", mode_label, len(codes))
-        print(f"模式：{mode_label}，共 {len(codes)} 只股票")
+        logger.info("=== 开始拉取历史数据 [%s]，来源：%s ===", mode_label, codes_source)
+        print(f"模式：{mode_label}，来源：{codes_source}")
 
         for code in codes:
             try:

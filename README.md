@@ -99,3 +99,45 @@ If you started the application using `start.sh` or in the background, you can us
 ```bash
 ./stop.sh
 ```
+
+---
+
+## Historical Data Fetching (`fetch_history.py`)
+
+`fetch_history.py` pulls daily OHLC data from Tushare Pro and stores it in the local SQLite database (`stock_cache.db`). This data powers the 60-day statistics and AI analysis features.
+
+> **Requires** `TUSHARE_TOKEN` to be set in `.env`.
+
+### Usage
+
+```bash
+# Normal mode: fetch last 60 trading days for all codes in COMMON_STOCK_CODES
+uv run python fetch_history.py
+
+# Backfill mode: fetch last 90 trading days (use on first deployment)
+uv run python fetch_history.py --backfill
+
+# Fetch specific stock/ETF codes only (ignores COMMON_STOCK_CODES)
+uv run python fetch_history.py --codes 600519,588170,159206
+
+# Combine: specific codes + backfill
+uv run python fetch_history.py --codes 600519,588170 --backfill
+```
+
+### ETF Support
+
+ETFs are automatically detected and fetched via the `fund_daily` API instead of `daily`:
+
+- **Shanghai ETFs** (code starts with `5`, e.g. `588170`, `510300`) → `fund_daily`
+- **Shenzhen ETFs** (code starts with `1`, e.g. `159206`, `159915`) → `fund_daily`
+- **Regular stocks** → `daily`
+
+### Crontab (auto-run after market close)
+
+```
+35 15 * * 1-5 cd /path/to/MeanDeviation-Web && uv run python fetch_history.py >> fetch_history.log 2>&1
+```
+
+### Index Data
+
+The script also automatically fetches the three major market indices (上证指数, 深证成指, 创业板指) on every run, which are used as market trend indicators in AI analysis.
