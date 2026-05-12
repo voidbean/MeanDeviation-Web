@@ -754,6 +754,87 @@ TOOL_DEFINITIONS = [
         },
         "required": ["ts_code"],
     },
+    {
+        "name": "get_technical_indicators",
+        "description": (
+            "基于个股近60日历史K线，计算并返回技术指标：BOLL布林带（上轨/中轨/下轨）、"
+            "5日/10日/20日均线（MA5/MA10/MA20），以及最近20日的收盘价序列。"
+            "用于判断当前价格所处位置（BOLL位置）、趋势方向（均线多头/空头排列）、"
+            "支撑压力位（Skill 02仓位管理、Skill 03买卖信号、Skill 09长线持仓）。"
+            "数据来自本地 daily_records 表，无需 Tushare 调用。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH 或 000001.SZ"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_margin_data",
+        "description": (
+            "获取近10个交易日沪深两市融资融券余额及变化趋势。"
+            "融资余额持续增加说明散户情绪亢奋，是风险信号；"
+            "融资余额持续萎缩+低位企稳是磨底信号。"
+            "用于行情阶段判断（Skill 01）、风险管理（Skill 07）、散户情绪分析（Skill 08）。"
+        ),
+        "parameters": {},
+        "required": [],
+    },
+    {
+        "name": "get_sector_flow",
+        "description": (
+            "获取A股主要板块指数（科技/资源/消费/金融/医药等）近5日的涨跌幅和成交额，"
+            "辅助判断板块轮动方向和当前主线题材。"
+            "用于板块轮动分析（Skill 04）和市场参与者判断（Skill 08）。"
+        ),
+        "parameters": {
+            "trade_date": {"type": "string", "description": "查询日期，格式 YYYYMMDD，默认取最近交易日"},
+        },
+        "required": [],
+    },
+    {
+        "name": "get_futures_positions",
+        "description": (
+            "获取沪深300股指期货（IF）主力合约近5日的多空持仓量及变化趋势。"
+            "主力多单增加说明机构看多；空单增加是看空信号。"
+            "用于行情阶段判断（Skill 01）和量价分析（Skill 05）。"
+        ),
+        "parameters": {},
+        "required": [],
+    },
+    {
+        "name": "get_disclosure_calendar",
+        "description": (
+            "查询个股最近或即将发布的财报披露日期（年报/半年报/季报）。"
+            "财报发布前后是高风险窗口，需要控制仓位。"
+            "用于仓位管理（Skill 02）和风险管理（Skill 07）。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_share_reduction",
+        "description": (
+            "查询个股近90天内大股东/高管的增持或减持记录。"
+            "大股东减持是明确的卖出信号；增持则是看多信号。"
+            "用于买卖信号判断（Skill 03）和风险管理（Skill 07）。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_etf_flow",
+        "description": (
+            "获取主要宽基ETF（沪深300ETF、科创50ETF、创业板ETF等）近5日的资金净流入情况，"
+            "判断国家队（GJD）是否在通过ETF入市托底或加仓。"
+            "用于市场参与者分析（Skill 08）和行情阶段判断（Skill 01）。"
+        ),
+        "parameters": {},
+        "required": [],
+    },
 ]
 
 
@@ -881,6 +962,505 @@ def _tool_get_daily_basic(ts_code: str, trade_date: str = "") -> dict:
             "note": "pe=市盈率，pb=市净率，total_mv=总市值(万元)，turnover_rate=换手率(%)"}
 
 
+def _tool_get_technical_indicators(ts_code: str) -> dict:
+    """基于 daily_records 历史数据计算 BOLL 布林带和均线指标。"""
+    # 将 ts_code 转为 daily_records 中存储的 code 格式（去掉后缀）
+    code = ts_code.split(".")[0] if "." in ts_code else ts_code
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            """
+            SELECT date, close, high, low
+            FROM daily_records
+            WHERE code = ?
+            ORDER BY date DESC
+            LIMIT 60
+            """,
+            (ts_code,),
+        )
+        rows = cur.fetchall()
+        # 尝试不带后缀的 code（兼容不同存储格式）
+        if not rows:
+            cur = conn.execute(
+                """
+                SELECT date, close, high, low
+                FROM daily_records
+                WHERE code = ?
+                ORDER BY date DESC
+                LIMIT 60
+                """,
+                (code,),
+            )
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        return {"error": f"读取历史数据失败: {e}"}
+
+    if not rows:
+        return {"error": "暂无历史K线数据，请先运行 fetch_history.py 拉取数据"}
+
+    # rows 按日期倒序，反转为正序计算
+    rows = list(reversed(rows))
+    closes = [r[1] for r in rows if r[1] is not None]
+    n = len(closes)
+
+    if n < 5:
+        return {"error": f"历史数据不足（仅{n}条），无法计算技术指标，至少需要5条"}
+
+    def sma(data: list, period: int) -> float | None:
+        if len(data) < period:
+            return None
+        return round(sum(data[-period:]) / period, 4)
+
+    def boll(data: list, period: int = 20, k: float = 2.0):
+        if len(data) < period:
+            return None, None, None
+        window = data[-period:]
+        mid = sum(window) / period
+        std = (sum((x - mid) ** 2 for x in window) / period) ** 0.5
+        return round(mid + k * std, 4), round(mid, 4), round(mid - k * std, 4)
+
+    ma5  = sma(closes, 5)
+    ma10 = sma(closes, 10)
+    ma20 = sma(closes, 20)
+    boll_upper, boll_mid, boll_lower = boll(closes, 20)
+
+    latest_close = closes[-1]
+    latest_date  = rows[-1][0]
+
+    # 均线多空排列判断
+    ma_trend = "数据不足"
+    if ma5 and ma10 and ma20:
+        if ma5 > ma10 > ma20:
+            ma_trend = "多头排列（MA5>MA10>MA20，趋势向上）"
+        elif ma5 < ma10 < ma20:
+            ma_trend = "空头排列（MA5<MA10<MA20，趋势向下）"
+        else:
+            ma_trend = "均线纠缠（无明确趋势）"
+
+    # BOLL 位置判断
+    boll_position = "数据不足"
+    if boll_upper and boll_lower and boll_mid:
+        if latest_close >= boll_upper:
+            boll_position = "价格在BOLL上轨附近或以上（超买区，注意压力）"
+        elif latest_close <= boll_lower:
+            boll_position = "价格在BOLL下轨附近或以下（超卖区，关注支撑）"
+        elif latest_close > boll_mid:
+            boll_position = "价格在BOLL中轨与上轨之间（强势区间）"
+        else:
+            boll_position = "价格在BOLL中轨与下轨之间（弱势区间）"
+
+    # 最近20日收盘价序列（供AI判断趋势形态）
+    recent_closes = [
+        {"date": rows[i][0], "close": rows[i][1]}
+        for i in range(max(0, n - 20), n)
+    ]
+
+    return {
+        "ts_code": ts_code,
+        "latest_date": latest_date,
+        "latest_close": latest_close,
+        "data_points": n,
+        "ma": {
+            "ma5": ma5,
+            "ma10": ma10,
+            "ma20": ma20,
+            "trend": ma_trend,
+        },
+        "boll": {
+            "upper": boll_upper,
+            "mid": boll_mid,
+            "lower": boll_lower,
+            "position": boll_position,
+        },
+        "recent_closes": recent_closes,
+        "note": "BOLL参数：20日，2倍标准差；均线：简单移动平均",
+    }
+
+
+def _tool_get_margin_data() -> dict:
+    """获取近10个交易日沪深两市融资融券余额。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取融资融券数据"}
+    try:
+        from datetime import datetime, timedelta
+        end = datetime.today()
+        start = end - timedelta(days=20)  # 多取几天以覆盖10个交易日
+        df = pro.margin(
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+    except Exception as e:
+        return {"error": f"margin 调用失败: {e}"}
+
+    if df is None or df.empty:
+        return {"error": "暂无融资融券数据"}
+
+    # 按日期汇总（沪深合计）
+    try:
+        agg = (
+            df.groupby("trade_date")[["rzye", "rqye", "rzrqye"]]
+            .sum()
+            .reset_index()
+            .sort_values("trade_date", ascending=False)
+            .head(10)
+        )
+        records = agg.to_dict("records")
+        # 计算环比变化
+        for i in range(len(records) - 1):
+            prev_rzye = records[i + 1].get("rzye", 0)
+            curr_rzye = records[i].get("rzye", 0)
+            if prev_rzye and prev_rzye != 0:
+                records[i]["rzye_chg_pct"] = round((curr_rzye - prev_rzye) / prev_rzye * 100, 2)
+            else:
+                records[i]["rzye_chg_pct"] = None
+        if records:
+            records[-1]["rzye_chg_pct"] = None
+
+        # 趋势判断（最近5日）
+        recent5 = [r.get("rzye", 0) for r in records[:5] if r.get("rzye")]
+        trend = "数据不足"
+        if len(recent5) >= 3:
+            if recent5[0] > recent5[1] > recent5[2]:
+                trend = "融资余额连续上升（散户情绪偏热，注意风险）"
+            elif recent5[0] < recent5[1] < recent5[2]:
+                trend = "融资余额连续下降（散户情绪收缩，关注磨底信号）"
+            else:
+                trend = "融资余额震荡（情绪中性）"
+
+        return {
+            "records": records,
+            "trend": trend,
+            "note": "rzye=融资余额(元)，rqye=融券余额(元)，rzrqye=两融合计余额(元)，chg_pct=较前日环比变化%",
+        }
+    except Exception as e:
+        return {"error": f"数据处理失败: {e}"}
+
+
+# 主要板块指数代码（申万一级行业代表性指数）
+SECTOR_INDEX_CODES = {
+    "801080.SI": "电子",
+    "801010.SI": "农林牧渔",
+    "801750.SI": "计算机",
+    "801760.SI": "传媒",
+    "801770.SI": "通信",
+    "801050.SI": "有色金属",
+    "801020.SI": "采掘",
+    "801030.SI": "化工",
+    "801110.SI": "家用电器",
+    "801120.SI": "食品饮料",
+    "801150.SI": "医药生物",
+    "801160.SI": "公用事业",
+    "801170.SI": "交通运输",
+    "801180.SI": "房地产",
+    "801190.SI": "银行",
+    "801200.SI": "非银金融",
+    "801210.SI": "综合",
+    "801230.SI": "综合金融",
+    "801710.SI": "建筑材料",
+    "801720.SI": "建筑装饰",
+    "801730.SI": "电气设备",
+    "801740.SI": "国防军工",
+    "801880.SI": "汽车",
+    "801890.SI": "机械设备",
+}
+
+
+def _tool_get_sector_flow(trade_date: str = "") -> dict:
+    """获取主要板块指数近5日涨跌幅，辅助判断板块轮动方向。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取板块数据"}
+
+    from datetime import datetime, timedelta
+    if not trade_date:
+        trade_date = datetime.today().strftime("%Y%m%d")
+
+    # 取近5个交易日的数据
+    start_date = (datetime.today() - timedelta(days=10)).strftime("%Y%m%d")
+
+    sector_results = []
+    try:
+        # 使用 index_daily 获取板块指数行情
+        ts_codes = list(SECTOR_INDEX_CODES.keys())
+        # 批量查询，每次最多查几个以避免超时
+        all_rows = []
+        for ts_code in ts_codes:
+            try:
+                df = pro.index_daily(
+                    ts_code=ts_code,
+                    start_date=start_date,
+                    end_date=trade_date,
+                    limit=5,
+                )
+                if df is not None and not df.empty:
+                    df["sector_name"] = SECTOR_INDEX_CODES[ts_code]
+                    all_rows.append(df)
+            except Exception:
+                continue  # 单个板块失败不影响整体
+
+        if not all_rows:
+            return {"error": "未能获取任何板块数据，可能需要更高 Tushare 权限"}
+
+        import pandas as pd
+        combined = pd.concat(all_rows, ignore_index=True)
+
+        # 取最新一日各板块涨跌幅，排序
+        latest_date = combined["trade_date"].max()
+        latest = combined[combined["trade_date"] == latest_date].copy()
+        latest = latest.sort_values("pct_chg", ascending=False)
+
+        top5_up = latest.head(5)[["sector_name", "ts_code", "close", "pct_chg", "amount"]].to_dict("records")
+        top5_down = latest.tail(5)[["sector_name", "ts_code", "close", "pct_chg", "amount"]].to_dict("records")
+
+        # 近5日累计涨跌幅（用于判断持续性）
+        sector_5d = []
+        for ts_code, name in SECTOR_INDEX_CODES.items():
+            sub = combined[combined["ts_code"] == ts_code].sort_values("trade_date")
+            if len(sub) >= 2:
+                chg_5d = round(
+                    (sub.iloc[-1]["close"] - sub.iloc[0]["close"]) / sub.iloc[0]["close"] * 100, 2
+                )
+                sector_5d.append({"sector_name": name, "ts_code": ts_code, "chg_5d_pct": chg_5d})
+
+        sector_5d.sort(key=lambda x: x["chg_5d_pct"], reverse=True)
+
+        return {
+            "latest_date": latest_date,
+            "top5_gainers_today": top5_up,
+            "top5_losers_today": top5_down,
+            "sector_5d_ranking": sector_5d,
+            "note": "pct_chg=当日涨跌幅(%)，chg_5d_pct=近5日累计涨跌幅(%)，amount=成交额(千元)",
+        }
+    except Exception as e:
+        return {"error": f"板块数据处理失败: {e}"}
+
+
+def _tool_get_futures_positions() -> dict:
+    """获取沪深300股指期货（IF）主力合约近5日多空持仓。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取期指数据"}
+    from datetime import datetime, timedelta
+    end = datetime.today()
+    start = end - timedelta(days=14)
+    try:
+        # IF 为沪深300股指期货，取主力合约持仓
+        df = pro.fut_holding(
+            symbol="IF",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+    except Exception as e:
+        return {"error": f"fut_holding 调用失败: {e}"}
+
+    if df is None or df.empty:
+        return {"error": "暂无期指持仓数据，可能需要更高 Tushare 权限"}
+
+    try:
+        # 按日期汇总多空总持仓
+        agg = (
+            df.groupby("trade_date")[["long_hld", "short_hld"]]
+            .sum()
+            .reset_index()
+            .sort_values("trade_date", ascending=False)
+            .head(5)
+        )
+        records = agg.to_dict("records")
+
+        # 计算净多头（多单-空单）及趋势
+        for r in records:
+            r["net_long"] = round(r.get("long_hld", 0) - r.get("short_hld", 0), 0)
+
+        # 趋势判断
+        if len(records) >= 2:
+            net_latest = records[0].get("net_long", 0)
+            net_prev = records[1].get("net_long", 0)
+            if net_latest > net_prev:
+                trend = "净多头增加（机构偏多，看涨信号）"
+            elif net_latest < net_prev:
+                trend = "净多头减少（机构偏空，注意风险）"
+            else:
+                trend = "持仓变化不明显"
+        else:
+            trend = "数据不足"
+
+        return {
+            "symbol": "IF（沪深300股指期货）",
+            "records": records,
+            "trend": trend,
+            "note": "long_hld=多头持仓量，short_hld=空头持仓量，net_long=净多头（多-空）",
+        }
+    except Exception as e:
+        return {"error": f"数据处理失败: {e}"}
+
+
+def _tool_get_disclosure_calendar(ts_code: str) -> dict:
+    """查询个股近期财报披露日期。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取财报日历"}
+    from datetime import datetime, timedelta
+    today = datetime.today()
+    # 查询前后90天的财报披露计划
+    start = (today - timedelta(days=30)).strftime("%Y%m%d")
+    end = (today + timedelta(days=90)).strftime("%Y%m%d")
+    try:
+        df = pro.disclosure_date(
+            ts_code=ts_code,
+            start_date=start,
+            end_date=end,
+        )
+    except Exception as e:
+        return {"error": f"disclosure_date 调用失败: {e}"}
+
+    if df is None or df.empty:
+        return {"ts_code": ts_code, "records": [], "note": "未查到近期财报披露计划"}
+
+    fields = ["ann_date", "end_date", "pre_date", "actual_date", "modify_date"]
+    available = [f for f in fields if f in df.columns]
+    records = df[available].sort_values("end_date", ascending=False).to_dict("records")
+
+    # 找出最近即将发布的财报
+    today_str = today.strftime("%Y%m%d")
+    upcoming = [r for r in records if r.get("pre_date", "") >= today_str or r.get("actual_date", "") >= today_str]
+    warning = None
+    if upcoming:
+        next_report = upcoming[0]
+        pre_date = next_report.get("pre_date") or next_report.get("actual_date", "")
+        if pre_date:
+            days_left = (datetime.strptime(pre_date, "%Y%m%d") - today).days
+            if days_left <= 14:
+                warning = f"⚠️ 距下次财报披露仅剩 {days_left} 天（{pre_date}），建议控制仓位"
+            else:
+                warning = f"下次财报披露预计 {pre_date}，距今 {days_left} 天"
+
+    return {
+        "ts_code": ts_code,
+        "records": records[:6],
+        "upcoming_warning": warning,
+        "note": "ann_date=公告日，end_date=报告期，pre_date=预计披露日，actual_date=实际披露日",
+    }
+
+
+def _tool_get_share_reduction(ts_code: str) -> dict:
+    """查询个股近90天大股东/高管增减持记录。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取增减持数据"}
+    from datetime import datetime, timedelta
+    end = datetime.today()
+    start = end - timedelta(days=90)
+    try:
+        df = pro.stk_holdertrade(
+            ts_code=ts_code,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+    except Exception as e:
+        return {"error": f"stk_holdertrade 调用失败: {e}"}
+
+    if df is None or df.empty:
+        return {"ts_code": ts_code, "records": [], "note": "近90天无大股东增减持记录"}
+
+    fields = ["ann_date", "holder_name", "holder_type", "in_de", "change_vol", "change_ratio",
+              "after_share", "after_ratio", "avg_price", "total_share"]
+    available = [f for f in fields if f in df.columns]
+    records = df[available].sort_values("ann_date", ascending=False).head(10).to_dict("records")
+
+    # 汇总增减持方向
+    in_de_col = "in_de" if "in_de" in df.columns else None
+    reduction_count = 0
+    increase_count = 0
+    if in_de_col:
+        reduction_count = int((df[in_de_col] == "减持").sum())
+        increase_count = int((df[in_de_col] == "增持").sum())
+
+    summary = f"近90天：增持{increase_count}次，减持{reduction_count}次"
+    if reduction_count > increase_count:
+        signal = "⚠️ 减持次数多于增持，注意大股东出货风险"
+    elif increase_count > reduction_count:
+        signal = "✅ 增持次数多于减持，大股东看多信号"
+    else:
+        signal = "增减持持平或无记录"
+
+    return {
+        "ts_code": ts_code,
+        "summary": summary,
+        "signal": signal,
+        "records": records,
+        "note": "in_de=增持/减持，change_vol=变动股数，change_ratio=变动比例，avg_price=均价",
+    }
+
+
+# 主要宽基/行业ETF代码（用于GJD行为判断）
+KEY_ETF_CODES = {
+    "510300.SH": "沪深300ETF（华泰柏瑞）",
+    "510500.SH": "中证500ETF",
+    "588000.SH": "科创50ETF",
+    "159915.SZ": "创业板ETF",
+    "512010.SH": "医疗ETF",
+    "512660.SH": "军工ETF",
+    "512480.SH": "半导体ETF",
+    "159869.SZ": "游戏ETF",
+}
+
+
+def _tool_get_etf_flow() -> dict:
+    """获取主要宽基ETF近5日资金净流入，判断GJD行为。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN，无法获取ETF数据"}
+    from datetime import datetime, timedelta
+    end = datetime.today()
+    start = end - timedelta(days=10)
+
+    etf_results = []
+    try:
+        import pandas as pd
+        for ts_code, name in KEY_ETF_CODES.items():
+            try:
+                df = pro.fund_daily(
+                    ts_code=ts_code,
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                )
+                if df is None or df.empty:
+                    continue
+                df = df.sort_values("trade_date", ascending=False).head(5)
+                latest = df.iloc[0]
+                # 近5日成交额合计（千元）
+                total_amount = df["amount"].sum() if "amount" in df.columns else None
+                etf_results.append({
+                    "ts_code": ts_code,
+                    "name": name,
+                    "latest_date": latest.get("trade_date"),
+                    "latest_close": round(float(latest.get("close", 0)), 4),
+                    "pct_chg": round(float(latest.get("pct_chg", 0)), 2) if "pct_chg" in df.columns else None,
+                    "amount_5d_yi": round(float(total_amount) / 100000, 2) if total_amount else None,
+                })
+            except Exception:
+                continue
+
+        if not etf_results:
+            return {"error": "未能获取ETF数据，可能需要更高 Tushare 权限"}
+
+        # 按5日成交额排序（成交额放大 = 资金关注度高）
+        etf_results.sort(key=lambda x: x.get("amount_5d_yi") or 0, reverse=True)
+
+        # GJD信号判断：沪深300ETF成交额是否异常放大
+        hs300_etf = next((e for e in etf_results if e["ts_code"] == "510300.SH"), None)
+        gjd_signal = "无明显GJD信号"
+        if hs300_etf and hs300_etf.get("amount_5d_yi"):
+            if hs300_etf["amount_5d_yi"] > 50:  # 5日合计超50亿
+                gjd_signal = f"⚠️ 沪深300ETF近5日成交额合计{hs300_etf['amount_5d_yi']}亿，资金关注度较高，可能有GJD介入"
+            else:
+                gjd_signal = f"沪深300ETF近5日成交额合计{hs300_etf['amount_5d_yi']}亿，未见异常放量"
+
+        return {
+            "etf_list": etf_results,
+            "gjd_signal": gjd_signal,
+            "note": "amount_5d_yi=近5日成交额合计(亿元)，pct_chg=最新日涨跌幅(%)；成交额放大可能反映GJD或机构资金流入",
+        }
+    except Exception as e:
+        return {"error": f"ETF数据处理失败: {e}"}
+
+
 def execute_tool(tool_name: str, tool_args: dict) -> str:
     """执行工具调用，返回 JSON 字符串结果（供 LLM 消费）。"""
     logger.info("execute_tool: name=%s args=%s", tool_name, tool_args)
@@ -893,6 +1473,20 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
             result = _tool_get_top_list(tool_args["ts_code"], tool_args.get("trade_date", ""))
         elif tool_name == "get_daily_basic":
             result = _tool_get_daily_basic(tool_args["ts_code"], tool_args.get("trade_date", ""))
+        elif tool_name == "get_technical_indicators":
+            result = _tool_get_technical_indicators(tool_args["ts_code"])
+        elif tool_name == "get_margin_data":
+            result = _tool_get_margin_data()
+        elif tool_name == "get_sector_flow":
+            result = _tool_get_sector_flow(tool_args.get("trade_date", ""))
+        elif tool_name == "get_futures_positions":
+            result = _tool_get_futures_positions()
+        elif tool_name == "get_disclosure_calendar":
+            result = _tool_get_disclosure_calendar(tool_args["ts_code"])
+        elif tool_name == "get_share_reduction":
+            result = _tool_get_share_reduction(tool_args["ts_code"])
+        elif tool_name == "get_etf_flow":
+            result = _tool_get_etf_flow()
         else:
             result = {"error": f"未知工具: {tool_name}"}
     except Exception as e:
