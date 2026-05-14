@@ -83,6 +83,15 @@
                                 </div>
                             </div>
 
+                            <!-- 分时图（白线+黄线） -->
+                            {% if result.intraday_points %}
+                            <div id="intraday-chart" style="width:100%;height:180px;"></div>
+                            {% else %}
+                            <div class="text-center text-muted py-2 mb-2" style="font-size:0.8rem;">
+                                📈 分时图：交易时段每15分钟更新，暂无数据
+                            </div>
+                            {% endif %}
+
                             <!-- 8848 Intraday Levels -->
                             <h6 class="border-bottom pb-2 mb-2">Intraday T+0 (8848)</h6>
                             <ul class="list-group list-group-flush mb-3">
@@ -129,6 +138,123 @@
                             </div>
                             {% endif %}
                             
+                            <!-- BOLL 布林带 -->
+                            {% if result.boll %}
+                            <h6 class="border-bottom pb-2 mb-2">BOLL 布林带（20日，2σ）</h6>
+                            <ul class="list-group list-group-flush mb-2">
+                                <li class="list-group-item d-flex justify-content-between align-items-center bg-danger-subtle py-1"
+                                    data-bs-toggle="tooltip" data-bs-placement="left"
+                                    title="价格涨幅超出正常波动范围（统计高估区）。短线注意减仓或止盈，不追高。">
+                                    <small>上轨（压力）</small>
+                                    <span class="fw-bold price-up">{{ result.boll.upper }}</span>
+                                </li>
+                                <li class="list-group-item d-flex justify-content-between align-items-center py-1"
+                                    data-bs-toggle="tooltip" data-bs-placement="left"
+                                    title="20日均价，多空分界线。价格站上中轨为强势，跌破中轨为弱势。回踩中轨不破是加仓机会。">
+                                    <small>中轨（均值）</small>
+                                    <span class="fw-bold text-secondary">{{ result.boll.mid }}</span>
+                                </li>
+                                <li class="list-group-item d-flex justify-content-between align-items-center bg-success-subtle py-1"
+                                    data-bs-toggle="tooltip" data-bs-placement="left"
+                                    title="价格跌幅超出正常波动范围（统计低估区）。关注超跌反弹机会，需配合量能放大确认。">
+                                    <small>下轨（支撑）</small>
+                                    <span class="fw-bold price-down">{{ result.boll.lower }}</span>
+                                </li>
+                            </ul>
+                            {% set boll_tips = {
+                                "上轨附近（超买，注意压力）": "价格已超出正常波动上沿。短线注意减仓止盈，追高风险大，等待回落中轨再评估。",
+                                "中轨↑上轨（强势区间）": "价格高于均值且未超买，多头占优。可持仓，回踩中轨不破是加仓机会。",
+                                "下轨↑中轨（弱势区间）": "价格低于均值，空头偏强。谨慎持仓，等待价格重新站上中轨后再考虑介入。",
+                                "下轨附近（超卖，关注支撑）": "价格已超出正常波动下沿，统计意义上的低估区。关注超跌反弹，但需量能放大配合，避免接飞刀。",
+                                "数据不足": "历史K线数据不足20日，无法计算布林带位置。"
+                            } %}
+                            <div class="alert alert-{{ result.boll.advice_class }} py-1 px-2 mb-3 d-flex justify-content-between align-items-center"
+                                 style="font-size:0.8rem; cursor:help;"
+                                 data-bs-toggle="tooltip" data-bs-placement="bottom"
+                                 title="{{ boll_tips.get(result.boll.position, '') }}">
+                                <span>📊 当前位置：<strong>{{ result.boll.position }}</strong></span>
+                                <small class="text-muted ms-2" style="font-size:0.72rem;">hover 查看建议</small>
+                            </div>
+                            {% endif %}
+
+                            <!-- MACD 指标 -->
+                            {% if result.macd %}
+                            {% set macd = result.macd %}
+                            <h6 class="border-bottom pb-2 mb-2">MACD（12,26,9）</h6>
+
+                            {# 背离告警 —— 最优先展示 #}
+                            {% if macd.divergence == "top" %}
+                            <div class="alert alert-danger py-2 px-3 mb-2 d-flex align-items-start gap-2"
+                                 data-bs-toggle="tooltip" data-bs-placement="bottom"
+                                 title="{{ macd.div_detail }}"
+                                 style="cursor:help; font-size:0.82rem;">
+                                <span style="font-size:1rem;">⚠️</span>
+                                <div>
+                                    <strong>顶背离告警</strong>
+                                    <div class="text-muted mt-1" style="font-size:0.78rem;">{{ macd.div_detail }}</div>
+                                </div>
+                            </div>
+                            {% elif macd.divergence == "bottom" %}
+                            <div class="alert alert-success py-2 px-3 mb-2 d-flex align-items-start gap-2"
+                                 data-bs-toggle="tooltip" data-bs-placement="bottom"
+                                 title="{{ macd.div_detail }}"
+                                 style="cursor:help; font-size:0.82rem;">
+                                <span style="font-size:1rem;">💡</span>
+                                <div>
+                                    <strong>底背离提示</strong>
+                                    <div class="text-muted mt-1" style="font-size:0.78rem;">{{ macd.div_detail }}</div>
+                                </div>
+                            </div>
+                            {% endif %}
+
+                            {# DIF/DEA/HIST 数值行 #}
+                            <div class="row g-1 mb-2 text-center" style="font-size:0.8rem;">
+                                <div class="col-4">
+                                    <div class="p-1 border rounded bg-light"
+                                         data-bs-toggle="tooltip" title="DIF = EMA12 - EMA26，快线。正值代表短期均价高于长期均价，多头动能。">
+                                        <div class="text-muted">DIF</div>
+                                        <strong class="{{ 'price-up' if macd.latest.dif > 0 else 'price-down' }}">
+                                            {{ macd.latest.dif }}
+                                        </strong>
+                                    </div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="p-1 border rounded bg-light"
+                                         data-bs-toggle="tooltip" title="DEA = DIF 的9日EMA，慢线（信号线）。DIF上穿DEA为金叉，下穿为死叉。">
+                                        <div class="text-muted">DEA</div>
+                                        <strong class="{{ 'price-up' if macd.latest.dea > 0 else 'price-down' }}">
+                                            {{ macd.latest.dea }}
+                                        </strong>
+                                    </div>
+                                </div>
+                                <div class="col-4">
+                                    <div class="p-1 border rounded bg-light"
+                                         data-bs-toggle="tooltip" title="MACD柱 = DIF - DEA。柱值由负转正为金叉信号，由正转负为死叉信号；柱值持续缩短是动能衰减的早期信号。">
+                                        <div class="text-muted">MACD柱</div>
+                                        <strong class="{{ 'price-up' if macd.latest.hist > 0 else 'price-down' }}">
+                                            {{ macd.latest.hist }}
+                                        </strong>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {# 金叉/死叉 + 零轴位置 #}
+                            <div class="d-flex gap-2 flex-wrap mb-3" style="font-size:0.78rem;">
+                                {% if macd.cross %}
+                                <span class="badge {{ 'bg-danger' if macd.cross.type == 'dead' else 'bg-success' }}"
+                                      data-bs-toggle="tooltip"
+                                      title="{{ '死叉：DIF下穿DEA，短期动能转弱，注意回调风险。' if macd.cross.type == 'dead' else '金叉：DIF上穿DEA，短期动能转强，关注做多机会。' }}">
+                                    {{ macd.cross.label }}（{{ macd.cross.date }}）
+                                </span>
+                                {% endif %}
+                                <span class="badge {{ 'bg-warning text-dark' if macd.above_zero else 'bg-secondary' }}"
+                                      data-bs-toggle="tooltip"
+                                      title="{{ 'DIF 在零轴上方：整体处于多头格局，回调是机会。' if macd.above_zero else 'DIF 在零轴下方：整体处于空头格局，反弹是风险，谨慎做多。' }}">
+                                    DIF {{ '零轴上方 ↑' if macd.above_zero else '零轴下方 ↓' }}
+                                </span>
+                            </div>
+                            {% endif %}
+
                             <!-- Portfolio Settings Form -->
                             <div class="card mt-3">
                                 <div class="card-header bg-white py-1 d-flex justify-content-between align-items-center">
@@ -449,6 +575,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 <script>
     // 全局函数：将建议值填入阶段高低点输入框（onclick 需要全局作用域）
     function fillStage(high, low) {
@@ -495,6 +622,10 @@
     }
 
     document.addEventListener('DOMContentLoaded', function () {
+        // 初始化所有 Bootstrap tooltip
+        document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
+            new bootstrap.Tooltip(el, { trigger: 'hover' });
+        });
         const analyzeForm = document.getElementById('analyze-form');
         const analyzeBtn = document.getElementById('analyze-btn');
         if (analyzeForm && analyzeBtn) {
@@ -538,6 +669,62 @@
             if (raw) {
                 marked.setOptions({ breaks: true });
                 aiResult.innerHTML = marked.parse(raw);
+            }
+        }
+
+        // 渲染分时图（ECharts 白线+黄线）
+        const chartDom = document.getElementById('intraday-chart');
+        if (chartDom && typeof echarts !== 'undefined') {
+            const points = {{ result.intraday_points | tojson if result and result.intraday_points else '[]' }};
+            if (points.length > 0) {
+                const times   = points.map(p => p.time);
+                const prices  = points.map(p => p.price);
+                const avgs    = points.map(p => p.avg);
+                const chart = echarts.init(chartDom, null, { renderer: 'svg' });
+                chart.setOption({
+                    grid: { top: 20, right: 12, bottom: 24, left: 52 },
+                    tooltip: {
+                        trigger: 'axis',
+                        formatter: params => {
+                            const t = params[0].axisValue;
+                            const lines = params.map(p =>
+                                `<span style="color:${p.color}">●</span> ${p.seriesName}: <b>${p.value ?? '-'}</b>`
+                            );
+                            return `${t}<br/>` + lines.join('<br/>');
+                        }
+                    },
+                    xAxis: {
+                        type: 'category',
+                        data: times,
+                        axisLabel: { fontSize: 10, interval: 'auto' },
+                        axisLine: { lineStyle: { color: '#ccc' } }
+                    },
+                    yAxis: {
+                        type: 'value',
+                        scale: true,
+                        axisLabel: { fontSize: 10 },
+                        splitLine: { lineStyle: { color: '#f0f0f0' } }
+                    },
+                    series: [
+                        {
+                            name: '价格',
+                            type: 'line',
+                            data: prices,
+                            symbol: 'none',
+                            lineStyle: { color: '#ffffff', width: 1.5 },
+                            itemStyle: { color: '#ffffff' }
+                        },
+                        {
+                            name: '均价',
+                            type: 'line',
+                            data: avgs,
+                            symbol: 'none',
+                            lineStyle: { color: '#f5c518', width: 1.5 },
+                            itemStyle: { color: '#f5c518' }
+                        }
+                    ],
+                    backgroundColor: '#1a1a2e'
+                });
             }
         }
     });

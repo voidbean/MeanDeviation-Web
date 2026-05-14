@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from contextlib import asynccontextmanager
+import threading
 import tushare as ts
 import os
 import sqlite3
@@ -21,7 +23,18 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时开启后台分时快照抓取线程。"""
+    t = threading.Thread(target=_intraday_bg_loop, daemon=True, name="intraday-fetcher")
+    t.start()
+    logger.info("lifespan: 后台分时快照线程已启动")
+    yield
+    # daemon 线程随主进程退出，无需额外清理
+
+
+app = FastAPI(lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
 # ── AI 分析配置 ──────────────────────────────────────────────
@@ -112,6 +125,25 @@ def init_db():
                     result_id  TEXT PRIMARY KEY,
                     payload    TEXT,
                     created_at INTEGER
+                )
+                """
+            )
+            conn.commit()
+
+            # 分时快照表：后台每30分钟用 rt_min 抓取自选股实时快照，AI 分析时读取
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intraday_snapshots (
+                    code    TEXT,
+                    date    TEXT,
+                    time    TEXT,
+                    price   REAL,
+                    open    REAL,
+                    high    REAL,
+                    low     REAL,
+                    vol     REAL,
+                    amount  REAL,
+                    PRIMARY KEY (code, date, time)
                 )
                 """
             )
@@ -835,6 +867,34 @@ TOOL_DEFINITIONS = [
         "parameters": {},
         "required": [],
     },
+    {
+        "name": "get_chip_distribution",
+        "description": (
+            "获取个股最近5日的筹码成本分布和胜率数据。"
+            "包含5/15/50/85/95分位成本价、加权平均成本(weight_avg)和胜率(winner_rate，当前价格以下的筹码占比%)。"
+            "胜率高（>80%）说明大多数持仓者盈利，上方套牢盘压力小；"
+            "胜率低（<30%）说明大量筹码被套，反弹时抛压重。"
+            "用于筹码结构分析、支撑压力位判断（Skill 02/03/05）。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
+    {
+        "name": "get_technical_factors",
+        "description": (
+            "获取个股最近3个交易日的技术指标：MACD柱值(macd)、RSI6/RSI12、KDJ的K值/D值、"
+            "布林带上轨/中轨/下轨(boll_upper/mid/lower)。"
+            "用于判断动量强弱（MACD/RSI）、超买超卖（KDJ/RSI）、价格所处通道位置（BOLL），"
+            "辅助买卖点判断（Skill 03）和趋势确认（Skill 05）。"
+            "所有指标均为前复权数据。"
+        ),
+        "parameters": {
+            "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH"},
+        },
+        "required": ["ts_code"],
+    },
 ]
 
 
@@ -842,59 +902,143 @@ def _today_str() -> str:
     return time.strftime("%Y-%m-%d")
 
 
-def _tool_get_intraday_lines(ts_code: str) -> dict:
-    """拉取今日分时数据，计算黄白线，每5分钟采样一条。"""
+def _is_trading_time() -> bool:
+    """判断当前是否在 A 股交易时段（工作日 09:30–15:00）。"""
+    import datetime
+    now = datetime.datetime.now()
+    if now.weekday() >= 5:  # 周六、周日
+        return False
+    t = now.time()
+    start = datetime.time(9, 30)
+    middle_end = datetime.time(11, 30)
+    middle_start = datetime.time(13, 0)
+    end = datetime.time(15, 0)
+    is_morning = start <= t <= middle_end
+    is_afternoon = middle_start <= t <= end
+    return is_morning or is_afternoon
+
+
+def _fetch_and_save_intraday_snapshots() -> None:
+    """用 rt_min 批量抓取所有自选股的最新分钟快照并写入 intraday_snapshots 表。"""
     if pro is None:
-        return {"error": "未配置 TUSHARE_TOKEN，无法获取分时数据"}
+        logger.warning("intraday_fetch: TUSHARE_TOKEN 未配置，跳过")
+        return
+    if not COMMON_STOCKS:
+        return
+
     today = _today_str()
+    # 清理非今日旧数据，保持表轻量
     try:
-        df = pro.stk_mins(
-            ts_code=ts_code,
-            freq="1min",
-            start_date=f"{today} 09:30:00",
-            end_date=f"{today} 15:00:00",
-        )
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute("DELETE FROM intraday_snapshots WHERE date != ?", (today,))
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as e:
-        return {"error": f"stk_mins 调用失败: {e}"}
+        logger.error("intraday_fetch: 清理旧数据失败 %s", e)
+
+    # 批量请求：逗号拼接所有 ts_code，一次 API 调用拿回所有数据
+    ts_codes = ",".join(to_ts_code(item["code"]) for item in COMMON_STOCKS)
+    try:
+        df = pro.rt_min(ts_code=ts_codes, freq="1MIN")
+    except Exception as e:
+        logger.error("intraday_fetch: rt_min 批量请求失败 %s", e)
+        return
 
     if df is None or df.empty:
-        return {"error": "暂无分时数据，可能非交易时段或代码有误"}
+        logger.warning("intraday_fetch: rt_min 返回空数据")
+        return
 
-    df = df.sort_values("trade_time").reset_index(drop=True)
-    df["vol"] = df["vol"].fillna(0).astype(float)
-    df["amount"] = df["amount"].fillna(0).astype(float)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        for _, row in df.iterrows():
+            try:
+                # ts_code 格式 "603881.SH"，取短代码
+                code = str(row["ts_code"]).split(".")[0]
+                t_str = str(row["time"])
+                hhmm = t_str[11:16] if len(t_str) >= 16 else t_str
+                price  = float(row["close"])
+                open_  = float(row["open"])
+                high   = float(row["high"])
+                low    = float(row["low"])
+                vol    = float(row["vol"])    # 单位：股
+                amount = float(row["amount"]) # 单位：元
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO intraday_snapshots
+                        (code, date, time, price, open, high, low, vol, amount)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (code, today, hhmm, price, open_, high, low, vol, amount),
+                )
+                logger.info("intraday_fetch: %s %s price=%.3f", code, hhmm, price)
+            except Exception as e:
+                logger.warning("intraday_fetch: 处理行失败 %s", e)
+        conn.commit()
+    finally:
+        conn.close()
 
-    # 黄线：累计成交额 / 累计成交量（vol 单位手，amount 单位元）
-    cum_vol = df["vol"].cumsum()
-    cum_amount = df["amount"].cumsum()
-    # vol 单位是手（100股），amount 单位是元；均价 = amount(元) / (vol*100 股) = 元/股
-    df["yellow"] = cum_amount / (cum_vol * 100).replace(0, float("nan"))
 
-    # 每5分钟取最后一条（按 trade_time 分钟数整除5分组）
-    def _minute_group(t: str) -> str:
-        # t 格式 "2026-04-29 09:35:00"，取 HH:MM 部分
-        hm = t[11:16]
-        h, m = int(hm[:2]), int(hm[3:])
-        bucket = (m // 5) * 5
-        return f"{h:02d}:{bucket:02d}"
+def _intraday_bg_loop() -> None:
+    """后台线程：每 30 分钟在交易时段抓取一次分时快照。"""
+    logger.info("intraday_bg_loop: 后台线程已启动")
+    while True:
+        if _is_trading_time():
+            logger.info("intraday_bg_loop: 开始抓取分时快照")
+            _fetch_and_save_intraday_snapshots()
+        time.sleep(30 * 60)
 
-    df["bucket"] = df["trade_time"].apply(_minute_group)
-    sampled = df.groupby("bucket", sort=True).last().reset_index()
 
+def _get_intraday_points(code: str) -> list:
+    """从 intraday_snapshots 表读取当日分时数据，返回带黄白线的 points 列表。
+    供页面渲染分时图和 AI 工具调用共用。
+    返回格式：[{"time": "09:35", "price": 41.27, "avg": 41.26}, ...]
+    无数据时返回空列表。
+    """
+    today = _today_str()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(
+                "SELECT time, price, vol, amount FROM intraday_snapshots "
+                "WHERE code = ? AND date = ? ORDER BY time ASC",
+                (code, today),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("_get_intraday_points: 读取失败 %s", e)
+        return []
+
+    cum_vol = 0.0
+    cum_amount = 0.0
     points = []
-    for _, row in sampled.iterrows():
-        price = round(float(row["close"]), 4)
-        yellow = round(float(row["yellow"]), 4) if not (row["yellow"] != row["yellow"]) else None
-        points.append({"time": row["bucket"], "price": price, "avg": yellow})
+    for t, price, vol, amount in rows:
+        cum_vol += vol or 0.0
+        cum_amount += amount or 0.0
+        avg = round(cum_amount / cum_vol, 4) if cum_vol > 0 else None
+        points.append({"time": t, "price": round(price, 4), "avg": avg})
+    return points
 
-    latest = points[-1] if points else {}
+
+def _tool_get_intraday_lines(ts_code: str) -> dict:
+    """从 intraday_snapshots 表读取当日分时快照，重建黄白线序列。
+    数据由后台线程每 30 分钟通过 rt_min 接口抓取写入。
+    """
+    code = ts_code.split(".")[0]
+    points = _get_intraday_points(code)
+    if not points:
+        return {"error": "暂无分时数据，后台任务尚未抓取（交易时段每30分钟更新一次）"}
+    latest = points[-1]
     return {
         "ts_code": ts_code,
-        "date": today,
-        "latest_price": latest.get("price"),
-        "latest_avg": latest.get("avg"),
+        "date": _today_str(),
+        "latest_price": latest["price"],
+        "latest_avg": latest["avg"],
         "points": points,
-        "note": "price=白线（每分钟收盘价），avg=黄线（分时均价）",
+        "note": "price=白线（分钟收盘价），avg=黄线（分时均价），每30分钟更新一次",
     }
 
 
@@ -962,68 +1106,247 @@ def _tool_get_daily_basic(ts_code: str, trade_date: str = "") -> dict:
             "note": "pe=市盈率，pb=市净率，total_mv=总市值(万元)，turnover_rate=换手率(%)"}
 
 
-def _tool_get_technical_indicators(ts_code: str) -> dict:
-    """基于 daily_records 历史数据计算 BOLL 布林带和均线指标。"""
-    # 将 ts_code 转为 daily_records 中存储的 code 格式（去掉后缀）
-    code = ts_code.split(".")[0] if "." in ts_code else ts_code
+def _calc_macd(code: str) -> dict | None:
+    """从 daily_records 读取近90日收盘价，计算 MACD(12,26,9) 并检测顶/底背离。
+    返回 dict 或 None（数据不足时）。
+    """
+    short_code = code.split(".")[0] if "." in code else code
+    ts_code    = code if "." in code else None
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.execute(
-            """
-            SELECT date, close, high, low
-            FROM daily_records
-            WHERE code = ?
-            ORDER BY date DESC
-            LIMIT 60
-            """,
-            (ts_code,),
-        )
-        rows = cur.fetchall()
-        # 尝试不带后缀的 code（兼容不同存储格式）
-        if not rows:
+        rows = None
+        for q in ([ts_code, short_code] if ts_code else [short_code]):
+            if q is None:
+                continue
             cur = conn.execute(
-                """
-                SELECT date, close, high, low
-                FROM daily_records
-                WHERE code = ?
-                ORDER BY date DESC
-                LIMIT 60
-                """,
-                (code,),
+                "SELECT date, close FROM daily_records WHERE code=? ORDER BY date ASC LIMIT 90",
+                (q,),
             )
             rows = cur.fetchall()
+            if rows:
+                break
         conn.close()
-    except Exception as e:
-        return {"error": f"读取历史数据失败: {e}"}
+    except Exception:
+        return None
 
-    if not rows:
-        return {"error": "暂无历史K线数据，请先运行 fetch_history.py 拉取数据"}
+    if not rows or len(rows) < 35:
+        return None
 
-    # rows 按日期倒序，反转为正序计算
+    dates  = [r[0] for r in rows]
+    closes = [float(r[1]) for r in rows]
+    n      = len(closes)
+
+    # EMA 计算
+    def _ema(data, period):
+        k = 2 / (period + 1)
+        out = [data[0]] * len(data)
+        for i in range(1, len(data)):
+            out[i] = data[i] * k + out[i - 1] * (1 - k)
+        return out
+
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    dif   = [ema12[i] - ema26[i] for i in range(n)]
+    dea   = _ema(dif, 9)
+    hist  = [dif[i] - dea[i] for i in range(n)]  # MACD 柱
+
+    # 最新值
+    latest = {
+        "date": dates[-1],
+        "dif":  round(dif[-1],  4),
+        "dea":  round(dea[-1],  4),
+        "hist": round(hist[-1], 4),
+    }
+
+    # ── 背离检测（在近 40 根 K 线内寻找相邻极值点）──────────────
+    WIN   = min(40, n)
+    seg_c = closes[-WIN:]
+    seg_h = hist[-WIN:]
+    seg_d = dates[-WIN:]
+
+    def find_peaks(arr, mode="high"):
+        """找局部极值：前后各2根满足条件。"""
+        pts = []
+        for i in range(2, len(arr) - 2):
+            if mode == "high":
+                if arr[i] > arr[i-1] and arr[i] > arr[i-2] and \
+                   arr[i] > arr[i+1] and arr[i] > arr[i+2]:
+                    pts.append(i)
+            else:
+                if arr[i] < arr[i-1] and arr[i] < arr[i-2] and \
+                   arr[i] < arr[i+1] and arr[i] < arr[i+2]:
+                    pts.append(i)
+        return pts
+
+    divergence = None  # None | "top" | "bottom"
+    div_detail = ""
+
+    # 顶背离：取最近两个价格高点，价格新高但 MACD 柱未新高
+    peak_idx = find_peaks(seg_c, "high")
+    if len(peak_idx) >= 2:
+        i1, i2 = peak_idx[-2], peak_idx[-1]
+        p1_c, p2_c = seg_c[i1], seg_c[i2]
+        p1_h, p2_h = seg_h[i1], seg_h[i2]
+        if p2_c > p1_c and p2_h < p1_h:
+            divergence = "top"
+            div_detail = (
+                f"价格高点 {seg_d[i1]}({p1_c:.2f}) → {seg_d[i2]}({p2_c:.2f}) 创新高，"
+                f"但 MACD 柱 {p1_h:.4f} → {p2_h:.4f} 未同步新高，"
+                f"上涨动能衰竭，警惕回调。"
+            )
+
+    # 底背离：取最近两个价格低点，价格新低但 MACD 柱未新低
+    if divergence is None:
+        trough_idx = find_peaks(seg_c, "low")
+        if len(trough_idx) >= 2:
+            i1, i2 = trough_idx[-2], trough_idx[-1]
+            t1_c, t2_c = seg_c[i1], seg_c[i2]
+            t1_h, t2_h = seg_h[i1], seg_h[i2]
+            if t2_c < t1_c and t2_h > t1_h:
+                divergence = "bottom"
+                div_detail = (
+                    f"价格低点 {seg_d[i1]}({t1_c:.2f}) → {seg_d[i2]}({t2_c:.2f}) 创新低，"
+                    f"但 MACD 柱 {t1_h:.4f} → {t2_h:.4f} 未同步新低，"
+                    f"下跌动能衰竭，关注反弹机会。"
+                )
+
+    # 金叉/死叉（最近一次）
+    cross = None
+    for i in range(n - 1, max(n - 10, 0), -1):
+        if hist[i] > 0 and hist[i - 1] <= 0:
+            cross = {"type": "golden", "date": dates[i], "label": "金叉（DIF上穿DEA）"}
+            break
+        if hist[i] < 0 and hist[i - 1] >= 0:
+            cross = {"type": "dead", "date": dates[i], "label": "死叉（DIF下穿DEA）"}
+            break
+
+    return {
+        "latest":     latest,
+        "divergence": divergence,   # None | "top" | "bottom"
+        "div_detail": div_detail,
+        "cross":      cross,
+        "above_zero": dif[-1] > 0,  # DIF 在零轴上方
+    }
+
+
+def _calc_boll(code: str) -> dict:
+    """从 daily_records 读取近60日收盘价，计算 BOLL(20,2) 和 MA5/10/20。
+    返回 dict，key: upper/mid/lower/ma5/ma10/ma20/position/closes（最近20日）。
+    数据不足或出错时返回 None。
+    """
+    ts_code = code if "." in code else None
+    short_code = code.split(".")[0] if "." in code else code
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = None
+        for q_code in ([ts_code, short_code] if ts_code else [short_code]):
+            if q_code is None:
+                continue
+            cur = conn.execute(
+                "SELECT date, close FROM daily_records WHERE code = ? ORDER BY date DESC LIMIT 60",
+                (q_code,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                break
+        conn.close()
+    except Exception:
+        return None
+
+    if not rows or len(rows) < 5:
+        return None
+
     rows = list(reversed(rows))
     closes = [r[1] for r in rows if r[1] is not None]
     n = len(closes)
 
-    if n < 5:
-        return {"error": f"历史数据不足（仅{n}条），无法计算技术指标，至少需要5条"}
+    def sma(data, period):
+        return round(sum(data[-period:]) / period, 4) if len(data) >= period else None
 
-    def sma(data: list, period: int) -> float | None:
-        if len(data) < period:
-            return None
-        return round(sum(data[-period:]) / period, 4)
-
-    def boll(data: list, period: int = 20, k: float = 2.0):
+    def boll_calc(data, period=20, k=2.0):
         if len(data) < period:
             return None, None, None
-        window = data[-period:]
-        mid = sum(window) / period
-        std = (sum((x - mid) ** 2 for x in window) / period) ** 0.5
+        w = data[-period:]
+        mid = sum(w) / period
+        std = (sum((x - mid) ** 2 for x in w) / period) ** 0.5
         return round(mid + k * std, 4), round(mid, 4), round(mid - k * std, 4)
 
+    upper, mid, lower = boll_calc(closes)
     ma5  = sma(closes, 5)
     ma10 = sma(closes, 10)
     ma20 = sma(closes, 20)
-    boll_upper, boll_mid, boll_lower = boll(closes, 20)
+    latest = closes[-1]
+
+    if upper and lower and mid:
+        if latest >= upper:
+            position = "上轨附近（超买，注意压力）"
+            advice_class = "danger"
+        elif latest <= lower:
+            position = "下轨附近（超卖，关注支撑）"
+            advice_class = "success"
+        elif latest > mid:
+            position = "中轨↑上轨（强势区间）"
+            advice_class = "warning"
+        else:
+            position = "下轨↑中轨（弱势区间）"
+            advice_class = "secondary"
+    else:
+        position = "数据不足"
+        advice_class = "secondary"
+
+    return {
+        "upper": upper,
+        "mid":   mid,
+        "lower": lower,
+        "ma5":   ma5,
+        "ma10":  ma10,
+        "ma20":  ma20,
+        "position":     position,
+        "advice_class": advice_class,
+        "data_points":  n,
+        "recent_closes": [{"date": rows[i][0], "close": rows[i][1]} for i in range(max(0, n - 20), n)],
+    }
+
+
+def _tool_get_technical_indicators(ts_code: str) -> dict:
+    """基于 daily_records 历史数据计算 BOLL 布林带和均线指标。"""
+    boll_data = _calc_boll(ts_code)
+    if boll_data is None:
+        return {"error": "暂无历史K线数据，请先运行 fetch_history.py 拉取数据"}
+
+    closes    = [r["close"] for r in boll_data["recent_closes"]]
+    n         = boll_data["data_points"]
+    boll_upper = boll_data["upper"]
+    boll_mid   = boll_data["mid"]
+    boll_lower = boll_data["lower"]
+    ma5        = boll_data["ma5"]
+    ma10       = boll_data["ma10"]
+    ma20       = boll_data["ma20"]
+
+    latest_close = closes[-1] if closes else None
+    latest_date  = boll_data["recent_closes"][-1]["date"] if boll_data["recent_closes"] else ""
+
+    # 均线多空排列判断
+    ma_trend = "数据不足"
+    if ma5 and ma10 and ma20:
+        if ma5 > ma10 > ma20:
+            ma_trend = "多头排列（MA5>MA10>MA20，趋势向上）"
+        elif ma5 < ma10 < ma20:
+            ma_trend = "空头排列（MA5<MA10<MA20，趋势向下）"
+        else:
+            ma_trend = "均线纠缠（无明确趋势）"
+
+    boll_position = boll_data["position"]
+    # 补充完整描述供 AI 使用
+    if boll_upper and boll_lower and boll_mid and latest_close:
+        if latest_close >= boll_upper:
+            boll_position = "价格在BOLL上轨附近或以上（超买区，注意压力）"
+        elif latest_close <= boll_lower:
+            boll_position = "价格在BOLL下轨附近或以下（超卖区，关注支撑）"
+        elif latest_close > boll_mid:
+            boll_position = "价格在BOLL中轨与上轨之间（强势区间）"
+        else:
+            boll_position = "价格在BOLL中轨与下轨之间（弱势区间）"
 
     latest_close = closes[-1]
     latest_date  = rows[-1][0]
@@ -1037,24 +1360,6 @@ def _tool_get_technical_indicators(ts_code: str) -> dict:
             ma_trend = "空头排列（MA5<MA10<MA20，趋势向下）"
         else:
             ma_trend = "均线纠缠（无明确趋势）"
-
-    # BOLL 位置判断
-    boll_position = "数据不足"
-    if boll_upper and boll_lower and boll_mid:
-        if latest_close >= boll_upper:
-            boll_position = "价格在BOLL上轨附近或以上（超买区，注意压力）"
-        elif latest_close <= boll_lower:
-            boll_position = "价格在BOLL下轨附近或以下（超卖区，关注支撑）"
-        elif latest_close > boll_mid:
-            boll_position = "价格在BOLL中轨与上轨之间（强势区间）"
-        else:
-            boll_position = "价格在BOLL中轨与下轨之间（弱势区间）"
-
-    # 最近20日收盘价序列（供AI判断趋势形态）
-    recent_closes = [
-        {"date": rows[i][0], "close": rows[i][1]}
-        for i in range(max(0, n - 20), n)
-    ]
 
     return {
         "ts_code": ts_code,
@@ -1073,7 +1378,7 @@ def _tool_get_technical_indicators(ts_code: str) -> dict:
             "lower": boll_lower,
             "position": boll_position,
         },
-        "recent_closes": recent_closes,
+        "recent_closes": boll_data["recent_closes"],
         "note": "BOLL参数：20日，2倍标准差；均线：简单移动平均",
     }
 
@@ -1461,6 +1766,99 @@ def _tool_get_etf_flow() -> dict:
         return {"error": f"ETF数据处理失败: {e}"}
 
 
+def _tool_get_chip_distribution(ts_code: str) -> dict:
+    """获取个股最近5日筹码成本分布和胜率。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN"}
+    try:
+        import datetime
+        end = datetime.date.today().strftime("%Y%m%d")
+        start = (datetime.date.today() - datetime.timedelta(days=14)).strftime("%Y%m%d")
+        df = pro.cyq_perf(ts_code=ts_code, start_date=start, end_date=end)
+    except Exception as e:
+        return {"error": f"cyq_perf 调用失败: {e}"}
+    if df is None or df.empty:
+        return {"error": "暂无筹码数据"}
+
+    df = df.sort_values("trade_date", ascending=False).reset_index(drop=True)
+    records = []
+    for _, row in df.iterrows():
+        records.append({
+            "date":        str(row["trade_date"]),
+            "cost_5pct":   round(float(row["cost_5pct"]),  2),
+            "cost_15pct":  round(float(row["cost_15pct"]), 2),
+            "cost_50pct":  round(float(row["cost_50pct"]), 2),
+            "cost_85pct":  round(float(row["cost_85pct"]), 2),
+            "cost_95pct":  round(float(row["cost_95pct"]), 2),
+            "weight_avg":  round(float(row["weight_avg"]),  2),
+            "winner_rate": round(float(row["winner_rate"]), 2),
+        })
+
+    latest = records[0]
+    return {
+        "ts_code": ts_code,
+        "latest_winner_rate": latest["winner_rate"],
+        "latest_weight_avg":  latest["weight_avg"],
+        "records": records,
+        "note": (
+            "winner_rate=当前价格以下筹码占比(%)，越高说明套牢盘越少；"
+            "cost_50pct=中位成本价，是重要支撑/压力参考；"
+            "weight_avg=筹码加权均价"
+        ),
+    }
+
+
+def _tool_get_technical_factors(ts_code: str) -> dict:
+    """获取个股最近3日技术指标：MACD、RSI、KDJ、布林带（前复权）。"""
+    if pro is None:
+        return {"error": "未配置 TUSHARE_TOKEN"}
+    try:
+        df = pro.stk_factor_pro(
+            ts_code=ts_code,
+            start_date=(
+                __import__("datetime").date.today()
+                - __import__("datetime").timedelta(days=14)
+            ).strftime("%Y%m%d"),
+            end_date=__import__("datetime").date.today().strftime("%Y%m%d"),
+        )
+    except Exception as e:
+        return {"error": f"stk_factor_pro 调用失败: {e}"}
+    if df is None or df.empty:
+        return {"error": "暂无技术因子数据"}
+
+    df = df.sort_values("trade_date", ascending=False).head(3).reset_index(drop=True)
+
+    FIELDS = {
+        "macd_bfq":        "macd",
+        "rsi_bfq_6":       "rsi6",
+        "rsi_bfq_12":      "rsi12",
+        "kdj_k_bfq":       "kdj_k",
+        "kdj_d_bfq":       "kdj_d",
+        "boll_upper_bfq":  "boll_upper",
+        "boll_mid_bfq":    "boll_mid",
+        "boll_lower_bfq":  "boll_lower",
+    }
+
+    records = []
+    for _, row in df.iterrows():
+        rec = {"date": str(row["trade_date"])}
+        for src, dst in FIELDS.items():
+            val = row.get(src)
+            rec[dst] = round(float(val), 3) if val is not None and val == val else None
+        records.append(rec)
+
+    return {
+        "ts_code": ts_code,
+        "records": records,
+        "note": (
+            "macd>0且增大为多头动能增强；rsi>70超买，<30超卖；"
+            "kdj_k上穿kdj_d为金叉买入信号；"
+            "价格在boll_upper附近为强势但需警惕回调，在boll_lower附近为超跌支撑。"
+            "所有指标均为前复权(bfq)数据。"
+        ),
+    }
+
+
 def execute_tool(tool_name: str, tool_args: dict) -> str:
     """执行工具调用，返回 JSON 字符串结果（供 LLM 消费）。"""
     logger.info("execute_tool: name=%s args=%s", tool_name, tool_args)
@@ -1487,6 +1885,10 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
             result = _tool_get_share_reduction(tool_args["ts_code"])
         elif tool_name == "get_etf_flow":
             result = _tool_get_etf_flow()
+        elif tool_name == "get_chip_distribution":
+            result = _tool_get_chip_distribution(tool_args["ts_code"])
+        elif tool_name == "get_technical_factors":
+            result = _tool_get_technical_factors(tool_args["ts_code"])
         else:
             result = {"error": f"未知工具: {tool_name}"}
     except Exception as e:
@@ -1863,6 +2265,9 @@ def calculate_8848(code: str):
             "n20_low":  n_day["n20_low"],
             "n60_high": n_day["n60_high"],
             "n60_low":  n_day["n60_low"],
+            "intraday_points": _get_intraday_points(code),
+            "boll": _calc_boll(code),
+            "macd": _calc_macd(code),
         }
 
     except Exception as e:
