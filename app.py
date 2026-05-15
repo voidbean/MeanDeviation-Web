@@ -533,6 +533,81 @@ def get_index_market_data(days: int = 20) -> dict:
     return result
 
 
+def get_index_volume_chart_data(days: int = 20) -> dict | None:
+    """
+    返回上证指数 (000001.SH) 最近 days 日量能数据，供前端 ECharts 柱状图渲染。
+    返回格式：
+    {
+        "dates":   ["2025-04-01", ...],          # X轴，升序
+        "amounts": [3456.78, ...],               # 成交额（亿元）
+        "colors":  ["#ef5350", "#9e9e9e", ...],  # 放量=红，缩量=灰
+        "labels":  ["放量", "缩量", ...],
+    }
+    若无数据则返回 None。
+    """
+    index_data = get_index_market_data(days=days)
+    sh_data = index_data.get("000001.SH", {})
+    records = sh_data.get("records", [])
+
+    if not records:
+        return None
+
+    # get_index_market_data 返回降序，反转为升序供图表使用
+    records = list(reversed(records))
+
+    dates   = [r["date"]      for r in records]
+    amounts = [r["amount_yi"] for r in records]
+    colors: list[str] = []
+    labels: list[str] = []
+
+    for i, amt in enumerate(amounts):
+        if i == 0:
+            colors.append("#9e9e9e")
+            labels.append("—")
+        else:
+            prev = amounts[i - 1]
+            if amt > prev:
+                colors.append("#ef5350")   # 放量 — A股红色
+                labels.append("放量")
+            else:
+                colors.append("#9e9e9e")   # 缩量 — 灰色
+                labels.append("缩量")
+
+    return {"dates": dates, "amounts": amounts, "colors": colors, "labels": labels}
+
+
+def get_stock_volume_chart_data(history_results: list) -> dict | None:
+    """
+    将 calculate_8848_history() 返回的 records（降序）转换为 ECharts 柱状图格式。
+    若无数据则返回 None。
+    """
+    if not history_results:
+        return None
+
+    # calculate_8848_history 返回降序，反转为升序供图表使用
+    records = list(reversed(history_results))
+
+    dates   = [r["date"]       for r in records]
+    amounts = [r.get("amount_yi", 0) for r in records]
+    colors: list[str] = []
+    labels: list[str] = []
+
+    for i, amt in enumerate(amounts):
+        if i == 0 or amounts[i - 1] == 0:
+            colors.append("#9e9e9e")
+            labels.append("—")
+        else:
+            prev = amounts[i - 1]
+            if amt > prev:
+                colors.append("#ef5350")
+                labels.append("放量")
+            else:
+                colors.append("#9e9e9e")
+                labels.append("缩量")
+
+    return {"dates": dates, "amounts": amounts, "colors": colors, "labels": labels}
+
+
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
     """
     Implement the strategy logic from stock.html
@@ -919,14 +994,18 @@ def _is_trading_time() -> bool:
 
 
 def _fetch_and_save_intraday_snapshots() -> None:
-    """用 rt_min 批量抓取所有自选股的最新分钟快照并写入 intraday_snapshots 表。"""
-    if pro is None:
-        logger.warning("intraday_fetch: TUSHARE_TOKEN 未配置，跳过")
-        return
+    """用 get_realtime_quotes 逐支抓取自选股实时行情，计算增量成交量/额后写入 intraday_snapshots。
+
+    get_realtime_quotes 返回当日累计 volume/amount，无严格次数限制（替代 rt_min 的 10次/天限制）。
+    vol/amount 存储的是相邻两次快照之间的**增量**，而非累计值，方便分时量能图展示各时段节奏。
+    """
     if not COMMON_STOCKS:
         return
 
+    import datetime
     today = _today_str()
+    now_hhmm = datetime.datetime.now().strftime("%H:%M")
+
     # 清理非今日旧数据，保持表轻量
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -938,56 +1017,80 @@ def _fetch_and_save_intraday_snapshots() -> None:
     except Exception as e:
         logger.error("intraday_fetch: 清理旧数据失败 %s", e)
 
-    # 批量请求：逗号拼接所有 ts_code，一次 API 调用拿回所有数据
-    ts_codes = ",".join(to_ts_code(item["code"]) for item in COMMON_STOCKS)
-    try:
-        df = pro.rt_min(ts_code=ts_codes, freq="1MIN")
-    except Exception as e:
-        logger.error("intraday_fetch: rt_min 批量请求失败 %s", e)
-        return
+    for item in COMMON_STOCKS:
+        code = item["code"]
+        try:
+            df = ts.get_realtime_quotes(code)
+        except Exception as e:
+            logger.warning("intraday_fetch: get_realtime_quotes 失败 code=%s %s", code, e)
+            continue
 
-    if df is None or df.empty:
-        logger.warning("intraday_fetch: rt_min 返回空数据")
-        return
+        if df is None or df.empty:
+            continue
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        for _, row in df.iterrows():
+        try:
+            price  = float(df.loc[0, "price"])
+            high   = float(df.loc[0, "high"])
+            low    = float(df.loc[0, "low"])
+            open_  = float(df.loc[0, "open"])
+            cum_vol    = float(df.loc[0, "volume"])  # 当日累计成交量（股）
+            cum_amount = float(df.loc[0, "amount"])  # 当日累计成交额（元）
+        except Exception as e:
+            logger.warning("intraday_fetch: 解析行情失败 code=%s %s", code, e)
+            continue
+
+        if price == 0 or cum_vol == 0:
+            continue
+
+        # 读取该股今日所有增量之和，作为上次已记录的累计值
+        try:
+            conn = sqlite3.connect(DB_PATH)
             try:
-                # ts_code 格式 "603881.SH"，取短代码
-                code = str(row["ts_code"]).split(".")[0]
-                t_str = str(row["time"])
-                hhmm = t_str[11:16] if len(t_str) >= 16 else t_str
-                price  = float(row["close"])
-                open_  = float(row["open"])
-                high   = float(row["high"])
-                low    = float(row["low"])
-                vol    = float(row["vol"])    # 单位：股
-                amount = float(row["amount"]) # 单位：元
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(vol), 0), COALESCE(SUM(amount), 0) "
+                    "FROM intraday_snapshots WHERE code = ? AND date = ?",
+                    (code, today),
+                ).fetchone()
+                prev_cum_vol    = float(row[0])
+                prev_cum_amount = float(row[1])
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error("intraday_fetch: 读取历史快照失败 code=%s %s", code, e)
+            prev_cum_vol = 0.0
+            prev_cum_amount = 0.0
+
+        # 增量（当日累计 - 已存增量之和）；首条记录增量即为累计值本身
+        delta_vol    = max(cum_vol    - prev_cum_vol,    0.0)
+        delta_amount = max(cum_amount - prev_cum_amount, 0.0)
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO intraday_snapshots
                         (code, date, time, price, open, high, low, vol, amount)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (code, today, hhmm, price, open_, high, low, vol, amount),
+                    (code, today, now_hhmm, price, open_, high, low, delta_vol, delta_amount),
                 )
-                logger.info("intraday_fetch: %s %s price=%.3f", code, hhmm, price)
-            except Exception as e:
-                logger.warning("intraday_fetch: 处理行失败 %s", e)
-        conn.commit()
-    finally:
-        conn.close()
+                conn.commit()
+            finally:
+                conn.close()
+            logger.info("intraday_fetch: %s %s price=%.3f delta_vol=%.0f", code, now_hhmm, price, delta_vol)
+        except Exception as e:
+            logger.error("intraday_fetch: 写入失败 code=%s %s", code, e)
 
 
 def _intraday_bg_loop() -> None:
-    """后台线程：每 30 分钟在交易时段抓取一次分时快照。"""
+    """后台线程：每 5 分钟在交易时段抓取一次分时快照。"""
     logger.info("intraday_bg_loop: 后台线程已启动")
     while True:
         if _is_trading_time():
             logger.info("intraday_bg_loop: 开始抓取分时快照")
             _fetch_and_save_intraday_snapshots()
-        time.sleep(30 * 60)
+        time.sleep(5 * 60)
 
 
 def _get_intraday_points(code: str) -> list:
@@ -1019,7 +1122,7 @@ def _get_intraday_points(code: str) -> list:
         cum_vol += vol or 0.0
         cum_amount += amount or 0.0
         avg = round(cum_amount / cum_vol, 4) if cum_vol > 0 else None
-        points.append({"time": t, "price": round(price, 4), "avg": avg})
+        points.append({"time": t, "price": round(price, 4), "avg": avg, "vol": vol or 0.0})
     return points
 
 
@@ -2292,12 +2395,18 @@ async def update_portfolio(
     if isinstance(result, dict) and result.get("status") == "success":
         save_query_history(result["code"], result["name"])
 
+    history_results = calculate_8848_history(code, days=20)
+    stock_volume    = get_stock_volume_chart_data(history_results)
+    index_volume    = get_index_volume_chart_data(days=20)
+
     rid = str(uuid.uuid4())
     save_temp_result(rid, {
         "result":          result,
         "last_code":       code,
         "batch_results":   None,
-        "history_results": [],
+        "history_results": history_results,
+        "stock_volume":    stock_volume,
+        "index_volume":    index_volume,
         "ai_analysis":     None,
         "ai_error":        None,
         "ai_provider":     AI_PROVIDER,
@@ -2328,7 +2437,7 @@ def to_ts_code(code: str) -> str:
     return ""
 
 
-def calculate_8848_history(code: str, days: int = 5):
+def calculate_8848_history(code: str, days: int = 20):
     """
     计算最近 days 个交易日的 8848 上下轨信息。
     依赖 pro 日线数据，如果未配置 Tushare Token，则返回空列表。
@@ -2394,6 +2503,7 @@ def calculate_8848_history(code: str, days: int = 5):
                 "upper_line": round(upper_line, 4),
                 "lower_line": round(lower_line, 4),
                 "position": position,
+                "amount_yi": round(amount / 100000, 2) if amount > 0 else 0,
             }
         )
 
@@ -2440,6 +2550,8 @@ async def read_root(request: Request, result_id: str = None):
         "common_stocks":   build_common_stocks_with_name(),
         "batch_results":   None,
         "history_results": None,
+        "stock_volume":    None,
+        "index_volume":    get_index_volume_chart_data(days=20),
         "last_code":       "",
         "query_history":   get_query_history(),
         "ai_analysis":     None,
@@ -2453,6 +2565,8 @@ async def read_root(request: Request, result_id: str = None):
     # query_history 和 common_stocks 总是刷新，不从缓存取
     ctx.pop("query_history", None)
     ctx.pop("common_stocks", None)
+    # index_volume 始终从 DB 刷新，不用缓存中的旧值
+    ctx.pop("index_volume", None)
     return templates.TemplateResponse("index.html", {"request": request, **defaults, **ctx})
 
 @app.post("/analyze", response_class=HTMLResponse)
@@ -2470,12 +2584,19 @@ async def analyze_stock(request: Request, stock_code: str = Form(...)):
         stock_code,
         result.get("status") if isinstance(result, dict) else "unknown",
     )
+
+    history_results = calculate_8848_history(stock_code, days=20)
+    stock_volume    = get_stock_volume_chart_data(history_results)
+    index_volume    = get_index_volume_chart_data(days=20)
+
     rid = str(uuid.uuid4())
     save_temp_result(rid, {
         "result":          result,
         "last_code":       stock_code,
         "batch_results":   None,
-        "history_results": [],
+        "history_results": history_results,
+        "stock_volume":    stock_volume,
+        "index_volume":    index_volume,
         "ai_analysis":     None,
         "ai_error":        None,
         "ai_provider":     AI_PROVIDER,
@@ -2545,12 +2666,18 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
         ai_error = str(e)
         logger.error("ai_analyze: failed code=%s error=%s", stock_code, e)
 
+    hist_for_chart = calculate_8848_history(stock_code, days=20)
+    stock_volume   = get_stock_volume_chart_data(hist_for_chart)
+    index_volume   = get_index_volume_chart_data(days=20)
+
     rid = str(uuid.uuid4())
     save_temp_result(rid, {
         "result":          result,
         "last_code":       stock_code,
         "batch_results":   None,
-        "history_results": [],
+        "history_results": hist_for_chart,
+        "stock_volume":    stock_volume,
+        "index_volume":    index_volume,
         "ai_analysis":     ai_analysis,
         "ai_error":        ai_error,
         "ai_provider":     AI_PROVIDER,
