@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
+
 # 基本日志配置，输出到 app.log，方便排查 tushare 等问题
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(__file__), "app.log"),
@@ -828,6 +829,19 @@ TOOL_DEFINITIONS = [
         "required": ["ts_code"],
     },
     {
+        "name": "get_index_intraday",
+        "description": (
+            "获取上证指数、深证成指、创业板指三大指数今日分时数据，"
+            "包含白线（当前价）、黄线（分时均价/资金成本重心）和各时段量能节奏（增量成交量及相对均量倍数）。"
+            "用于判断大盘盘中趋势：价格持续高于黄线为多头主导，低于黄线为空头主导；"
+            "放量上涨/缩量下跌为强势特征，放量下跌/缩量反弹需警惕。"
+            "配合 Skill 01 大盘阶段判断，辅助决策个股日内操作节奏。"
+            "每3分钟更新一次，仅交易时段有数据。"
+        ),
+        "parameters": {},
+        "required": [],
+    },
+    {
         "name": "get_moneyflow",
         "description": (
             "获取个股最近5个交易日的主力资金流向数据，包含主力净流入、超大单、大单、中单、小单的净流入金额和占比。"
@@ -993,11 +1007,75 @@ def _is_trading_time() -> bool:
     return is_morning or is_afternoon
 
 
-def _fetch_and_save_intraday_snapshots() -> None:
-    """用 get_realtime_quotes 逐支抓取自选股实时行情，计算增量成交量/额后写入 intraday_snapshots。
+def _save_intraday_snapshot(code: str, today: str, now_hhmm: str,
+                             price: float, open_: float, high: float, low: float,
+                             cum_vol: float, cum_amount_qianyuan: float) -> None:
+    """将单只股票/指数的实时行情计算增量后写入 intraday_snapshots。
 
-    get_realtime_quotes 返回当日累计 volume/amount，无严格次数限制（替代 rt_min 的 10次/天限制）。
-    vol/amount 存储的是相邻两次快照之间的**增量**，而非累计值，方便分时量能图展示各时段节奏。
+    cum_amount_qianyuan：当日累计成交额，单位千元。
+    vol/amount 存储相邻两次快照之间的增量，而非累计值。
+    """
+    if price == 0 or cum_vol == 0:
+        return
+
+    # 读取今日已存增量之和，作为上次累计值
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            prev_row = conn.execute(
+                "SELECT COALESCE(SUM(vol), 0), COALESCE(SUM(amount), 0) "
+                "FROM intraday_snapshots WHERE code = ? AND date = ?",
+                (code, today),
+            ).fetchone()
+            prev_cum_vol    = float(prev_row[0])
+            prev_cum_amount = float(prev_row[1])
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("intraday_fetch: 读取历史快照失败 code=%s %s", code, e)
+        prev_cum_vol = 0.0
+        prev_cum_amount = 0.0
+
+    delta_vol    = max(cum_vol            - prev_cum_vol,    0.0)
+    delta_amount = max(cum_amount_qianyuan - prev_cum_amount, 0.0)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO intraday_snapshots
+                    (code, date, time, price, open, high, low, vol, amount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (code, today, now_hhmm, price, open_, high, low, delta_vol, delta_amount),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info("intraday_fetch: %s %s price=%.3f delta_vol=%.0f", code, now_hhmm, price, delta_vol)
+    except Exception as e:
+        logger.error("intraday_fetch: 写入失败 code=%s %s", code, e)
+
+
+# 三大指数：(get_realtime_quotes 查询代码, 存库用的 code)
+_INDEX_RT_CODES = [
+    ("sh000001", "000001.SH"),   # 上证指数
+    ("399001",   "399001.SZ"),   # 深证成指
+    ("399006",   "399006.SZ"),   # 创业板指
+]
+
+
+def _fetch_and_save_intraday_snapshots() -> None:
+    """用 ts.get_realtime_quotes 逐只抓取自选股 + 三大指数实时行情，写入 intraday_snapshots。
+
+    get_realtime_quotes 无严格调用次数限制，个股和指数均支持。
+    vol/amount 存储相邻两次快照之间的增量，方便分时量能图展示各时段节奏。
+
+    字段说明（get_realtime_quotes）：
+        price  → 当前最新价
+        volume → 当日累计成交量（股）
+        amount → 当日累计成交额（元），存库时除以 1000 换算为千元
     """
     if not COMMON_STOCKS:
         return
@@ -1017,6 +1095,7 @@ def _fetch_and_save_intraday_snapshots() -> None:
     except Exception as e:
         logger.error("intraday_fetch: 清理旧数据失败 %s", e)
 
+    # ── 个股快照 ──────────────────────────────────────────────────────────────
     for item in COMMON_STOCKS:
         code = item["code"]
         try:
@@ -1029,68 +1108,51 @@ def _fetch_and_save_intraday_snapshots() -> None:
             continue
 
         try:
-            price  = float(df.loc[0, "price"])
-            high   = float(df.loc[0, "high"])
-            low    = float(df.loc[0, "low"])
-            open_  = float(df.loc[0, "open"])
-            cum_vol    = float(df.loc[0, "volume"])  # 当日累计成交量（股）
-            cum_amount = float(df.loc[0, "amount"])  # 当日累计成交额（元）
+            price      = float(df.loc[0, "price"])
+            high       = float(df.loc[0, "high"])
+            low        = float(df.loc[0, "low"])
+            open_      = float(df.loc[0, "open"])
+            cum_vol    = float(df.loc[0, "volume"])          # 当日累计成交量（股）
+            cum_amount = float(df.loc[0, "amount"]) / 1000.0 # 元 → 千元
         except Exception as e:
             logger.warning("intraday_fetch: 解析行情失败 code=%s %s", code, e)
             continue
 
-        if price == 0 or cum_vol == 0:
+        _save_intraday_snapshot(code, today, now_hhmm, price, open_, high, low, cum_vol, cum_amount)
+
+    # ── 三大指数快照 ──────────────────────────────────────────────────────────
+    for rt_code, store_code in _INDEX_RT_CODES:
+        try:
+            df = ts.get_realtime_quotes(rt_code)
+        except Exception as e:
+            logger.warning("intraday_fetch: 指数 get_realtime_quotes 失败 code=%s %s", rt_code, e)
             continue
 
-        # 读取该股今日所有增量之和，作为上次已记录的累计值
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                row = conn.execute(
-                    "SELECT COALESCE(SUM(vol), 0), COALESCE(SUM(amount), 0) "
-                    "FROM intraday_snapshots WHERE code = ? AND date = ?",
-                    (code, today),
-                ).fetchone()
-                prev_cum_vol    = float(row[0])
-                prev_cum_amount = float(row[1])
-            finally:
-                conn.close()
-        except Exception as e:
-            logger.error("intraday_fetch: 读取历史快照失败 code=%s %s", code, e)
-            prev_cum_vol = 0.0
-            prev_cum_amount = 0.0
-
-        # 增量（当日累计 - 已存增量之和）；首条记录增量即为累计值本身
-        delta_vol    = max(cum_vol    - prev_cum_vol,    0.0)
-        delta_amount = max(cum_amount - prev_cum_amount, 0.0)
+        if df is None or df.empty:
+            continue
 
         try:
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO intraday_snapshots
-                        (code, date, time, price, open, high, low, vol, amount)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (code, today, now_hhmm, price, open_, high, low, delta_vol, delta_amount),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            logger.info("intraday_fetch: %s %s price=%.3f delta_vol=%.0f", code, now_hhmm, price, delta_vol)
+            price      = float(df.loc[0, "price"])
+            high       = float(df.loc[0, "high"])
+            low        = float(df.loc[0, "low"])
+            open_      = float(df.loc[0, "open"])
+            cum_vol    = float(df.loc[0, "volume"])          # 当日累计成交量（股/手，指数单位不同但增量逻辑一致）
+            cum_amount = float(df.loc[0, "amount"]) / 1000.0 # 元 → 千元
         except Exception as e:
-            logger.error("intraday_fetch: 写入失败 code=%s %s", code, e)
+            logger.warning("intraday_fetch: 解析指数行情失败 code=%s %s", rt_code, e)
+            continue
+
+        _save_intraday_snapshot(store_code, today, now_hhmm, price, open_, high, low, cum_vol, cum_amount)
 
 
 def _intraday_bg_loop() -> None:
-    """后台线程：每 5 分钟在交易时段抓取一次分时快照。"""
+    """后台线程：每 3 分钟在交易时段抓取一次分时快照。"""
     logger.info("intraday_bg_loop: 后台线程已启动")
     while True:
         if _is_trading_time():
             logger.info("intraday_bg_loop: 开始抓取分时快照")
             _fetch_and_save_intraday_snapshots()
-        time.sleep(5 * 60)
+        time.sleep(1 * 60)
 
 
 def _get_intraday_points(code: str) -> list:
@@ -1119,9 +1181,10 @@ def _get_intraday_points(code: str) -> list:
     cum_amount = 0.0
     points = []
     for t, price, vol, amount in rows:
-        cum_vol += vol or 0.0
+        cum_vol    += vol    or 0.0
         cum_amount += amount or 0.0
-        avg = round(cum_amount / cum_vol, 4) if cum_vol > 0 else None
+        # amount 存库单位为千元，vol 单位为股；均价 = 千元*1000 / 股 = 元/股
+        avg = round(cum_amount * 1000 / cum_vol, 4) if cum_vol > 0 else None
         points.append({"time": t, "price": round(price, 4), "avg": avg, "vol": vol or 0.0})
     return points
 
@@ -1142,6 +1205,65 @@ def _tool_get_intraday_lines(ts_code: str) -> dict:
         "latest_avg": latest["avg"],
         "points": points,
         "note": "price=白线（分钟收盘价），avg=黄线（分时均价），每30分钟更新一次",
+    }
+
+
+def _tool_get_index_intraday() -> dict:
+    """读取三大指数今日分时快照，返回黄白线序列 + 量能节奏，供 AI 判断大盘盘中趋势。
+
+    数据由后台线程每3分钟写入 intraday_snapshots，code 格式为 000001.SH 等。
+    黄线（avg）= 累计成交额 / 累计成交量，反映当日资金成本重心。
+    量能节奏（vol）= 每个时间片的增量成交量，用于判断各时段买卖力度。
+    """
+    INDEX_STORE_CODES = [
+        ("000001.SH", "上证指数"),
+        ("399001.SZ", "深证成指"),
+        ("399006.SZ", "创业板指"),
+    ]
+    today = _today_str()
+    result = {}
+
+    for store_code, name in INDEX_STORE_CODES:
+        points = _get_intraday_points(store_code)
+        if not points:
+            result[store_code] = {"name": name, "error": "暂无分时数据"}
+            continue
+
+        latest = points[-1]
+
+        # 量能节奏：计算各时段增量成交量相对于全日均量的比值，判断放量/缩量时段
+        vols = [p["vol"] for p in points if p["vol"] > 0]
+        avg_vol = sum(vols) / len(vols) if vols else 0
+
+        # 标注每个点的量能状态
+        annotated = []
+        for p in points:
+            vol_ratio = round(p["vol"] / avg_vol, 2) if avg_vol > 0 else None
+            annotated.append({
+                "time":      p["time"],
+                "price":     p["price"],    # 白线：当前价
+                "avg":       p["avg"],      # 黄线：分时均价
+                "vol":       p["vol"],      # 增量成交量
+                "vol_ratio": vol_ratio,     # 相对均量倍数，>1.5 为放量，<0.5 为缩量
+            })
+
+        result[store_code] = {
+            "name":         name,
+            "date":         today,
+            "latest_price": latest["price"],
+            "latest_avg":   latest["avg"],
+            "price_vs_avg": "价格高于均线" if latest["price"] and latest["avg"] and latest["price"] > latest["avg"] else "价格低于均线",
+            "points":       annotated,
+        }
+
+    return {
+        "indexes": result,
+        "note": (
+            "price=白线（当前价），avg=黄线（分时均价/资金成本重心）；"
+            "价格持续高于黄线为多头主导，低于黄线为空头主导；"
+            "vol_ratio>1.5为放量时段，<0.5为缩量时段；"
+            "每3分钟更新一次。"
+        ),
     }
 
 
@@ -1968,6 +2090,8 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
     try:
         if tool_name == "get_intraday_lines":
             result = _tool_get_intraday_lines(tool_args["ts_code"])
+        elif tool_name == "get_index_intraday":
+            result = _tool_get_index_intraday()
         elif tool_name == "get_moneyflow":
             result = _tool_get_moneyflow(tool_args["ts_code"], tool_args.get("trade_date", ""))
         elif tool_name == "get_top_list":
@@ -2072,13 +2196,12 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
     # ── Claude ──────────────────────────────────────────────────────────────
     if provider == "claude":
         import anthropic
-        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 180.0}
+        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 180.0, "default_headers": {"api-key": CLAUDE_API_KEY}}
         if CLAUDE_BASE_URL:
             kwargs["base_url"] = CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         claude_tools = _build_claude_tools()
         messages = [{"role": "user", "content": user_prompt}]
-
         for _round in range(MAX_TOOL_ROUNDS):
             resp = client.messages.create(
                 model=CLAUDE_MODEL,

@@ -41,8 +41,41 @@ FETCH_DAYS = 60  # 拉取最近 60 个交易日，保证 N=20 统计有足够余
 
 
 # ── 初始化 DB ────────────────────────────────────────────────────────────────
+
+# stk_factor_pro 落库的技术指标字段（均取不复权版本 _bfq）
+# 格式：(db列名, stk_factor_pro字段名)
+FACTOR_FIELDS: list[tuple[str, str]] = [
+    ("ma5",          "ma_bfq_5"),
+    ("ma10",         "ma_bfq_10"),
+    ("ma20",         "ma_bfq_20"),
+    ("ma60",         "ma_bfq_60"),
+    ("ema5",         "ema_bfq_5"),
+    ("ema10",        "ema_bfq_10"),
+    ("ema20",        "ema_bfq_20"),
+    ("macd",         "macd_bfq"),
+    ("macd_dif",     "macd_dif_bfq"),
+    ("macd_dea",     "macd_dea_bfq"),
+    ("rsi6",         "rsi_bfq_6"),
+    ("rsi12",        "rsi_bfq_12"),
+    ("kdj_k",        "kdj_k_bfq"),
+    ("kdj_d",        "kdj_d_bfq"),
+    ("kdj_j",        "kdj_bfq"),
+    ("boll_upper",   "boll_upper_bfq"),
+    ("boll_mid",     "boll_mid_bfq"),
+    ("boll_lower",   "boll_lower_bfq"),
+    ("turnover_rate","turnover_rate"),
+    ("pe",           "pe"),
+    ("pb",           "pb"),
+    ("updays",       "updays"),
+    ("downdays",     "downdays"),
+]
+
+# stk_factor_pro 请求字段列表（ts_code + trade_date + 所有指标原始字段名）
+_FACTOR_API_FIELDS = "ts_code,trade_date," + ",".join(api_col for _, api_col in FACTOR_FIELDS)
+
+
 def ensure_tables(conn: sqlite3.Connection) -> None:
-    """确保所需表存在（幂等）。"""
+    """确保所需表存在，并为 daily_records 补充技术指标列（幂等）。"""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_records (
@@ -67,6 +100,16 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+    # 动态补列：amount 及所有技术指标列（SQLite 不支持 IF NOT EXISTS，用 try/except）
+    extra_cols = [("amount", "REAL DEFAULT 0")] + [(db_col, "REAL") for db_col, _ in FACTOR_FIELDS]
+    for col_name, col_def in extra_cols:
+        try:
+            conn.execute(f"ALTER TABLE daily_records ADD COLUMN {col_name} {col_def}")
+            conn.commit()
+            logger.info("ensure_tables: 新增列 daily_records.%s", col_name)
+        except Exception:
+            pass  # 列已存在，忽略
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -144,6 +187,57 @@ def upsert_daily_record(
         """,
         (date, code, name, close, high, low, avg_price, amount),
     )
+
+
+def fetch_factors_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS) -> int:
+    """
+    用 stk_factor_pro 拉取单只股票的技术指标，UPDATE 到已有 daily_records 行。
+    只更新已存在的行（日线数据必须先由 fetch_one 写入），不新增行。
+    返回成功更新的记录条数，失败时抛出异常。
+
+    注意：stk_factor_pro 不支持多 ts_code 批量，只能逐只调用。
+    积分要求：5000 分以上，每分钟 30 次。
+    """
+    ts_code = to_ts_code(code)
+    if is_etf(ts_code):
+        # ETF 无技术指标数据，跳过
+        logger.info("fetch_factors: %s 为 ETF，跳过技术指标", ts_code)
+        return 0
+
+    logger.info("fetch_factors: 拉取 %s 技术指标，limit=%d", ts_code, limit)
+    df = pro.stk_factor_pro(
+        ts_code=ts_code,
+        fields=_FACTOR_API_FIELDS,
+        limit=limit,
+    )
+
+    if df is None or df.empty:
+        logger.warning("fetch_factors: %s 返回空数据", ts_code)
+        return 0
+
+    # 构建 UPDATE 语句：只更新技术指标列，不动 close/high/low/avg_price
+    set_clause = ", ".join(f"{db_col} = ?" for db_col, _ in FACTOR_FIELDS)
+    sql = f"UPDATE daily_records SET {set_clause} WHERE date = ? AND code = ?"
+
+    count = 0
+    for _, row in df.iterrows():
+        try:
+            trade_date = fmt_date(str(row["trade_date"]))
+            values = []
+            for db_col, api_col in FACTOR_FIELDS:
+                raw = row.get(api_col)
+                values.append(float(raw) if raw is not None and str(raw) not in ("", "nan") else None)
+            values.append(trade_date)  # WHERE date = ?
+            values.append(code)        # WHERE code = ?
+            conn.execute(sql, values)
+            count += 1
+        except Exception as e:
+            logger.warning("fetch_factors: %s 某行处理失败：%s", ts_code, e)
+            continue
+
+    conn.commit()
+    logger.info("fetch_factors: %s 更新 %d 条技术指标", ts_code, count)
+    return count
 
 
 # ── 核心逻辑 ─────────────────────────────────────────────────────────────────
@@ -323,6 +417,26 @@ def main() -> None:
         summary = f"完成：成功 {success} 只，失败 {failed} 只，耗时 {elapsed}s"
         logger.info("=== %s ===", summary)
         print(f"\n{summary}")
+
+        # ── 拉取技术指标（stk_factor_pro，需 5000 积分）────────────────────
+        print("\n── 拉取技术指标（stk_factor_pro）──")
+        logger.info("=== 开始拉取技术指标，共 %d 只 ===", len(codes))
+        fac_success, fac_failed = 0, 0
+        for code in codes:
+            try:
+                n = fetch_factors_one(pro, conn, code, limit=limit)
+                fac_success += 1
+                print(f"  ✓ {code}  更新 {n} 条技术指标")
+            except Exception as e:
+                fac_failed += 1
+                logger.error("技术指标 %s 失败：%s", code, e)
+                print(f"  ✗ {code}  技术指标失败：{e}")
+            # stk_factor_pro 每分钟 30 次限制，保守间隔 2s
+            time.sleep(2)
+
+        fac_summary = f"技术指标完成：成功 {fac_success} 只，失败 {fac_failed} 只"
+        logger.info("=== %s ===", fac_summary)
+        print(f"\n{fac_summary}")
 
         # ── 拉取三大指数数据（大盘风向标）────────────────────────────────────
         # 使用 pro.index_daily 接口，amount 单位与 pro.daily 个股一致（千元）
