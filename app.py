@@ -2349,7 +2349,7 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
 
     if provider == "claude":
         import anthropic
-        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 120.0}
+        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 120.0, "default_headers": {"api-key": CLAUDE_API_KEY}}
         if CLAUDE_BASE_URL:
             kwargs["base_url"] = CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
