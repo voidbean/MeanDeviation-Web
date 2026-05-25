@@ -534,47 +534,70 @@ def get_index_market_data(days: int = 20) -> dict:
     return result
 
 
-def get_index_volume_chart_data(days: int = 20) -> dict | None:
+def get_index_trend_chart_data(days: int = 20) -> dict | None:
     """
-    返回上证指数 (000001.SH) 最近 days 日量能数据，供前端 ECharts 柱状图渲染。
+    返回三大指数（上证/深成/创业板）近 days 日走势数据，供前端 ECharts 多折线图渲染。
+    收盘价归一化为相对首日的涨跌幅（%），方便三指数强弱对比。
+    同时附带上证成交额，供 tooltip 展示量能参考。
+
     返回格式：
     {
-        "dates":   ["2025-04-01", ...],          # X轴，升序
-        "amounts": [3456.78, ...],               # 成交额（亿元）
-        "colors":  ["#ef5350", "#9e9e9e", ...],  # 放量=红，缩量=灰
-        "labels":  ["放量", "缩量", ...],
+        "dates":      ["2025-04-01", ...],       # X轴，升序，以上证日期为准
+        "sh_pct":     [0.0, 1.2, -0.5, ...],    # 上证涨跌幅（%，相对首日）
+        "sz_pct":     [...],                     # 深成涨跌幅
+        "cy_pct":     [...],                     # 创业板涨跌幅
+        "sh_close":   [3200.1, ...],             # 上证收盘价（tooltip用）
+        "sz_close":   [...],                     # 深成收盘价
+        "cy_close":   [...],                     # 创业板收盘价
+        "sh_amounts": [3456.78, ...],            # 上证成交额（亿，tooltip用）
     }
     若无数据则返回 None。
     """
     index_data = get_index_market_data(days=days)
-    sh_data = index_data.get("000001.SH", {})
-    records = sh_data.get("records", [])
 
-    if not records:
+    def extract(ts_code: str) -> list:
+        """取升序 records，不足则返回空列表。"""
+        recs = index_data.get(ts_code, {}).get("records", [])
+        return list(reversed(recs))  # get_index_market_data 返回降序
+
+    sh_recs = extract("000001.SH")
+    sz_recs = extract("399001.SZ")
+    cy_recs = extract("399006.SZ")
+
+    if not sh_recs:
         return None
 
-    # get_index_market_data 返回降序，反转为升序供图表使用
-    records = list(reversed(records))
+    def to_pct(records: list) -> list[float | None]:
+        """将收盘价序列转为相对首日的涨跌幅（%）。"""
+        if not records:
+            return []
+        base = records[0]["close"]
+        if not base:
+            return [None] * len(records)
+        return [round((r["close"] - base) / base * 100, 2) if r["close"] else None
+                for r in records]
 
-    dates   = [r["date"]      for r in records]
-    amounts = [r["amount_yi"] for r in records]
-    colors: list[str] = []
-    labels: list[str] = []
+    dates      = [r["date"]      for r in sh_recs]
+    sh_close   = [r["close"]     for r in sh_recs]
+    sh_amounts = [r["amount_yi"] for r in sh_recs]
+    sz_close   = [r["close"]     for r in sz_recs] if sz_recs else []
+    cy_close   = [r["close"]     for r in cy_recs] if cy_recs else []
 
-    for i, amt in enumerate(amounts):
-        if i == 0:
-            colors.append("#9e9e9e")
-            labels.append("—")
-        else:
-            prev = amounts[i - 1]
-            if amt > prev:
-                colors.append("#ef5350")   # 放量 — A股红色
-                labels.append("放量")
-            else:
-                colors.append("#9e9e9e")   # 缩量 — 灰色
-                labels.append("缩量")
+    # 对齐长度（以上证日期为准，其他指数可能数据天数略有差异）
+    n = len(dates)
+    def pad(lst: list, length: int):
+        return lst[:length] + [None] * max(0, length - len(lst))
 
-    return {"dates": dates, "amounts": amounts, "colors": colors, "labels": labels}
+    return {
+        "dates":      dates,
+        "sh_pct":     to_pct(sh_recs),
+        "sz_pct":     to_pct(sz_recs) if sz_recs else [None] * n,
+        "cy_pct":     to_pct(cy_recs) if cy_recs else [None] * n,
+        "sh_close":   pad(sh_close,   n),
+        "sz_close":   pad(sz_close,   n),
+        "cy_close":   pad(cy_close,   n),
+        "sh_amounts": pad(sh_amounts, n),
+    }
 
 
 def get_stock_volume_chart_data(history_results: list) -> dict | None:
@@ -590,6 +613,7 @@ def get_stock_volume_chart_data(history_results: list) -> dict | None:
 
     dates   = [r["date"]       for r in records]
     amounts = [r.get("amount_yi", 0) for r in records]
+    closes  = [r.get("close", None)  for r in records]
     colors: list[str] = []
     labels: list[str] = []
 
@@ -606,7 +630,7 @@ def get_stock_volume_chart_data(history_results: list) -> dict | None:
                 colors.append("#9e9e9e")
                 labels.append("缩量")
 
-    return {"dates": dates, "amounts": amounts, "colors": colors, "labels": labels}
+    return {"dates": dates, "amounts": amounts, "colors": colors, "labels": labels, "closes": closes}
 
 
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
@@ -2520,7 +2544,7 @@ async def update_portfolio(
 
     history_results = calculate_8848_history(code, days=20)
     stock_volume    = get_stock_volume_chart_data(history_results)
-    index_volume    = get_index_volume_chart_data(days=20)
+    index_trend    = get_index_trend_chart_data(days=20)
 
     rid = str(uuid.uuid4())
     save_temp_result(rid, {
@@ -2529,7 +2553,7 @@ async def update_portfolio(
         "batch_results":   None,
         "history_results": history_results,
         "stock_volume":    stock_volume,
-        "index_volume":    index_volume,
+        "index_trend":    index_trend,
         "ai_analysis":     None,
         "ai_error":        None,
         "ai_provider":     AI_PROVIDER,
@@ -2674,7 +2698,7 @@ async def read_root(request: Request, result_id: str = None):
         "batch_results":   None,
         "history_results": None,
         "stock_volume":    None,
-        "index_volume":    get_index_volume_chart_data(days=20),
+        "index_trend":    get_index_trend_chart_data(days=20),
         "last_code":       "",
         "query_history":   get_query_history(),
         "ai_analysis":     None,
@@ -2688,8 +2712,8 @@ async def read_root(request: Request, result_id: str = None):
     # query_history 和 common_stocks 总是刷新，不从缓存取
     ctx.pop("query_history", None)
     ctx.pop("common_stocks", None)
-    # index_volume 始终从 DB 刷新，不用缓存中的旧值
-    ctx.pop("index_volume", None)
+    # index_trend 始终从 DB 刷新，不用缓存中的旧值
+    ctx.pop("index_trend", None)
     return templates.TemplateResponse("index.html", {"request": request, **defaults, **ctx})
 
 @app.post("/analyze", response_class=HTMLResponse)
@@ -2710,7 +2734,7 @@ async def analyze_stock(request: Request, stock_code: str = Form(...)):
 
     history_results = calculate_8848_history(stock_code, days=20)
     stock_volume    = get_stock_volume_chart_data(history_results)
-    index_volume    = get_index_volume_chart_data(days=20)
+    index_trend    = get_index_trend_chart_data(days=20)
 
     rid = str(uuid.uuid4())
     save_temp_result(rid, {
@@ -2719,7 +2743,7 @@ async def analyze_stock(request: Request, stock_code: str = Form(...)):
         "batch_results":   None,
         "history_results": history_results,
         "stock_volume":    stock_volume,
-        "index_volume":    index_volume,
+        "index_trend":    index_trend,
         "ai_analysis":     None,
         "ai_error":        None,
         "ai_provider":     AI_PROVIDER,
@@ -2791,7 +2815,7 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
 
     hist_for_chart = calculate_8848_history(stock_code, days=20)
     stock_volume   = get_stock_volume_chart_data(hist_for_chart)
-    index_volume   = get_index_volume_chart_data(days=20)
+    index_trend   = get_index_trend_chart_data(days=20)
 
     rid = str(uuid.uuid4())
     save_temp_result(rid, {
@@ -2800,7 +2824,7 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
         "batch_results":   None,
         "history_results": hist_for_chart,
         "stock_volume":    stock_volume,
-        "index_volume":    index_volume,
+        "index_trend":    index_trend,
         "ai_analysis":     ai_analysis,
         "ai_error":        ai_error,
         "ai_provider":     AI_PROVIDER,

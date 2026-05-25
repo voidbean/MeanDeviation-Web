@@ -2,9 +2,11 @@
 fetch_history.py — 历史日线数据采集脚本
 
 功能：
-    从 Tushare Pro 拉取股票/ETF 最近 60 个交易日的日线数据，
+    从 Tushare Pro 拉取股票/ETF 最近 60 个交易日的前复权（qfq）日线数据，
     写入 daily_records 表，供 get_n_day_stats() 使用。
     ETF（上交所 5 开头、深交所 1 开头）自动使用 fund_daily 接口。
+    使用前复权价格可避免除权日导致 BOLL/MA 等技术指标严重失真。
+    每日定时拉取近 60 日数据，复权因子变化时历史价格会自动覆盖更新。
 
 用法：
     uv run python fetch_history.py                          # 常规模式：拉取 COMMON_STOCK_CODES 最近 60 个交易日
@@ -42,27 +44,27 @@ FETCH_DAYS = 60  # 拉取最近 60 个交易日，保证 N=20 统计有足够余
 
 # ── 初始化 DB ────────────────────────────────────────────────────────────────
 
-# stk_factor_pro 落库的技术指标字段（均取不复权版本 _bfq）
+# stk_factor_pro 落库的技术指标字段（均取前复权版本 _qfq）
 # 格式：(db列名, stk_factor_pro字段名)
 FACTOR_FIELDS: list[tuple[str, str]] = [
-    ("ma5",          "ma_bfq_5"),
-    ("ma10",         "ma_bfq_10"),
-    ("ma20",         "ma_bfq_20"),
-    ("ma60",         "ma_bfq_60"),
-    ("ema5",         "ema_bfq_5"),
-    ("ema10",        "ema_bfq_10"),
-    ("ema20",        "ema_bfq_20"),
-    ("macd",         "macd_bfq"),
-    ("macd_dif",     "macd_dif_bfq"),
-    ("macd_dea",     "macd_dea_bfq"),
-    ("rsi6",         "rsi_bfq_6"),
-    ("rsi12",        "rsi_bfq_12"),
-    ("kdj_k",        "kdj_k_bfq"),
-    ("kdj_d",        "kdj_d_bfq"),
-    ("kdj_j",        "kdj_bfq"),
-    ("boll_upper",   "boll_upper_bfq"),
-    ("boll_mid",     "boll_mid_bfq"),
-    ("boll_lower",   "boll_lower_bfq"),
+    ("ma5",          "ma_qfq_5"),
+    ("ma10",         "ma_qfq_10"),
+    ("ma20",         "ma_qfq_20"),
+    ("ma60",         "ma_qfq_60"),
+    ("ema5",         "ema_qfq_5"),
+    ("ema10",        "ema_qfq_10"),
+    ("ema20",        "ema_qfq_20"),
+    ("macd",         "macd_qfq"),
+    ("macd_dif",     "macd_dif_qfq"),
+    ("macd_dea",     "macd_dea_qfq"),
+    ("rsi6",         "rsi_qfq_6"),
+    ("rsi12",        "rsi_qfq_12"),
+    ("kdj_k",        "kdj_k_qfq"),
+    ("kdj_d",        "kdj_d_qfq"),
+    ("kdj_j",        "kdj_qfq"),
+    ("boll_upper",   "boll_upper_qfq"),
+    ("boll_mid",     "boll_mid_qfq"),
+    ("boll_lower",   "boll_lower_qfq"),
     ("turnover_rate","turnover_rate"),
     ("pe",           "pe"),
     ("pb",           "pb"),
@@ -241,10 +243,29 @@ def fetch_factors_one(pro, conn: sqlite3.Connection, code: str, limit: int = FET
 
 
 # ── 核心逻辑 ─────────────────────────────────────────────────────────────────
+def get_etf_adj_factors(pro, ts_code: str, limit: int) -> dict[str, float]:
+    """
+    拉取 ETF 复权因子表，返回 {trade_date_str: adj_factor} 字典。
+    前复权计算：price_qfq = price_raw / adj_factor * latest_adj_factor
+    若接口失败则返回空字典（调用方降级为不复权）。
+
+    Tushare fund_daily 不支持 adj 参数，需手动用 fund_adj 复权因子计算前复权价格。
+    """
+    try:
+        df = pro.fund_adj(ts_code=ts_code, limit=limit)
+        if df is None or df.empty:
+            return {}
+        return {str(row["trade_date"]): float(row["adj_factor"]) for _, row in df.iterrows()}
+    except Exception as e:
+        logger.warning("fund_adj %s 失败，降级为不复权：%s", ts_code, e)
+        return {}
+
+
 def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS) -> int:
     """
     拉取单只股票或 ETF 的历史日线数据并写入 DB。
-    ETF（上交所 5 开头、深交所 1 开头）自动使用 fund_daily 接口。
+    - 个股：pro.daily(adj='qfq') 直接返回前复权价格
+    - ETF：fund_daily 不支持 adj，手动用 fund_adj 复权因子换算前复权价格
     返回成功写入的记录条数，失败时抛出异常。
     """
     ts_code = to_ts_code(code)
@@ -255,8 +276,14 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
     logger.info("拉取 %s (%s) via %s，limit=%d", ts_code, name or "未知", api_name, limit)
     if use_fund_api:
         df = pro.fund_daily(ts_code=ts_code, limit=limit)
+        # fund_daily 不支持 adj 参数，手动拉取复权因子做前复权换算
+        adj_factors = get_etf_adj_factors(pro, ts_code, limit)
+        latest_adj = max(adj_factors.values()) if adj_factors else 1.0
+        logger.info("%s 复权因子条数=%d，最新因子=%.4f", ts_code, len(adj_factors), latest_adj)
     else:
-        df = pro.daily(ts_code=ts_code, limit=limit)
+        df = pro.daily(ts_code=ts_code, limit=limit, adj='qfq')
+        adj_factors = {}
+        latest_adj = 1.0
 
     if df is None or df.empty:
         logger.warning("%s 返回空数据，可能停牌或代码有误", ts_code)
@@ -266,15 +293,33 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
     for _, row in df.iterrows():
         try:
             trade_date = str(row["trade_date"])
-            close = float(row["close"])
-            high  = float(row["high"])
-            low   = float(row["low"])
+            close_raw = float(row["close"])
+            high_raw  = float(row["high"])
+            low_raw   = float(row["low"])
             amount = float(row.get("amount", 0) or 0)  # 千元
             vol    = float(row.get("vol", 0) or 0)     # 手
 
-            # 均价换算：千元→元，手→股
+            # ETF 前复权换算：price_qfq = price_raw * (factor / latest_adj)
+            # 逻辑：除权后 latest_adj 变大，历史 factor 较小，历史价格等比缩小，
+            # 使历史价格与当前价格处于同一尺度。
+            # 例：1拆3后 latest_adj=3，除权前 factor=1，历史价格 × (1/3) 对齐现价。
+            if use_fund_api and adj_factors:
+                factor = adj_factors.get(trade_date, latest_adj)
+                ratio  = factor / latest_adj
+                close = round(close_raw * ratio, 4)
+                high  = round(high_raw  * ratio, 4)
+                low   = round(low_raw   * ratio, 4)
+            else:
+                close, high, low = close_raw, high_raw, low_raw
+
+            # 均价换算：千元→元，手→股（用原始价格计算，再同步复权）
             if vol > 0 and amount > 0:
-                avg_price = (amount * 1000) / (vol * 100)
+                avg_price_raw = (amount * 1000) / (vol * 100)
+                if use_fund_api and adj_factors:
+                    factor = adj_factors.get(trade_date, latest_adj)
+                    avg_price = round(avg_price_raw * (factor / latest_adj), 4)
+                else:
+                    avg_price = round(avg_price_raw, 4)
             else:
                 avg_price = close  # 停牌日 fallback
 
@@ -286,7 +331,7 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
                 close=close,
                 high=high,
                 low=low,
-                avg_price=round(avg_price, 4),
+                avg_price=avg_price,
                 amount=round(amount, 2),
             )
             count += 1
