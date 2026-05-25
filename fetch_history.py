@@ -103,8 +103,8 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
-    # 动态补列：amount 及所有技术指标列（SQLite 不支持 IF NOT EXISTS，用 try/except）
-    extra_cols = [("amount", "REAL DEFAULT 0")] + [(db_col, "REAL") for db_col, _ in FACTOR_FIELDS]
+    # 动态补列：amount、open 及所有技术指标列（SQLite 不支持 IF NOT EXISTS，用 try/except）
+    extra_cols = [("amount", "REAL DEFAULT 0"), ("open", "REAL DEFAULT 0")] + [(db_col, "REAL") for db_col, _ in FACTOR_FIELDS]
     for col_name, col_def in extra_cols:
         try:
             conn.execute(f"ALTER TABLE daily_records ADD COLUMN {col_name} {col_def}")
@@ -173,21 +173,23 @@ def upsert_daily_record(
     low: float,
     avg_price: float,
     amount: float = 0.0,
+    open: float = 0.0,
 ) -> None:
     """写入一条日线记录，已存在则覆盖（幂等）。amount 单位：千元。"""
     conn.execute(
         """
-        INSERT INTO daily_records(date, code, name, close, high, low, avg_price, amount)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO daily_records(date, code, name, close, high, low, avg_price, amount, open)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date, code) DO UPDATE SET
             close     = excluded.close,
             high      = excluded.high,
             low       = excluded.low,
             avg_price = excluded.avg_price,
             name      = excluded.name,
-            amount    = excluded.amount
+            amount    = excluded.amount,
+            open      = excluded.open
         """,
-        (date, code, name, close, high, low, avg_price, amount),
+        (date, code, name, close, high, low, avg_price, amount, open),
     )
 
 
@@ -296,6 +298,7 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
             close_raw = float(row["close"])
             high_raw  = float(row["high"])
             low_raw   = float(row["low"])
+            open_raw  = float(row.get("open", row["close"]) or row["close"])
             amount = float(row.get("amount", 0) or 0)  # 千元
             vol    = float(row.get("vol", 0) or 0)     # 手
 
@@ -309,8 +312,9 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
                 close = round(close_raw * ratio, 4)
                 high  = round(high_raw  * ratio, 4)
                 low   = round(low_raw   * ratio, 4)
+                open_ = round(open_raw  * ratio, 4)
             else:
-                close, high, low = close_raw, high_raw, low_raw
+                close, high, low, open_ = close_raw, high_raw, low_raw, open_raw
 
             # 均价换算：千元→元，手→股（用原始价格计算，再同步复权）
             if vol > 0 and amount > 0:
@@ -333,6 +337,7 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
                 low=low,
                 avg_price=avg_price,
                 amount=round(amount, 2),
+                open=open_,
             )
             count += 1
         except Exception as e:

@@ -177,6 +177,19 @@ def init_db():
                 else:
                     raise
 
+            # 迁移：为 daily_records 表新增 open 字段（开盘价），用于 K 线图
+            try:
+                conn.execute(
+                    "ALTER TABLE daily_records ADD COLUMN open REAL DEFAULT 0"
+                )
+                conn.commit()
+                print("Migration: added open column to daily_records table.")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" in str(e).lower():
+                    pass  # 字段已存在，忽略
+                else:
+                    raise
+
         finally:
             conn.close()
     except Exception as e:
@@ -316,16 +329,17 @@ def save_daily_record(code: str, name: str, data: dict):
         today = time.strftime("%Y-%m-%d")
         conn.execute(
             """
-            INSERT INTO daily_records(date, code, name, close, high, low, avg_price)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_records(date, code, name, close, high, low, avg_price, open)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date, code) DO UPDATE SET
                 close = excluded.close,
                 high = excluded.high,
                 low = excluded.low,
                 avg_price = excluded.avg_price,
-                name = excluded.name
+                name = excluded.name,
+                open = excluded.open
             """,
-            (today, code, name, data['price'], data['high'], data['low'], data['avg_price'])
+            (today, code, name, data['price'], data['high'], data['low'], data['avg_price'], data.get('open', 0))
         )
         conn.commit()
         conn.close()
@@ -630,7 +644,26 @@ def get_stock_volume_chart_data(history_results: list) -> dict | None:
                 colors.append("#9e9e9e")
                 labels.append("缩量")
 
-    return {"dates": dates, "amounts": amounts, "colors": colors, "labels": labels, "closes": closes}
+    opens       = [r.get("open",       None) for r in records]
+    highs       = [r.get("high",       None) for r in records]
+    lows        = [r.get("low",        None) for r in records]
+    upper_lines = [r.get("upper_line", None) for r in records]
+    lower_lines = [r.get("lower_line", None) for r in records]
+    avg_prices  = [r.get("avg_price",  None) for r in records]
+
+    return {
+        "dates":       dates,
+        "amounts":     amounts,
+        "colors":      colors,
+        "labels":      labels,
+        "closes":      closes,
+        "opens":       opens,
+        "highs":       highs,
+        "lows":        lows,
+        "upper_lines": upper_lines,
+        "lower_lines": lower_lines,
+        "avg_prices":  avg_prices,
+    }
 
 
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
@@ -1475,6 +1508,67 @@ def _calc_macd(code: str) -> dict | None:
         "div_detail": div_detail,
         "cross":      cross,
         "above_zero": dif[-1] > 0,  # DIF 在零轴上方
+        # 近20日序列，供 MACD 副图渲染
+        "series": {
+            "dates": dates[-20:],
+            "dif":   [round(v, 4) for v in dif[-20:]],
+            "dea":   [round(v, 4) for v in dea[-20:]],
+            "hist":  [round(v, 4) for v in hist[-20:]],
+        },
+    }
+
+
+def _calc_yidong(code: str, current_price: float) -> dict | None:
+    """
+    计算异动线：取近31个交易日的收盘价，用第31条（即30个交易日前）作为基准，
+    异动线 = 基准收盘价 × 3.0（即30日内涨幅累计达到200%）。
+    返回 dict 或 None（数据不足时）：
+      - base_date:   基准日期
+      - base_close:  基准收盘价
+      - yidong_line: 异动线价格
+      - pct_to_line: 当前价距异动线的百分比（负=未到，正=已超过）
+      - alert:       True/False，当前价 >= 异动线 × 0.9 时触发
+      - triggered:   True/False，当前价 >= 异动线（已触发异动）
+    """
+    short_code = code.split(".")[0] if "." in code else code
+    ts_code    = code if "." in code else None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = None
+        for q in ([ts_code, short_code] if ts_code else [short_code]):
+            if q is None:
+                continue
+            cur = conn.execute(
+                "SELECT date, close FROM daily_records WHERE code=? ORDER BY date DESC LIMIT 31",
+                (q,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                break
+        conn.close()
+    except Exception:
+        return None
+
+    if not rows or len(rows) < 31:
+        return None
+
+    # rows 是降序，rows[-1] 是最早的那条（30个交易日前）
+    base_date, base_close = rows[-1][0], float(rows[-1][1])
+    if base_close <= 0:
+        return None
+
+    yidong_line = round(base_close * 3.0, 4)
+    pct_to_line = round((current_price - yidong_line) / yidong_line * 100, 2)
+    alert       = current_price >= yidong_line * 0.9
+    triggered   = current_price >= yidong_line
+
+    return {
+        "base_date":   base_date,
+        "base_close":  round(base_close, 4),
+        "yidong_line": yidong_line,
+        "pct_to_line": pct_to_line,   # 负值=还差多少%，正值=已超过多少%
+        "alert":       alert,
+        "triggered":   triggered,
     }
 
 
@@ -1543,6 +1637,20 @@ def _calc_boll(code: str) -> dict:
         position = "数据不足"
         advice_class = "secondary"
 
+    # 近20日滚动均线序列（供 K 线图叠加均线使用）
+    recent_rows = rows[max(0, n - 20):]
+    all_closes  = closes  # 全量 closes，用于计算滚动均线
+    ma_series_dates = []
+    ma_series_ma5   = []
+    ma_series_ma10  = []
+    ma_series_ma20  = []
+    for i in range(max(0, n - 20), n):
+        ma_series_dates.append(rows[i][0])
+        offset = i + 1  # 截止到第 i 条（含）的数据长度
+        ma_series_ma5.append(round(sum(all_closes[max(0, offset - 5):offset]) / min(5, offset), 4))
+        ma_series_ma10.append(round(sum(all_closes[max(0, offset - 10):offset]) / min(10, offset), 4))
+        ma_series_ma20.append(round(sum(all_closes[max(0, offset - 20):offset]) / min(20, offset), 4))
+
     return {
         "upper": upper,
         "mid":   mid,
@@ -1554,6 +1662,12 @@ def _calc_boll(code: str) -> dict:
         "advice_class": advice_class,
         "data_points":  n,
         "recent_closes": [{"date": rows[i][0], "close": rows[i][1]} for i in range(max(0, n - 20), n)],
+        "ma_series": {
+            "dates": ma_series_dates,
+            "ma5":   ma_series_ma5,
+            "ma10":  ma_series_ma10,
+            "ma20":  ma_series_ma20,
+        },
     }
 
 
@@ -2491,6 +2605,20 @@ def calculate_8848(code: str):
         # N-Day Stats（20日 + 60日，用于页面展示建议值）
         n_day = get_n_day_stats(code)
 
+        boll_data = _calc_boll(code)
+        macd_data = _calc_macd(code)
+
+        # 个股近20日相对首日涨跌幅序列（供大盘走势图叠加对比）
+        stock_pct = None
+        if boll_data and boll_data.get("recent_closes"):
+            rc = boll_data["recent_closes"]
+            if rc and rc[0]["close"]:
+                base = rc[0]["close"]
+                stock_pct = [
+                    round((r["close"] - base) / base * 100, 2) if r["close"] else None
+                    for r in rc
+                ]
+
         return {
             "code": code,
             "name": name,
@@ -2516,8 +2644,10 @@ def calculate_8848(code: str):
             "n60_high": n_day["n60_high"],
             "n60_low":  n_day["n60_low"],
             "intraday_points": _get_intraday_points(code),
-            "boll": _calc_boll(code),
-            "macd": _calc_macd(code),
+            "boll": boll_data,
+            "macd": macd_data,
+            "stock_pct": stock_pct,
+            "yidong": _calc_yidong(code, price),
         }
 
     except Exception as e:
@@ -2642,10 +2772,18 @@ def calculate_8848_history(code: str, days: int = 20):
         else:
             position = "neutral"
 
+        try:
+            open_price = float(row.get("open", close_price))
+        except Exception:
+            open_price = close_price
+
         records.append(
             {
                 "date": str(row.get("trade_date", "")),
+                "open": round(open_price, 4),
                 "close": round(close_price, 4),
+                "high": round(float(row.get("high", close_price)), 4),
+                "low": round(float(row.get("low", close_price)), 4),
                 "avg_price": round(avg_price, 4),
                 "upper_line": round(upper_line, 4),
                 "lower_line": round(lower_line, 4),
