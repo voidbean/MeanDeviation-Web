@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import threading
+import math
 import tushare as ts
 import os
 import sqlite3
@@ -1518,22 +1519,68 @@ def _calc_macd(code: str) -> dict | None:
     }
 
 
+def _get_benchmark_index(short_code: str) -> str:
+    """根据股票代码前缀返回对标指数的 ts_code。
+    沪市主板(60xxxx) → 000001.SH（上证指数）
+    深市主板(00xxxx)  → 399001.SZ（深证成指）
+    创业板  (30xxxx)  → 399006.SZ（创业板指）
+    科创板  (68xxxx)  → 000688.SH（科创50）
+    其余    → 000001.SH（默认上证）
+    """
+    if short_code.startswith("60"):
+        return "000001.SH"
+    elif short_code.startswith("00"):
+        return "399001.SZ"
+    elif short_code.startswith("30"):
+        return "399006.SZ"
+    elif short_code.startswith("68"):
+        return "000688.SH"
+    else:
+        return "000001.SH"
+
+
 def _calc_yidong(code: str, current_price: float) -> dict | None:
     """
-    计算异动线：取近31个交易日的收盘价，用第31条（即30个交易日前）作为基准，
-    异动线 = 基准收盘价 × 3.0（即30日内涨幅累计达到200%）。
+    计算异动线：基于个股相对对标指数的累计偏离值判断是否异动。
+
+    核心公式：
+      R_stock    = (current_price - base_close) / base_close × 100%
+      R_index    = (I_current - I_base) / I_base × 100%
+      Deviation  = R_stock - R_index
+
+    触发条件：Deviation >= 200%（个股超额涨幅达到200%）
+    预警条件：Deviation >= 180%（触发线的90%）
+
+    对标指数规则（交易所规定）：
+      沪市主板(60xxxx) → 000001.SH 上证指数
+      深市主板(00xxxx) → 399001.SZ 深证成指
+      创业板  (30xxxx) → 399006.SZ 创业板指
+      科创板  (68xxxx) → 000688.SH 科创50
+
+    降级逻辑：若对标指数数据缺失，退回旧逻辑（base_close × 3.0），
+    此时返回字段 fallback=True 以便前端提示。
+
     返回 dict 或 None（数据不足时）：
-      - base_date:   基准日期
-      - base_close:  基准收盘价
-      - yidong_line: 异动线价格
-      - pct_to_line: 当前价距异动线的百分比（负=未到，正=已超过）
-      - alert:       True/False，当前价 >= 异动线 × 0.9 时触发
-      - triggered:   True/False，当前价 >= 异动线（已触发异动）
+      - base_date:     基准日期（T-30）
+      - base_close:    个股 T-30 基准收盘价
+      - yidong_line:   异动线对应价格 = base_close × (1 + 2.0 + R_index/100)
+      - pct_to_line:   当前价距异动线的百分比（负=未到，正=已超过）
+      - r_stock:       个股区间涨跌幅（%）
+      - r_index:       对标指数区间涨跌幅（%）
+      - deviation:     累计偏离值（%）= r_stock - r_index
+      - index_code:    对标指数代码
+      - index_base:    指数 T-30 基准收盘点位
+      - index_current: 指数最新收盘点位
+      - alert:         True/False，deviation >= 180%
+      - triggered:     True/False，deviation >= 200%
+      - fallback:      True 表示指数数据缺失，已降级为旧逻辑（× 3.0）
     """
     short_code = code.split(".")[0] if "." in code else code
     ts_code    = code if "." in code else None
     try:
         conn = sqlite3.connect(DB_PATH)
+
+        # ── 1. 取个股近31条收盘价 ──────────────────────────────────────────
         rows = None
         for q in ([ts_code, short_code] if ts_code else [short_code]):
             if q is None:
@@ -1545,30 +1592,97 @@ def _calc_yidong(code: str, current_price: float) -> dict | None:
             rows = cur.fetchall()
             if rows:
                 break
+
+        if not rows or len(rows) < 31:
+            conn.close()
+            return None
+
+        # rows 降序，rows[-1] 是最早那条（T-30 基准日）
+        base_date, base_close = rows[-1][0], float(rows[-1][1])
+        if base_close <= 0:
+            conn.close()
+            return None
+
+        # ── 2. 取对标指数的 T-30 基准点位 & 最新收盘点位 ──────────────────
+        index_code   = _get_benchmark_index(short_code)
+        index_base   = None
+        index_current = None
+
+        idx_cur = conn.execute(
+            "SELECT date, close FROM daily_records WHERE code=? ORDER BY date DESC LIMIT 31",
+            (index_code,),
+        )
+        idx_rows = idx_cur.fetchall()
         conn.close()
+
+        if idx_rows and len(idx_rows) >= 31:
+            index_current = float(idx_rows[0][1])   # 最新收盘
+            index_base    = float(idx_rows[-1][1])   # T-30 基准
+
     except Exception:
         return None
 
-    if not rows or len(rows) < 31:
-        return None
+    # ── 3. 计算偏离值（或降级） ────────────────────────────────────────────
+    r_stock = round((current_price - base_close) / base_close * 100, 4)
 
-    # rows 是降序，rows[-1] 是最早的那条（30个交易日前）
-    base_date, base_close = rows[-1][0], float(rows[-1][1])
-    if base_close <= 0:
-        return None
+    if index_base and index_base > 0 and index_current and index_current > 0:
+        # 正常逻辑：扣除指数涨幅
+        r_index   = round((index_current - index_base) / index_base * 100, 4)
+        deviation = round(r_stock - r_index, 4)
+        # 异动线价格：在指数涨幅基础上再超涨200%对应的价格
+        yidong_line = round(base_close * (1 + (2.0 + r_index / 100)), 4)
+        fallback    = False
+    else:
+        # 降级逻辑：指数数据缺失，退回 base_close × 3.0
+        r_index     = None
+        deviation   = r_stock          # 无法扣除指数，直接用个股涨幅
+        yidong_line = round(base_close * 3.0, 4)
+        index_base  = None
+        index_current = None
+        fallback    = True
 
-    yidong_line = round(base_close * 3.0, 4)
     pct_to_line = round((current_price - yidong_line) / yidong_line * 100, 2)
-    alert       = current_price >= yidong_line * 0.9
-    triggered   = current_price >= yidong_line
+
+    if fallback:
+        # 降级时沿用原阈值：当前价 >= 异动线（即涨幅 >= 200%）
+        alert     = current_price >= yidong_line * 0.9
+        triggered = current_price >= yidong_line
+    else:
+        alert     = deviation >= 180.0
+        triggered = deviation >= 200.0
+
+    # ── 4. 次日预估 ────────────────────────────────────────────────────────
+    # 异动线价格固定（base_close / r_index 不变），以当前价为基准推算次日情况。
+    # 涨停板比例：科创板(68xxxx) = 20%，其余主板/创业板 = 10%
+    limit_rate = 0.20 if short_code.startswith("68") else 0.10
+    next_day_gap_pct    = round((yidong_line - current_price) / current_price * 100, 2)
+    next_day_limit_price = round(current_price * (1 + limit_rate), 2)
+    if yidong_line > current_price and current_price > 0:
+        boards_needed = math.ceil(
+            math.log(yidong_line / current_price) / math.log(1 + limit_rate)
+        )
+    else:
+        boards_needed = 0   # 已达到或超过异动线
 
     return {
-        "base_date":   base_date,
-        "base_close":  round(base_close, 4),
-        "yidong_line": yidong_line,
-        "pct_to_line": pct_to_line,   # 负值=还差多少%，正值=已超过多少%
-        "alert":       alert,
-        "triggered":   triggered,
+        "base_date":      base_date,
+        "base_close":     round(base_close, 4),
+        "yidong_line":    yidong_line,
+        "pct_to_line":    pct_to_line,      # 负值=还差多少%，正值=已超过多少%
+        "r_stock":        r_stock,
+        "r_index":        r_index,          # None 表示降级
+        "deviation":      round(deviation, 2),
+        "index_code":     index_code,
+        "index_base":     round(index_base, 2) if index_base else None,
+        "index_current":  round(index_current, 2) if index_current else None,
+        "alert":          alert,
+        "triggered":      triggered,
+        "fallback":       fallback,
+        # 次日预估字段
+        "next_day_gap_pct":      next_day_gap_pct,      # 距异动线还差 X%（负=已超过）
+        "next_day_limit_price":  next_day_limit_price,  # 次日涨停价
+        "next_day_boards_needed": boards_needed,         # 需要几个涨停板才能触发
+        "limit_rate":            limit_rate,             # 涨停板比例（0.1 或 0.2）
     }
 
 

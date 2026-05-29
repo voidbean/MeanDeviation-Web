@@ -281,10 +281,20 @@
                                     <span class="ms-1 badge bg-danger">立即关注</span>
                                     <div class="mt-1 text-muted" style="font-size:0.78rem;">
                                         异动线 <strong class="text-danger">{{ yd.yidong_line }}</strong>
-                                        （基准日 {{ yd.base_date }} 收盘 {{ yd.base_close }} × 3）
                                         · 当前超出
                                         <strong class="text-danger">+{{ yd.pct_to_line }}%</strong>
+                                        {% if not yd.fallback %}
+                                        · 超额偏离 <strong class="text-danger">{{ yd.deviation }}%</strong>
+                                        （股 {{ yd.r_stock }}% − {{ yd.index_code }} {{ yd.r_index }}%）
+                                        {% else %}
+                                        · <span class="text-warning">⚠ 指数数据缺失，已降级为基准价 × 3 计算</span>
+                                        {% endif %}
                                     </div>
+                                    {% if yd.next_day_gap_pct is not none %}
+                                    <div class="mt-1" style="font-size:0.75rem; color:#b71c1c; border-top:1px dashed #e57373; padding-top:4px;">
+                                        📅 <strong>次日预估</strong>：当前已超异动线 <strong>{{ (yd.next_day_gap_pct * -1) | round(2) }}%</strong>，次日涨停价 <strong>{{ yd.next_day_limit_price }}</strong>（{{ (yd.limit_rate * 100) | int }}% 板），注意持续减仓
+                                    </div>
+                                    {% endif %}
                                 </div>
                             </div>
                             {% elif yd.alert %}
@@ -295,21 +305,55 @@
                                     <strong>接近异动线，注意减仓时机</strong>
                                     <div class="mt-1" style="font-size:0.78rem;">
                                         异动线 <strong>{{ yd.yidong_line }}</strong>
-                                        （基准日 {{ yd.base_date }} 收盘 {{ yd.base_close }} × 3）
                                         · 距异动线还差
                                         <strong class="text-warning">{{ (yd.pct_to_line * -1) | round(2) }}%</strong>
                                         （约 <strong>{{ (yd.yidong_line - result.current_price) | round(4) }}</strong> 元）
+                                        {% if not yd.fallback %}
+                                        · 超额偏离 <strong>{{ yd.deviation }}%</strong> / 200%
+                                        （股 {{ yd.r_stock }}% − {{ yd.index_code }} {{ yd.r_index }}%）
+                                        {% else %}
+                                        · <span class="text-muted">⚠ 指数数据缺失，已降级为基准价 × 3 计算</span>
+                                        {% endif %}
                                     </div>
+                                    {% if yd.next_day_gap_pct is not none %}
+                                    <div class="mt-1" style="font-size:0.75rem; color:#e65100; border-top:1px dashed #ffcc80; padding-top:4px;">
+                                        📅 <strong>次日预估</strong>：距异动线还差 <strong>{{ yd.next_day_gap_pct }}%</strong>，
+                                        {% if yd.next_day_boards_needed == 1 %}
+                                        次日一个涨停板（{{ (yd.limit_rate * 100) | int }}%）即可触发 · 涨停价 <strong>{{ yd.next_day_limit_price }}</strong>
+                                        {% else %}
+                                        约需 <strong>{{ yd.next_day_boards_needed }}</strong> 个涨停板触发 · 次日涨停价 <strong>{{ yd.next_day_limit_price }}</strong>
+                                        {% endif %}
+                                    </div>
+                                    {% endif %}
                                 </div>
                             </div>
                             {% else %}
-                            <div class="d-flex align-items-center gap-2 mb-3 px-1" style="font-size:0.78rem; color:#888;">
-                                <span>📏 异动线</span>
-                                <strong style="color:#555;">{{ yd.yidong_line }}</strong>
-                                <span>（基准 {{ yd.base_date }} × 3）</span>
-                                <span class="ms-auto">距离
-                                    <strong>{{ (yd.pct_to_line * -1) | round(1) }}%</strong>
-                                </span>
+                            <div class="mb-3 px-1">
+                                <div class="d-flex align-items-center gap-2" style="font-size:0.78rem; color:#888;">
+                                    <span>📏 异动线</span>
+                                    <strong style="color:#555;">{{ yd.yidong_line }}</strong>
+                                    {% if not yd.fallback %}
+                                    <span>（基准 {{ yd.base_date }}，{{ yd.index_code }} 校正）</span>
+                                    <span class="ms-auto">偏离 {{ yd.deviation }}% / 200%，距线
+                                        <strong>{{ (yd.pct_to_line * -1) | round(1) }}%</strong>
+                                    </span>
+                                    {% else %}
+                                    <span>（基准 {{ yd.base_date }} × 3，⚠ 指数数据缺失降级）</span>
+                                    <span class="ms-auto">距离
+                                        <strong>{{ (yd.pct_to_line * -1) | round(1) }}%</strong>
+                                    </span>
+                                    {% endif %}
+                                </div>
+                                {% if yd.next_day_gap_pct is not none %}
+                                <div class="mt-1" style="font-size:0.75rem; color:#666; border-top:1px dashed #ddd; padding-top:4px;">
+                                    📅 <strong>次日预估</strong>：距异动线还差 <strong>{{ yd.next_day_gap_pct }}%</strong>，
+                                    {% if yd.next_day_boards_needed == 1 %}
+                                    次日一个涨停板（{{ (yd.limit_rate * 100) | int }}%）即可触发 · 涨停价 <strong>{{ yd.next_day_limit_price }}</strong>
+                                    {% else %}
+                                    约需 <strong>{{ yd.next_day_boards_needed }}</strong> 个涨停板触发 · 次日涨停价 <strong>{{ yd.next_day_limit_price }}</strong>
+                                    {% endif %}
+                                </div>
+                                {% endif %}
                             </div>
                             {% endif %}
                             {% endif %}
