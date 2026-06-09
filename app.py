@@ -502,6 +502,72 @@ def get_n_day_stats(code: str):
         logger.error(f"Failed to get stats for {code}: {e}")
     return result
 
+
+def calc_atr(code: str, period: int = 14) -> float | None:
+    """
+    从 daily_records 读取近 (period+1) 日 K 线，计算 ATR(period) 简单移动平均（SMA）。
+
+    TR（真实波动幅度）= max(
+        当日最高 - 当日最低,
+        |当日最高 - 昨日收盘|,
+        |当日最低 - 昨日收盘|
+    )
+    ATR = 最近 period 个 TR 的算术平均值。
+
+    边界处理：
+    - high/low/close 任一为 0 的行被过滤（停牌脏数据）
+    - 数据不足 period 天时，用现有天数的均值降级返回（而非 None）
+    - 完全无数据或仅 1 条时返回 None
+    """
+    needed = period + 1  # 计算 TR 需要前一日收盘，多取 1 条
+    ts_code = code if "." in code else None
+    short_code = code.split(".")[0] if "." in code else code
+
+    rows = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        for q_code in ([ts_code, short_code] if ts_code else [short_code]):
+            if q_code is None:
+                continue
+            cur = conn.execute(
+                "SELECT high, low, close FROM daily_records "
+                "WHERE code = ? AND high > 0 AND low > 0 AND close > 0 "
+                "ORDER BY date DESC LIMIT ?",
+                (q_code, needed),
+            )
+            rows = cur.fetchall()
+            if rows:
+                break
+        conn.close()
+    except Exception as e:
+        logger.error("calc_atr failed for %s: %s", code, e)
+        return None
+
+    if not rows or len(rows) < 2:
+        return None
+
+    rows = list(reversed(rows))  # 升序：oldest → newest
+    tr_list = []
+    for i in range(1, len(rows)):
+        high_i     = rows[i][0]
+        low_i      = rows[i][1]
+        close_prev = rows[i - 1][2]
+        tr = max(
+            high_i - low_i,
+            abs(high_i - close_prev),
+            abs(low_i  - close_prev),
+        )
+        tr_list.append(tr)
+
+    if not tr_list:
+        return None
+
+    # 数据不足 period 天时，用现有数据均值降级处理
+    use_n = min(period, len(tr_list))
+    atr = sum(tr_list[-use_n:]) / use_n
+    return round(atr, 4)
+
+
 # 三大指数代码与名称（大盘风向标）
 INDEX_CODES = [
     ("000001.SH", "上证指数"),
@@ -523,7 +589,7 @@ def get_index_market_data(days: int = 20) -> dict:
         for ts_code, idx_name in INDEX_CODES:
             cur = conn.execute(
                 """
-                SELECT date, close, high, low, COALESCE(amount, 0)
+                SELECT date, close, high, low, COALESCE(amount, 0), COALESCE(open, close)
                 FROM daily_records
                 WHERE code = ?
                 ORDER BY date DESC
@@ -541,6 +607,7 @@ def get_index_market_data(days: int = 20) -> dict:
                     "high":       r[2],
                     "low":        r[3],
                     "amount_yi":  amount_yi,
+                    "open":       r[5],   # 揉搓线分析需要
                 })
             result[ts_code] = {"name": idx_name, "records": records}
         conn.close()
@@ -765,16 +832,60 @@ def load_skills() -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "", index_data: dict = None) -> str:
+def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "", index_data: dict = None, rousu_data: dict = None) -> str:
     """将股票数据 + 持仓参数 + 历史数据 + 大盘指数数据组装成分析 prompt
     mode: 'intraday' = 盘中（今天怎么操作）| 'next_day' = 盘后（明天怎么操作）
     index_data: get_index_market_data() 的返回值，None 时不展示大盘段落
+    rousu_data: 揉搓线预计算结果，None 时不展示揉搓线段落
     """
     history_text = "\n".join(
-        f"  {r['date']}: 收{r['close']} 高{r['high']} 低{r['low']} 均价{r['avg_price']}"
+        f"  {r['date']}: 开{r.get('open', r['close'])} 收{r['close']} 高{r['high']} 低{r['low']} 均价{r['avg_price']}"
         for r in history
     )
     holding = result['cost_price'] > 0
+
+    # ── 揉搓线形态文本块 ──────────────────────────────────────────────────────
+    def _fmt_rousu(patterns: list) -> str:
+        """将 analyze_rousu_lines() 结果格式化为单行文本列表。"""
+        if not patterns:
+            return "  （近期无揉搓线形态）"
+        lines = []
+        for p in patterns:
+            lines.append(
+                f"  {p['date']} [{p['label']}] {p['trend']} {p['color']} {p['shadow_order']}"
+                f" → **{p['interpretation']}**"
+            )
+        return "\n".join(lines)
+
+    if rousu_data:
+        stock_daily_text    = _fmt_rousu(rousu_data.get("stock_daily", []))
+        stock_intraday_text = _fmt_rousu(rousu_data.get("stock_intraday", []))
+
+        index_rousu_parts = []
+        for ts_code, idx_info in (rousu_data.get("index_daily") or {}).items():
+            idx_name = idx_info.get("name", ts_code)
+            idx_patterns = _fmt_rousu(idx_info.get("patterns", []))
+            index_rousu_parts.append(f"{idx_name}（{ts_code}）：\n{idx_patterns}")
+        index_rousu_text = "\n\n".join(index_rousu_parts) if index_rousu_parts else "  （暂无数据）"
+
+        rousu_block = f"""
+【揉搓线形态分析】
+说明：揉搓线 = 小实体（实体占比<40%）+ 双侧长影线（上下影各>20%）。
+影线顺序近似规则：日K 以开盘位置判断（开盘偏高→下影接上影，偏低→上影接下影）；30分钟K 以窗口内实际价格序列判断（更精确）。
+
+▌个股日K 揉搓线（近10日）：
+{stock_daily_text}
+
+▌个股今日30分钟K 揉搓线：
+{stock_intraday_text}
+
+▌大盘指数日K 揉搓线（近5日）：
+{index_rousu_text}
+"""
+    else:
+        rousu_block = ""
+    # ─────────────────────────────────────────────────────────────────────────
+
     fib_text = (
         f"斐波那契 38.2%: {result['f382']}  61.8%: {result['f618']}  78.6%: {result['f786']}"
         if result.get('stage_params_set')
@@ -793,6 +904,7 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
             "请特别给出今日具体的操作价位建议（如：可在 XX 附近买入 / 涨到 XX 可减仓），"
             "结合今日已有的高低点和当前价格判断当下时机，不要只给方向性建议。"
         )
+        condition_order_instruction = ""  # 盘中模式不输出条件单
     else:
         mode_context = "【分析时机】收盘后复盘，今日行情已结束，分析明日操作计划。"
         op3_focus = (
@@ -805,6 +917,53 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
             "请给出明日具体的操作预案（如：若明日高开则 XX，若低开则 XX），"
             "结合今日收盘价和历史数据给出明日的关键价位参考，帮助提前做好应对准备。"
         )
+        # ── 次日条件单专项指令 ──────────────────────────────────────────────
+        if holding:
+            condition_order_instruction = """
+4b. **次日条件单建议**（持仓保护）：
+基于上方操作计划，给出明日可挂的条件单参数，格式如下：
+
+【止损单】
+- 触发价：___（跌破此价位时卖出，建议参考动态防守价或关键支撑位，止损距离约为 1.5×ATR）
+- 触发逻辑：说明为何选此价位（如：跌破8848下轨 / 跌破F618 / 跌破N日低点等）
+- 执行方式：触价市价卖出 / 触价限价卖出（注明滑点容忍）
+
+【止盈单（第一目标）】
+- 触发价：___（到达此价位时减仓约50%，建议参考上轨/F382/近期压力位）
+- 触发逻辑：说明为何选此价位
+- 执行方式：触价限价卖出
+
+【止盈单（第二目标）】
+- 触发价：___（到达此价位时清仓剩余仓位，建议参考更高压力位/历史高点）
+- 触发逻辑：说明为何选此价位
+- 执行方式：触价限价卖出
+
+注意：止盈距离应至少为止损距离的2倍（风险收益比 ≥ 1:2）；若当前位置风险收益比不足，请明确指出并建议是否值得持有。"""
+        else:
+            condition_order_instruction = """
+4b. **次日条件单建议**（观望入场）：
+基于上方操作计划，若明日出现买入机会，给出可挂的条件单参数，格式如下：
+
+【买入条件单】
+- 触发价：___（突破/回踩至此价位时买入，说明触发逻辑，如：突破上轨/回踩F618/放量站上均线等）
+- 建议仓位：___（如：半仓试探 / 三成仓轻仓介入）
+- 执行方式：触价限价买入（注明可接受的滑点范围）
+
+【买入后止损单】
+- 触发价：___（买入后跌破此价位离场，止损距离约为 1.5×ATR，参考动态防守价）
+- 触发逻辑：说明为何选此价位
+- 最大亏损：___元/股（= 买入价 - 止损价，供仓位管理参考）
+
+【买入后止盈单（第一目标）】
+- 触发价：___（到达此价位时减仓约50%）
+- 触发逻辑：说明为何选此价位
+
+【买入后止盈单（第二目标）】
+- 触发价：___（到达此价位时清仓剩余仓位）
+- 触发逻辑：说明为何选此价位
+
+注意：止盈距离应至少为止损距离的2倍（风险收益比 ≥ 1:2）；若当前位置风险收益比不足，请明确指出并建议暂不入场。"""
+        # ────────────────────────────────────────────────────────────────────
 
     # 构建大盘风向标文本
     if index_data:
@@ -824,6 +983,23 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
     else:
         index_text = "暂无数据（请先运行 fetch_history.py 拉取指数数据）"
 
+    # ── ATR & 动态防守价文本 ──────────────────────────────────────────────────
+    atr_val   = result.get("atr")
+    ddp_lower = result.get("ddp_lower")
+    ddp_f618  = result.get("ddp_f618")
+    if atr_val is not None:
+        atr_line = f"ATR(14)波动幅度：{atr_val}"
+        ddp_parts = []
+        if ddp_lower is not None:
+            ddp_parts.append(f"基于8848下轨={ddp_lower}")
+        if ddp_f618 is not None:
+            ddp_parts.append(f"基于F618={ddp_f618}")
+        ddp_line = "动态防守价（支撑 − 0.5×ATR）：" + "  ".join(ddp_parts) if ddp_parts else ""
+    else:
+        atr_line = "ATR(14)波动幅度：暂无（历史数据不足14日）"
+        ddp_line = ""
+    # ─────────────────────────────────────────────────────────────────────────
+
     return f"""{mode_context}
 
 【当前股票信息】
@@ -833,7 +1009,8 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
 VWAP均价：{result['avg_price']}
 静态8848上轨：{result['upper_line']}
 静态8848下轨：{result['lower_line']}
-持仓状态：{"持仓中，成本价 " + str(result['cost_price']) if holding else "未持仓"}
+{atr_line}
+{ddp_line + chr(10) if ddp_line else ""}持仓状态：{"持仓中，成本价 " + str(result['cost_price']) if holding else "未持仓"}
 阶段高点：{result['stage_high'] if result['stage_high'] > 0 else "未设置"}
 阶段低点：{result['stage_low'] if result['stage_low'] > 0 else "未设置"}
 {fib_text}
@@ -843,7 +1020,7 @@ VWAP均价：{result['avg_price']}
 
 【近期历史数据（最近60日，按日期倒序）】
 {history_text if history_text else "暂无历史数据"}
-
+{rousu_block}
 【大盘风向标（近20日，按日期倒序）】
 {index_text}
 
@@ -860,6 +1037,7 @@ VWAP均价：{result['avg_price']}
 
 4. **{op3_label}**（参考 Skill 03 + 对应类型操作规则）：在完成上述评估后，再结合静态规则信号参考（{result['signal']}），{op3_focus}
 {extra_instruction}
+{condition_order_instruction}
 
 5. **风险提示**（参考 Skill 07）：当前主要风险点是什么？有哪些需要特别注意的信号？
 
@@ -1245,6 +1423,269 @@ def _get_intraday_points(code: str) -> list:
         avg = round(cum_amount * 1000 / cum_vol, 4) if cum_vol > 0 else None
         points.append({"time": t, "price": round(price, 4), "avg": avg, "vol": vol or 0.0})
     return points
+
+
+def _build_intraday_candles(points: list, window_minutes: int = 30) -> list:
+    """
+    将分时快照点列表聚合为固定时间窗口的 OHLC 虚拟 K 线。
+
+    参数:
+        points: _get_intraday_points() 返回的列表，每项含 {time: "HH:MM", price, avg, vol}
+        window_minutes: 窗口宽度（分钟），默认 30
+
+    返回:
+        list of dict，每项含:
+            window_start: str  "HH:MM"（窗口起始时间）
+            open:  float  窗口第一个 price
+            close: float  窗口最后一个 price
+            high:  float  窗口内 price 最大值
+            low:   float  窗口内 price 最小值
+            vol:   float  窗口内增量 vol 之和
+            n:     int    窗口内点数
+    """
+    if not points:
+        return []
+
+    def _to_minutes(t: str) -> int:
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+
+    candles = []
+    bucket_start = None
+    bucket_points = []
+
+    for p in points:
+        t_min = _to_minutes(p["time"])
+        if bucket_start is None:
+            # 对齐到 window_minutes 的整数倍（相对于 09:30 = 570 分钟）
+            offset = t_min - 570  # 09:30 = 570
+            bucket_idx = offset // window_minutes
+            bucket_start = 570 + bucket_idx * window_minutes
+        elif t_min >= bucket_start + window_minutes:
+            # 当前点超出当前桶 → 先保存当前桶，再开新桶
+            if bucket_points:
+                prices = [x["price"] for x in bucket_points]
+                candles.append({
+                    "window_start": f"{bucket_start // 60:02d}:{bucket_start % 60:02d}",
+                    "open":  bucket_points[0]["price"],
+                    "close": bucket_points[-1]["price"],
+                    "high":  max(prices),
+                    "low":   min(prices),
+                    "vol":   sum(x["vol"] for x in bucket_points),
+                    "n":     len(bucket_points),
+                })
+            # 新桶：对齐到 window_minutes
+            offset = t_min - 570
+            bucket_idx = offset // window_minutes
+            bucket_start = 570 + bucket_idx * window_minutes
+            bucket_points = []
+        bucket_points.append(p)
+
+    # 保存最后一个桶（即使未满）
+    if bucket_points:
+        prices = [x["price"] for x in bucket_points]
+        candles.append({
+            "window_start": f"{bucket_start // 60:02d}:{bucket_start % 60:02d}",
+            "open":  bucket_points[0]["price"],
+            "close": bucket_points[-1]["price"],
+            "high":  max(prices),
+            "low":   min(prices),
+            "vol":   sum(x["vol"] for x in bucket_points),
+            "n":     len(bucket_points),
+        })
+
+    return candles
+
+
+def analyze_rousu_lines(records: list, n: int = 10, label: str = "日K") -> list:
+    """
+    对最近 n 根 K 线逐一判断是否为揉搓线，并给出 8 种形态解读。
+
+    参数:
+        records: 按日期**倒序**排列的 K 线列表，每项含:
+                 date (或 window_start), open, close, high, low
+        n:       分析最近 n 根，默认 10
+        label:   用于输出描述的标签，如 "日K" 或 "30分钟K"
+
+    返回:
+        list of dict，仅包含被判定为揉搓线的条目。
+
+    揉搓线条件（需全部满足）:
+        body_ratio         = abs(close - open) / (high - low) < 0.4
+        upper_shadow_ratio = (high - max(open,close)) / (high - low) > 0.2
+        lower_shadow_ratio = (min(open,close) - low) / (high - low) > 0.2
+
+    趋势判断（基于前 5 根收盘价均值）:
+        prior_5_avg = mean(close of records[i+1 .. i+5])
+        close > prior_5_avg → 上涨趋势，否则 → 下跌趋势
+
+    影线顺序（日K 近似）:
+        open_position = (open - low) / (high - low)
+        > 0.5 → 开盘偏高，先跌后涨 → 下影接上影
+        ≤ 0.5 → 开盘偏低，先涨后跌 → 上影接下影
+    """
+    INTERPRETATIONS = {
+        ("下跌趋势", "黑K", "下影接上影"): "中继下跌",
+        ("下跌趋势", "红K", "下影接上影"): "支撑位震荡选方向",
+        ("下跌趋势", "红K", "上影接下影"): "支撑位资金抢反弹",
+        ("下跌趋势", "黑K", "上影接下影"): "短期止跌",
+        ("上涨趋势", "黑K", "下影接上影"): "开始有分歧",
+        ("上涨趋势", "红K", "下影接上影"): "分歧但强势继续看新高",
+        ("上涨趋势", "红K", "上影接下影"): "承接力度大，但只承接不追高",
+        ("上涨趋势", "黑K", "上影接下影"): "承接低，可能出现短期顶",
+    }
+
+    results = []
+    target = records[:n]  # 最近 n 根（倒序，index 0 = 最新）
+
+    for i, rec in enumerate(target):
+        try:
+            o = float(rec["open"])
+            c = float(rec["close"])
+            h = float(rec["high"])
+            lo = float(rec["low"])
+        except (KeyError, TypeError, ValueError):
+            continue  # 数据缺失，跳过
+
+        candle_range = h - lo
+        if candle_range < 1e-6:
+            continue  # 一字板或停牌，跳过
+
+        body_ratio         = abs(c - o) / candle_range
+        upper_shadow_ratio = (h - max(o, c)) / candle_range
+        lower_shadow_ratio = (min(o, c) - lo) / candle_range
+
+        # 揉搓线判断
+        if not (body_ratio < 0.4 and upper_shadow_ratio > 0.2 and lower_shadow_ratio > 0.2):
+            continue
+
+        # 趋势判断：需要前 5 根数据（records[i+1] 到 records[i+5]）
+        prior_slice = records[i + 1: i + 6]
+        if len(prior_slice) < 5:
+            continue  # 历史不足，无法判断趋势，跳过
+        prior_closes = []
+        for r in prior_slice:
+            try:
+                prior_closes.append(float(r["close"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        if len(prior_closes) < 3:
+            continue  # 有效数据太少
+        prior_avg = sum(prior_closes) / len(prior_closes)
+        trend = "上涨趋势" if c > prior_avg else "下跌趋势"
+
+        # 颜色
+        color = "红K" if c >= o else "黑K"
+
+        # 影线顺序
+        open_position = (o - lo) / candle_range
+        shadow_order = "下影接上影" if open_position > 0.5 else "上影接下影"
+
+        interpretation = INTERPRETATIONS.get((trend, color, shadow_order), "未知形态")
+
+        # 日期字段兼容：daily_records 用 "date"，intraday 用 "window_start"
+        date_key = rec.get("date") or rec.get("window_start") or f"index-{i}"
+
+        results.append({
+            "date":           date_key,
+            "label":          label,
+            "trend":          trend,
+            "color":          color,
+            "shadow_order":   shadow_order,
+            "interpretation": interpretation,
+            "body_ratio":     round(body_ratio, 3),
+            "open_position":  round(open_position, 3),
+        })
+
+    return results
+
+
+def analyze_rousu_lines_intraday(code: str, date: str = None) -> list:
+    """
+    从 intraday_snapshots 构建 30 分钟虚拟 K 线，并对其运行揉搓线分析。
+
+    参数:
+        code: 股票代码（不带后缀，如 "600519"）或带后缀（如 "600519.SH"）
+        date: 日期字符串 "YYYY-MM-DD"，默认为今日
+
+    返回:
+        analyze_rousu_lines() 格式的列表（仅含揉搓线条目）
+        若无分时数据则返回 []
+    """
+    if not date:
+        date = _today_str()
+
+    # 处理带后缀的代码
+    bare_code = code.split(".")[0]
+
+    rows = []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(
+                "SELECT time, price, vol, amount FROM intraday_snapshots "
+                "WHERE code = ? AND date = ? ORDER BY time ASC",
+                (bare_code, date),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("analyze_rousu_lines_intraday: DB error %s", e)
+        return []
+
+    if not rows:
+        # 也尝试带后缀的 code（指数存储格式如 000001.SH）
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                cur = conn.execute(
+                    "SELECT time, price, vol, amount FROM intraday_snapshots "
+                    "WHERE code = ? AND date = ? ORDER BY time ASC",
+                    (code, date),
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error("analyze_rousu_lines_intraday: DB error (full code) %s", e)
+            return []
+
+    if not rows:
+        return []
+
+    points = [{"time": r[0], "price": r[1], "vol": r[2] or 0.0, "amount": r[3] or 0.0}
+              for r in rows]
+
+    candles = _build_intraday_candles(points, window_minutes=30)
+    if not candles:
+        return []
+
+    # 分时 K 线倒序（最新在前），与 analyze_rousu_lines 期望格式一致
+    candles_desc = list(reversed(candles))
+
+    return analyze_rousu_lines(candles_desc, n=len(candles_desc), label="30分钟K")
+
+
+def _get_daily_records_for_rousu(code: str, n: int = 15) -> list:
+    """从 daily_records 读取最近 n 日 OHLC，供揉搓线快速信号分析用。
+    返回按日期倒序（最新在前）的列表，每项含 date/open/close/high/low。
+    """
+    short_code = code.split(".")[0]
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT date, COALESCE(open, close) AS open, close, high, low "
+            "FROM daily_records WHERE code = ? ORDER BY date DESC LIMIT ?",
+            (short_code, n),
+        ).fetchall()
+        conn.close()
+        return [
+            {"date": r[0], "open": r[1], "close": r[2], "high": r[3], "low": r[4]}
+            for r in rows
+        ]
+    except Exception:
+        return []
 
 
 def _tool_get_intraday_lines(ts_code: str) -> dict:
@@ -2664,10 +3105,11 @@ def calculate_8848(code: str):
         price = float(df.loc[0, 'price'])
         high = float(df.loc[0, 'high'])
         low = float(df.loc[0, 'low'])
+        open_ = float(df.loc[0, 'open'])
 
         volume = float(df.loc[0, 'volume']) # Volume in shares
         amount = float(df.loc[0, 'amount']) # Amount in Yuan
-        
+
         if volume == 0:
             return {"error": "Volume is 0, cannot calculate average price (Market might be closed or just opened)."}
 
@@ -2676,15 +3118,15 @@ def calculate_8848(code: str):
 
         # Calculate Intraday Average Price (ZSTJJ)
         avg_price = amount / volume
-        
+
         # Heuristic check
         if abs(avg_price - price) / price > 0.5:
              if abs((avg_price * 100) - price) / price < 0.5:
                  avg_price *= 100
-        
+
         # Save daily record
         save_daily_record(code, name, {
-            "price": price, "high": high, "low": low, "avg_price": avg_price
+            "price": price, "high": high, "low": low, "avg_price": avg_price, "open": open_
         })
 
         # Load Portfolio Settings
@@ -2719,6 +3161,24 @@ def calculate_8848(code: str):
         # N-Day Stats（20日 + 60日，用于页面展示建议值）
         n_day = get_n_day_stats(code)
 
+        # ── ATR(14) 及动态防守价 ──────────────────────────────────────────
+        # ATR = 近14日 TR 的简单移动平均，TR = max(H-L, |H-C_prev|, |L-C_prev|)
+        atr_val = calc_atr(code)
+
+        # 精度：ETF（51xxxx/15xxxx/16xxxx/18xxxx）保留3位，A股保留2位
+        _short_code = code.split(".")[0] if "." in code else code
+        _decimals = 3 if _short_code.startswith(("51", "15", "16", "18")) else 2
+
+        def _ddp(support_price):
+            """动态防守价 = 核心支撑位 - 0.5 × ATR；ATR 为 None 或支撑位无效时返回 None"""
+            if atr_val is None or support_price is None or support_price <= 0:
+                return None
+            return round(support_price - 0.5 * atr_val, _decimals)
+
+        ddp_lower = _ddp(lower_line)                                          # 基于 8848 下轨
+        ddp_f618  = _ddp(strat["f618"]) if stage_params_set else None         # 基于 F618（仅观望模式有效）
+        # ─────────────────────────────────────────────────────────────────
+
         boll_data = _calc_boll(code)
         macd_data = _calc_macd(code)
 
@@ -2732,6 +3192,11 @@ def calculate_8848(code: str):
                     round((r["close"] - base) / base * 100, 2) if r["close"] else None
                     for r in rc
                 ]
+
+        # 分时快照（提前为局部变量，供分时图和K线图共用，避免重复查DB）
+        _pts = _get_intraday_points(code)
+        # 揉搓线快速信号（日K + 今日分时K，不走AI，直接规则引擎输出）
+        _daily_recs = _get_daily_records_for_rousu(code, n=15)
 
         return {
             "code": code,
@@ -2757,11 +3222,19 @@ def calculate_8848(code: str):
             "n20_low":  n_day["n20_low"],
             "n60_high": n_day["n60_high"],
             "n60_low":  n_day["n60_low"],
-            "intraday_points": _get_intraday_points(code),
+            "intraday_points":    _pts,
+            "intraday_candles_5":  _build_intraday_candles(_pts, window_minutes=5),
+            "intraday_candles_15": _build_intraday_candles(_pts, window_minutes=15),
+            "rousu_daily":    analyze_rousu_lines(_daily_recs, n=10, label="日K"),
+            "rousu_intraday": analyze_rousu_lines_intraday(code),
             "boll": boll_data,
             "macd": macd_data,
             "stock_pct": stock_pct,
             "yidong": _calc_yidong(code, price),
+            # ── ATR & 动态防守价 ──────────────────────────────────────────
+            "atr":       atr_val,    # ATR(14) 原始值；None = 历史数据不足
+            "ddp_lower": ddp_lower,  # 动态防守价（基于 8848 下轨）
+            "ddp_f618":  ddp_f618,   # 动态防守价（基于 F618，仅 stage_params_set 时有值）
         }
 
     except Exception as e:
@@ -3036,7 +3509,8 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT date, close, high, low, avg_price FROM daily_records "
+            "SELECT date, close, high, low, avg_price, COALESCE(open, close) AS open "
+            "FROM daily_records "
             "WHERE code = ? ORDER BY date DESC LIMIT 60",
             (stock_code,),
         ).fetchall()
@@ -3052,8 +3526,35 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
         "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
         + skills_text
     )
-    index_data = get_index_market_data(days=20)
-    user_prompt = build_ai_prompt(result, history, mode=ai_mode, user_hint=user_hint, index_data=index_data)
+    index_data = get_index_market_data(days=20)  # 已包含 open 字段
+
+    # ── 揉搓线预计算 ──────────────────────────────────────────────────────────
+    stock_daily_rousu    = analyze_rousu_lines(history, n=10, label="日K")
+    stock_intraday_rousu = analyze_rousu_lines_intraday(stock_code)
+
+    index_daily_rousu = {}
+    for ts_code, idx_info in index_data.items():
+        idx_records  = idx_info.get("records", [])
+        idx_patterns = analyze_rousu_lines(idx_records, n=5, label="日K")
+        index_daily_rousu[ts_code] = {
+            "name":     idx_info.get("name", ts_code),
+            "patterns": idx_patterns,
+        }
+
+    rousu_data = {
+        "stock_daily":    stock_daily_rousu,
+        "stock_intraday": stock_intraday_rousu,
+        "index_daily":    index_daily_rousu,
+    }
+    # ─────────────────────────────────────────────────────────────────────────
+
+    user_prompt = build_ai_prompt(
+        result, history,
+        mode=ai_mode,
+        user_hint=user_hint,
+        index_data=index_data,
+        rousu_data=rousu_data,
+    )
 
     # 4. 调用 AI 模型（带工具调用）
     ai_analysis = None

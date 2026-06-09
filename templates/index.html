@@ -96,13 +96,48 @@
                                 {% endif %}
                             </div>
 
-                            <!-- 分时图（白线+黄线）+ 量能柱 -->
+                            <!-- 分时图 / K线图切换 Tab -->
                             {% if result.intraday_points %}
-                            <div id="intraday-chart" style="width:100%;height:180px;"></div>
-                            <div id="intraday-vol-chart" style="width:100%;height:60px;margin-top:2px;"></div>
+                            <div class="mb-2">
+                                <div class="btn-group btn-group-sm mb-1" role="group" id="intraday-tab-group">
+                                    <button type="button" class="btn btn-outline-secondary active" id="tab-timeshare" onclick="switchIntradayChart('timeshare')">分时</button>
+                                    <button type="button" class="btn btn-outline-secondary" id="tab-5min" onclick="switchIntradayChart('5min')">5分钟K</button>
+                                    <button type="button" class="btn btn-outline-secondary" id="tab-15min" onclick="switchIntradayChart('15min')">15分钟K</button>
+                                </div>
+                                <div id="intraday-chart" style="width:100%;height:180px;"></div>
+                                <div id="intraday-vol-chart" style="width:100%;height:60px;margin-top:2px;"></div>
+                            </div>
                             {% else %}
                             <div class="text-center text-muted py-2 mb-2" style="font-size:0.8rem;">
-                                📈 分时图：交易时段每15分钟更新，暂无数据
+                                📈 分时图：交易时段每3分钟更新，暂无数据
+                            </div>
+                            {% endif %}
+
+                            <!-- 揉搓线快速信号卡（规则引擎直出，无需AI分析） -->
+                            {% set all_rousu = (result.rousu_daily or []) + (result.rousu_intraday or []) %}
+                            {% if all_rousu %}
+                            <div class="mb-3">
+                                <h6 class="border-bottom pb-1 mb-2">🕯️ 揉搓线信号
+                                    <small class="text-muted fw-normal ms-1" style="font-size:0.72rem;">规则引擎 · 无需AI</small>
+                                </h6>
+                                {% for r in all_rousu %}
+                                {% if r.interpretation in ['支撑位资金抢反弹'] %}
+                                    {% set sig_class = 'success' %}
+                                {% elif r.interpretation in ['中继下跌', '承接低，可能出现短期顶'] %}
+                                    {% set sig_class = 'danger' %}
+                                {% elif r.interpretation in ['短期止跌', '支撑位震荡选方向'] %}
+                                    {% set sig_class = 'info' %}
+                                {% else %}
+                                    {% set sig_class = 'warning' %}
+                                {% endif %}
+                                <div class="d-flex align-items-center flex-wrap gap-1 mb-1 px-2 py-1 rounded border border-{{ sig_class }}-subtle bg-{{ sig_class }}-subtle">
+                                    <span class="badge bg-secondary" style="font-size:0.68rem;">{{ r.label }}</span>
+                                    <span class="badge bg-secondary" style="font-size:0.68rem;">{{ r.date }}</span>
+                                    <span class="badge" style="background:{{ '#c62828' if r.color == '红K' else '#2e7d32' }};font-size:0.68rem;">{{ r.color }}</span>
+                                    <span class="small fw-bold text-{{ sig_class }}">{{ r.interpretation }}</span>
+                                    <span class="small text-muted ms-auto" style="font-size:0.72rem;">{{ r.trend }} · {{ r.shadow_order }}</span>
+                                </div>
+                                {% endfor %}
                             </div>
                             {% endif %}
 
@@ -117,6 +152,39 @@
                                     <span>Support (Avg * 0.988)</span>
                                     <span class="fs-5 price-down">{{ result.lower_line }}</span>
                                 </li>
+                                {% if result.atr %}
+                                <li class="list-group-item d-flex justify-content-between align-items-center">
+                                    <span>ATR(14) <small class="text-muted">近14日波动幅度</small></span>
+                                    <span class="text-muted">{{ result.atr }}</span>
+                                </li>
+                                {% endif %}
+                                {% if result.ddp_lower or result.ddp_f618 %}
+                                <li class="list-group-item bg-warning-subtle">
+                                    <div class="d-flex justify-content-between align-items-center mb-1">
+                                        <span class="fw-semibold">动态防守价
+                                            <small class="text-muted fw-normal">支撑 − 0.5×ATR</small>
+                                        </span>
+                                        {% if result.ddp_f618 %}
+                                        <div class="btn-group btn-group-sm" role="group" id="ddp-tab-group">
+                                            <button type="button" class="btn btn-outline-secondary active"
+                                                    id="ddp-tab-lower"
+                                                    onclick="switchDdp('lower')">8848下轨</button>
+                                            <button type="button" class="btn btn-outline-secondary"
+                                                    id="ddp-tab-f618"
+                                                    onclick="switchDdp('f618')">F618</button>
+                                        </div>
+                                        {% endif %}
+                                    </div>
+                                    <div id="ddp-value-lower" class="fs-5 fw-bold price-down text-end">
+                                        {{ result.ddp_lower if result.ddp_lower else '—' }}
+                                    </div>
+                                    {% if result.ddp_f618 %}
+                                    <div id="ddp-value-f618" class="fs-5 fw-bold price-down text-end" style="display:none">
+                                        {{ result.ddp_f618 }}
+                                    </div>
+                                    {% endif %}
+                                </li>
+                                {% endif %}
                             </ul>
 
                             <!-- Strategy / Fibonacci Levels -->
@@ -811,16 +879,28 @@
             }
         }
 
-        // 渲染分时图（ECharts 白线+黄线）
-        const chartDom = document.getElementById('intraday-chart');
-        if (chartDom && typeof echarts !== 'undefined') {
-            const points = {{ result.intraday_points | tojson if result and result.intraday_points else '[]' }};
-            if (points.length > 0) {
-                const times   = points.map(p => p.time);
-                const prices  = points.map(p => p.price);
-                const avgs    = points.map(p => p.avg);
-                const chart = echarts.init(chartDom, null, { renderer: 'svg' });
-                chart.setOption({
+        // ── 分时图 / K线图 Tab 切换 ──────────────────────────────────────────
+        (function () {
+            const chartDom  = document.getElementById('intraday-chart');
+            const volDom    = document.getElementById('intraday-vol-chart');
+            if (!chartDom || typeof echarts === 'undefined') return;
+
+            // 数据（Jinja2 内联注入，一次性）
+            const intradayPoints = {{ result.intraday_points | tojson if result and result.intraday_points else '[]' }};
+            const candles5       = {{ result.intraday_candles_5 | tojson if result and result.intraday_candles_5 else '[]' }};
+            const candles15      = {{ result.intraday_candles_15 | tojson if result and result.intraday_candles_15 else '[]' }};
+            if (intradayPoints.length === 0) return;
+
+            // ECharts 实例（主图 + 量能图）
+            const mainChart = echarts.init(chartDom, null, { renderer: 'svg' });
+            const volChart  = echarts.init(volDom,   null, { renderer: 'svg' });
+
+            // ── 构建分时图 option ──
+            function buildTimeshareOption(points) {
+                const times  = points.map(p => p.time);
+                const prices = points.map(p => p.price);
+                const avgs   = points.map(p => p.avg);
+                return {
                     grid: { top: 20, right: 12, bottom: 24, left: 52 },
                     tooltip: {
                         trigger: 'axis',
@@ -832,82 +912,117 @@
                             return `${t}<br/>` + lines.join('<br/>');
                         }
                     },
-                    xAxis: {
-                        type: 'category',
-                        data: times,
-                        axisLabel: { fontSize: 10, interval: 'auto' },
-                        axisLine: { lineStyle: { color: '#ccc' } }
-                    },
-                    yAxis: {
-                        type: 'value',
-                        scale: true,
-                        axisLabel: { fontSize: 10 },
-                        splitLine: { lineStyle: { color: '#f0f0f0' } }
-                    },
+                    xAxis: { type: 'category', data: times, axisLabel: { fontSize: 10, interval: 'auto' }, axisLine: { lineStyle: { color: '#ccc' } } },
+                    yAxis: { type: 'value', scale: true, axisLabel: { fontSize: 10 }, splitLine: { lineStyle: { color: '#333' } } },
                     series: [
-                        {
-                            name: '价格',
-                            type: 'line',
-                            data: prices,
-                            symbol: 'none',
-                            lineStyle: { color: '#ffffff', width: 1.5 },
-                            itemStyle: { color: '#ffffff' }
-                        },
-                        {
-                            name: '均价',
-                            type: 'line',
-                            data: avgs,
-                            symbol: 'none',
-                            lineStyle: { color: '#f5c518', width: 1.5 },
-                            itemStyle: { color: '#f5c518' }
-                        }
+                        { name: '价格', type: 'line', data: prices, symbol: 'none', lineStyle: { color: '#ffffff', width: 1.5 }, itemStyle: { color: '#ffffff' } },
+                        { name: '均价', type: 'line', data: avgs,   symbol: 'none', lineStyle: { color: '#f5c518', width: 1.5 }, itemStyle: { color: '#f5c518' } }
                     ],
                     backgroundColor: '#1a1a2e'
-                });
+                };
             }
-        }
 
-        // ── 分时量能图（当日，紧贴分时价格图下方）────────────────────────
-        const intradayVolDom = document.getElementById('intraday-vol-chart');
-        if (intradayVolDom && typeof echarts !== 'undefined') {
-            const ivPoints = {{ result.intraday_points | tojson if result and result.intraday_points else '[]' }};
-            if (ivPoints.length > 0) {
-                const ivTimes = ivPoints.map(p => p.time);
-                const ivVols  = ivPoints.map(p => p.vol || 0);
-                // 以当日均量为基准：高于均量=红（放量），低于均量=灰（缩量）
-                const ivAvg   = ivVols.reduce((a, b) => a + b, 0) / ivVols.length;
-                const ivColors = ivVols.map(v => v >= ivAvg ? '#ef5350' : '#9e9e9e');
+            // ── 构建K线图 option ──
+            function buildCandleOption(candles, label) {
+                const times = candles.map(c => c.window_start);
+                // ECharts candlestick 格式：[open, close, low, high]
+                const data  = candles.map(c => [c.open, c.close, c.low, c.high]);
+                return {
+                    grid: { top: 20, right: 12, bottom: 24, left: 52 },
+                    tooltip: {
+                        trigger: 'axis',
+                        formatter: params => {
+                            const p = params[0];
+                            if (!p) return '';
+                            const [o, c, l, h] = p.value;
+                            const color = c >= o ? '#ef5350' : '#43a047';
+                            return `${p.axisValue}<br/>` +
+                                `开: <b>${o}</b>  收: <b style="color:${color}">${c}</b><br/>` +
+                                `高: <b>${h}</b>  低: <b>${l}</b>`;
+                        }
+                    },
+                    xAxis: { type: 'category', data: times, axisLabel: { fontSize: 10, interval: 'auto' }, axisLine: { lineStyle: { color: '#ccc' } } },
+                    yAxis: { type: 'value', scale: true, axisLabel: { fontSize: 10 }, splitLine: { lineStyle: { color: '#333' } } },
+                    series: [{
+                        name: label,
+                        type: 'candlestick',
+                        data: data,
+                        itemStyle: {
+                            color: '#ef5350', color0: '#43a047',
+                            borderColor: '#ef5350', borderColor0: '#43a047',
+                        }
+                    }],
+                    backgroundColor: '#1a1a2e'
+                };
+            }
 
-                const ivChart = echarts.init(intradayVolDom, null, { renderer: 'svg' });
-                ivChart.setOption({
+            // ── 构建量能柱 option（分时 or K线均适用）──
+            function buildVolOption(vols, times) {
+                const avg    = vols.reduce((a, b) => a + b, 0) / (vols.length || 1);
+                const colors = vols.map(v => v >= avg ? '#ef5350' : '#9e9e9e');
+                return {
                     grid: { top: 2, right: 12, bottom: 18, left: 52 },
                     tooltip: {
                         trigger: 'axis',
                         formatter: params => {
                             const p = params[0];
-                            const label = p.value >= ivAvg ? '放量' : '缩量';
-                            return `${p.axisValue}<br/><span style="color:${p.color}">●</span> 成交量：<b>${(p.value / 10000).toFixed(1)}万股</b> <span style="color:${p.color}">${label}</span>`;
+                            const lbl = p.value >= avg ? '放量' : '缩量';
+                            return `${p.axisValue}<br/><span style="color:${p.color}">●</span> 成交量：<b>${(p.value / 10000).toFixed(1)}万股</b> <span style="color:${p.color}">${lbl}</span>`;
                         }
                     },
-                    xAxis: {
-                        type: 'category',
-                        data: ivTimes,
-                        axisLabel: { fontSize: 8, interval: 'auto' },
-                        axisLine: { lineStyle: { color: '#ccc' } }
-                    },
-                    yAxis: {
-                        type: 'value',
-                        axisLabel: { show: false },
-                        splitLine: { show: false }
-                    },
-                    series: [{
-                        type: 'bar',
-                        data: ivVols.map((v, i) => ({ value: v, itemStyle: { color: ivColors[i] } })),
-                        barMaxWidth: 10,
-                    }]
-                });
+                    xAxis: { type: 'category', data: times, axisLabel: { fontSize: 8, interval: 'auto' }, axisLine: { lineStyle: { color: '#ccc' } } },
+                    yAxis: { type: 'value', axisLabel: { show: false }, splitLine: { show: false } },
+                    series: [{ type: 'bar', data: vols.map((v, i) => ({ value: v, itemStyle: { color: colors[i] } })), barMaxWidth: 10 }]
+                };
             }
-        }
+
+            // ── 初始渲染（分时图）──
+            mainChart.setOption(buildTimeshareOption(intradayPoints));
+            volChart.setOption(buildVolOption(
+                intradayPoints.map(p => p.vol || 0),
+                intradayPoints.map(p => p.time)
+            ));
+
+            // ── Tab 切换函数（挂到 window 供 onclick 调用）──
+            // ── 动态防守价切换（8848下轨 / F618）──────────────────────────
+            window.switchDdp = function(mode) {
+                const valLower = document.getElementById('ddp-value-lower');
+                const valF618  = document.getElementById('ddp-value-f618');
+                const btnLower = document.getElementById('ddp-tab-lower');
+                const btnF618  = document.getElementById('ddp-tab-f618');
+                if (valLower) valLower.style.display = (mode === 'lower') ? '' : 'none';
+                if (valF618)  valF618.style.display  = (mode === 'f618')  ? '' : 'none';
+                if (btnLower) btnLower.classList.toggle('active', mode === 'lower');
+                if (btnF618)  btnF618.classList.toggle('active',  mode === 'f618');
+            };
+
+            window.switchIntradayChart = function(mode) {
+                ['timeshare', '5min', '15min'].forEach(m => {
+                    const btn = document.getElementById('tab-' + m);
+                    if (btn) btn.classList.toggle('active', m === mode);
+                });
+                if (mode === 'timeshare') {
+                    mainChart.setOption(buildTimeshareOption(intradayPoints), true);
+                    volChart.setOption(buildVolOption(
+                        intradayPoints.map(p => p.vol || 0),
+                        intradayPoints.map(p => p.time)
+                    ), true);
+                } else {
+                    const candles = mode === '5min' ? candles5 : candles15;
+                    const label   = mode === '5min' ? '5分钟K' : '15分钟K';
+                    if (candles.length === 0) return;  // 数据不足，不切换
+                    mainChart.setOption(buildCandleOption(candles, label), true);
+                    volChart.setOption(buildVolOption(
+                        candles.map(c => c.vol || 0),
+                        candles.map(c => c.window_start)
+                    ), true);
+                }
+            };
+
+            // ── 5分钟K / 15分钟K 数据不足时置灰 Tab 按钮 ──
+            if (candles5.length  === 0) { const b = document.getElementById('tab-5min');  if (b) { b.disabled = true; b.title = '分时数据不足'; } }
+            if (candles15.length === 0) { const b = document.getElementById('tab-15min'); if (b) { b.disabled = true; b.title = '分时数据不足'; } }
+        })();
 
         // ── 量能柱状图（大盘用，单Y轴）────────────────────────────────────
         function buildVolumeChartOption(dates, amounts, colors, labels) {
