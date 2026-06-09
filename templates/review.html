@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交易复盘 · 8848</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .main-container { margin-top: 30px; margin-bottom: 40px; }
+        @media (min-width: 992px) { .main-container { margin-top: 40px; } }
+
+        /* 复盘结果 Markdown 渲染样式（单笔 + 阶段共用） */
+        .review-md-content { font-size: 0.875rem; line-height: 1.8; }
+        .review-md-content h1, .review-md-content h2, .review-md-content h3 {
+            font-size: 1rem; font-weight: 700; margin-top: 0.8rem; margin-bottom: 0.3rem;
+        }
+        .review-md-content h4, .review-md-content h5 {
+            font-size: 0.9rem; font-weight: 600; margin-top: 0.6rem; margin-bottom: 0.2rem;
+        }
+        .review-md-content p { margin-bottom: 0.5rem; }
+        .review-md-content ul, .review-md-content ol { padding-left: 1.4rem; margin-bottom: 0.5rem; }
+        .review-md-content li { margin-bottom: 0.2rem; }
+        .review-md-content strong { color: #333; }
+        .review-md-content hr { margin: 0.6rem 0; border-color: #dee2e6; }
+        .review-md-content code { background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.82rem; }
+        .review-md-content blockquote { border-left: 3px solid #5b4fcf; padding-left: 0.8rem; color: #555; margin: 0.5rem 0; }
+        .review-md-content table { font-size: 0.82rem; width: 100%; border-collapse: collapse; margin-bottom: 0.5rem; }
+        .review-md-content th, .review-md-content td { border: 1px solid #dee2e6; padding: 0.25rem 0.5rem; }
+        .review-md-content th { background: #f0f0f0; }
+
+        /* 小按钮 */
+        .btn-xs { padding: 0.15rem 0.4rem; font-size: 0.75rem; border-radius: 0.2rem; }
+
+        /* 想法行 */
+        .thought-row td { padding-top: 0 !important; padding-bottom: 0.4rem !important; }
+    </style>
+</head>
+<body>
+
+<!-- 导航栏 -->
+<nav class="navbar navbar-expand-lg navbar-dark bg-primary px-3">
+    <a class="navbar-brand fw-bold" href="/">8848</a>
+    <div class="navbar-nav ms-auto">
+        <a class="nav-link" href="/">分析</a>
+        <a class="nav-link active fw-semibold" href="/review">交易复盘</a>
+        <a class="nav-link" href="/sector">板块轮动</a>
+    </div>
+</nav>
+
+<div class="container-fluid main-container">
+    <div class="row g-3">
+
+        <!-- ═══════════════════════════════════════
+             左栏：录入表单（col-lg-4）
+        ════════════════════════════════════════ -->
+        <div class="col-12 col-lg-4">
+            <div class="card shadow-sm">
+                <div class="card-header bg-primary text-white d-flex align-items-center gap-2">
+                    <strong>录入交易记录</strong>
+                </div>
+                <div class="card-body">
+                    <form method="post" action="/review/add">
+
+                        <!-- 股票代码（带历史查询下拉） -->
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">
+                                股票代码 <span class="text-danger">*</span>
+                            </label>
+                            <div class="input-group">
+                                <input type="text" name="code" id="review-code-input"
+                                       class="form-control"
+                                       placeholder="如 600519 或 000001" required
+                                       autocomplete="off">
+                                {% if query_history %}
+                                <button class="btn btn-outline-secondary dropdown-toggle"
+                                        type="button"
+                                        id="review-code-dropdown-btn"
+                                        data-bs-toggle="dropdown"
+                                        aria-expanded="false"
+                                        title="从最近查询中选择">
+                                    最近
+                                </button>
+                                <ul class="dropdown-menu dropdown-menu-end"
+                                    aria-labelledby="review-code-dropdown-btn"
+                                    style="max-height:260px; overflow-y:auto; min-width:180px;">
+                                    {% for item in query_history %}
+                                    <li>
+                                        <button type="button" class="dropdown-item small"
+                                                onclick="fillReviewCode('{{ item.code }}')">
+                                            {% if item.name %}
+                                                <span class="fw-semibold">{{ item.name }}</span>
+                                                <span class="text-muted ms-1">{{ item.code }}</span>
+                                            {% else %}
+                                                {{ item.code }}
+                                            {% endif %}
+                                        </button>
+                                    </li>
+                                    {% endfor %}
+                                </ul>
+                                {% endif %}
+                            </div>
+                            <div class="form-text">支持 600519、000001.SZ 等格式</div>
+                        </div>
+
+                        <!-- 操作时间 -->
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">
+                                操作时间 <span class="text-danger">*</span>
+                            </label>
+                            <input type="datetime-local" name="trade_time" class="form-control" required>
+                        </div>
+
+                        <!-- 方向 + 情绪 -->
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label fw-semibold">操作方向</label>
+                                <select name="direction" class="form-select">
+                                    <option value="买入">🟢 买入</option>
+                                    <option value="加仓">📈 加仓</option>
+                                    <option value="减仓">📉 减仓</option>
+                                    <option value="卖出">🔴 卖出</option>
+                                </select>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label fw-semibold">情绪状态</label>
+                                <select name="emotion" class="form-select">
+                                    <option value="冷静">😌 冷静</option>
+                                    <option value="有点冲动">😤 有点冲动</option>
+                                    <option value="很纠结">😰 很纠结</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- 价格 + 手数 -->
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label fw-semibold">成交价格</label>
+                                <div class="input-group">
+                                    <input type="number" name="price" class="form-control"
+                                           step="0.0001" min="0.0001" placeholder="0.0000" required>
+                                    <span class="input-group-text">元</span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label fw-semibold">手数</label>
+                                <div class="input-group">
+                                    <input type="number" name="volume" class="form-control"
+                                           min="1" placeholder="1" required>
+                                    <span class="input-group-text">手</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 当时的想法 -->
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold">当时的想法</label>
+                            <textarea name="thought" class="form-control" rows="3"
+                                      placeholder="为什么做这笔操作？当时看到了什么信号？"></textarea>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary w-100">
+                            保存记录
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════════════════════════════════════
+             右栏：复盘结果 + 历史列表（col-lg-8）
+        ════════════════════════════════════════ -->
+        <div class="col-12 col-lg-8">
+
+            <!-- ── 阶段复盘结果卡片（有阶段结果时显示） ── -->
+            {% if stage_result %}
+            <div class="card shadow-sm mb-3 border-info" id="stage-result-card">
+                <div class="card-header bg-info bg-opacity-15 d-flex justify-content-between align-items-center">
+                    <span class="fw-bold">📊 阶段复盘结果
+                        <small class="text-muted fw-normal ms-2">
+                            {{ stage_start }} ~ {{ stage_end }}，共 {{ stage_count }} 笔
+                        </small>
+                    </span>
+                    <div class="d-flex gap-2 align-items-center">
+                        <button class="btn btn-sm btn-outline-primary"
+                                onclick="extractProfile('stage-result-content')">
+                            提炼到个人画像
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary"
+                                onclick="document.getElementById('stage-result-card').style.display='none'">
+                            ✕
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="stage-result-content" class="review-md-content"></div>
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- ── 单笔复盘结果卡片（有结果时才显示） ── -->
+            {% if ai_result %}
+            <div class="card shadow-sm mb-3 border-warning" id="review-result-card">
+                <div class="card-header bg-warning bg-opacity-25 d-flex justify-content-between align-items-center">
+                    <span class="fw-bold">🤖 AI 复盘结果</span>
+                    <div class="d-flex gap-2 align-items-center">
+                        <button class="btn btn-sm btn-outline-primary"
+                                onclick="extractProfile('review-result-content')">
+                            提炼到个人画像
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary"
+                                onclick="document.getElementById('review-result-card').style.display='none'">
+                            ✕
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="review-result-content" class="review-md-content"></div>
+                </div>
+            </div>
+            {% else %}
+            <!-- 占位卡片（隐藏，供 showStoredReview 复用） -->
+            <div class="card shadow-sm mb-3 border-warning d-none" id="review-result-card">
+                <div class="card-header bg-warning bg-opacity-25 d-flex justify-content-between align-items-center">
+                    <span class="fw-bold">🤖 AI 复盘结果</span>
+                    <div class="d-flex gap-2 align-items-center">
+                        <button class="btn btn-sm btn-outline-primary"
+                                onclick="extractProfile('review-result-content')">
+                            提炼到个人画像
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary"
+                                onclick="document.getElementById('review-result-card').classList.add('d-none')">
+                            ✕
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="review-result-content" class="review-md-content"></div>
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- ── 阶段复盘表单卡片 ── -->
+            <div class="card shadow-sm mb-3">
+                <div class="card-header d-flex align-items-center gap-2">
+                    <span class="fw-bold">📅 阶段复盘</span>
+                    <small class="text-muted">选择时间范围，跨股找规律</small>
+                </div>
+                <div class="card-body">
+                    <form method="post" action="/review/stage_analyze"
+                          onsubmit="this.querySelector('button[type=submit]').disabled=true;
+                                    this.querySelector('button[type=submit]').textContent='分析中…';">
+                        <div class="row g-2 align-items-end">
+                            <div class="col-sm-4">
+                                <label class="form-label fw-semibold small mb-1">开始日期</label>
+                                <input type="date" name="start_date" class="form-control form-control-sm" required>
+                            </div>
+                            <div class="col-sm-4">
+                                <label class="form-label fw-semibold small mb-1">结束日期</label>
+                                <input type="date" name="end_date" class="form-control form-control-sm" required>
+                            </div>
+                            <div class="col-sm-4">
+                                <button type="submit" class="btn btn-info btn-sm w-100 text-white">
+                                    开始阶段复盘
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- 历史记录列表 -->
+            <div class="card shadow-sm">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span class="fw-bold">交易记录</span>
+                    <span class="badge bg-secondary">共 {{ trades|length }} 条</span>
+                </div>
+                <div class="card-body p-0">
+                    {% if trades %}
+                    <div class="table-responsive">
+                        <table class="table table-hover table-sm mb-0 align-middle">
+                            <thead class="table-light">
+                                <tr>
+                                    <th style="min-width:120px">时间</th>
+                                    <th>股票</th>
+                                    <th>方向</th>
+                                    <th class="text-end">价格</th>
+                                    <th class="text-end">手数</th>
+                                    <th class="text-center">情绪</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for t in trades %}
+                                {# 主数据行 #}
+                                <tr class="{% if analyzed_trade_id == t.id|string %}table-warning{% endif %}"
+                                    id="trade-row-{{ t.id }}">
+                                    <td class="text-nowrap text-muted small">{{ t.trade_time[:16] }}</td>
+                                    <td>
+                                        <span class="fw-semibold">{{ t.name }}</span>
+                                        <br><small class="text-muted">{{ t.code }}</small>
+                                    </td>
+                                    <td>
+                                        {% if t.direction == '买入' %}
+                                            <span class="badge bg-success">买入</span>
+                                        {% elif t.direction == '加仓' %}
+                                            <span class="badge bg-info text-dark">加仓</span>
+                                        {% elif t.direction == '减仓' %}
+                                            <span class="badge bg-warning text-dark">减仓</span>
+                                        {% elif t.direction == '卖出' %}
+                                            <span class="badge bg-danger">卖出</span>
+                                        {% else %}
+                                            <span class="badge bg-secondary">{{ t.direction }}</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="text-end">{{ "%.4f"|format(t.price) }}</td>
+                                    <td class="text-end">{{ t.volume }}手</td>
+                                    <td class="text-center">
+                                        {% if t.emotion == '冷静' %}😌
+                                        {% elif t.emotion == '有点冲动' %}😤
+                                        {% elif t.emotion == '很纠结' %}😰
+                                        {% else %}{{ t.emotion }}{% endif %}
+                                    </td>
+                                    <td>
+                                        <div class="d-flex gap-1 flex-nowrap">
+                                            <!-- 复盘按钮 -->
+                                            <form method="post" action="/review/analyze" class="d-inline">
+                                                <input type="hidden" name="trade_id" value="{{ t.id }}">
+                                                <button type="submit" class="btn btn-xs btn-outline-primary"
+                                                        title="AI 复盘此笔操作"
+                                                        onclick="this.disabled=true; this.textContent='分析中…'; this.form.submit();">
+                                                    复盘
+                                                </button>
+                                            </form>
+                                            <!-- 查看历史复盘结果 -->
+                                            {% if t.review_result %}
+                                            <button class="btn btn-xs btn-outline-success"
+                                                    onclick="showStoredReview('{{ t.id }}')"
+                                                    title="查看上次复盘结果">
+                                                查看
+                                            </button>
+                                            {% endif %}
+                                        </div>
+                                    </td>
+                                </tr>
+                                {# 想法折叠行 #}
+                                {% if t.thought %}
+                                <tr class="thought-row {% if analyzed_trade_id == t.id|string %}table-warning{% endif %}">
+                                    <td colspan="7" class="ps-4">
+                                        <small class="text-muted fst-italic">
+                                            💬 {{ t.thought }}
+                                        </small>
+                                    </td>
+                                </tr>
+                                {% endif %}
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <div class="text-center py-5 text-muted">
+                        <div style="font-size: 2rem;">📋</div>
+                        <p class="mt-2">还没有交易记录，从左侧开始录入吧</p>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+        </div><!-- /col-lg-8 -->
+    </div><!-- /row -->
+</div><!-- /container -->
+
+<!-- 历史复盘结果数据（JSON 注入，供 JS 读取） -->
+<script id="stored-reviews" type="application/json">
+{
+    {% set ns = namespace(first=true) %}
+    {% for t in trades %}{% if t.review_result %}{% if not ns.first %},{% endif %}{% set ns.first = false %}"{{ t.id }}": {{ t.review_result | tojson }}{% endif %}{% endfor %}
+}
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+    marked.setOptions({ breaks: true });
+
+    // 渲染当次单笔 AI 复盘结果
+    {% if ai_result %}
+    (function() {
+        var content = document.getElementById('review-result-content');
+        var card    = document.getElementById('review-result-card');
+        if (content && typeof marked !== 'undefined') {
+            content.innerHTML = marked.parse({{ ai_result | tojson }});
+        }
+        if (card) {
+            card.classList.remove('d-none');
+            setTimeout(function() {
+                card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 100);
+        }
+    })();
+    {% endif %}
+
+    // 渲染阶段复盘结果
+    {% if stage_result %}
+    (function() {
+        var content = document.getElementById('stage-result-content');
+        var card    = document.getElementById('stage-result-card');
+        if (content && typeof marked !== 'undefined') {
+            content.innerHTML = marked.parse({{ stage_result | tojson }});
+        }
+        if (card) {
+            setTimeout(function() {
+                card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 100);
+        }
+    })();
+    {% endif %}
+
+    // 查看历史复盘结果
+    function showStoredReview(tradeId) {
+        var reviews = {};
+        try {
+            reviews = JSON.parse(document.getElementById('stored-reviews').textContent);
+        } catch(e) {}
+
+        var text = reviews[tradeId];
+        if (!text) return;
+
+        var content = document.getElementById('review-result-content');
+        var card    = document.getElementById('review-result-card');
+        if (content && typeof marked !== 'undefined') {
+            content.innerHTML = marked.parse(text);
+        }
+        if (card) {
+            card.classList.remove('d-none');
+            card.style.display = '';
+            card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    }
+
+    // 从历史查询下拉中回填股票代码
+    function fillReviewCode(code) {
+        var input = document.getElementById('review-code-input');
+        if (input) { input.value = code; }
+    }
+
+    // 提炼到个人画像：把指定容器的 innerText 作为复盘结果提交
+    function extractProfile(contentElemId) {
+        var elem = document.getElementById(contentElemId);
+        if (!elem) return;
+        var reviewText = elem.innerText || elem.textContent || '';
+        if (!reviewText.trim()) {
+            alert('复盘内容为空，无法提炼。');
+            return;
+        }
+        var form = document.createElement('form');
+        form.method = 'post';
+        form.action = '/review/extract_profile';
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'review_text';
+        input.value = reviewText;
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+    }
+</script>
+</body>
+</html>

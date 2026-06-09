@@ -191,6 +191,27 @@ def init_db():
                 else:
                     raise
 
+            # 交易复盘记录表
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_log (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code          TEXT    NOT NULL,
+                    name          TEXT    NOT NULL DEFAULT '',
+                    trade_time    TEXT    NOT NULL,
+                    direction     TEXT    NOT NULL,
+                    price         REAL    NOT NULL,
+                    volume        INTEGER NOT NULL,
+                    thought       TEXT    DEFAULT '',
+                    emotion       TEXT    DEFAULT '冷静',
+                    review_result TEXT    DEFAULT NULL,
+                    reviewed_at   TEXT    DEFAULT NULL,
+                    created_at    TEXT    DEFAULT (datetime('now','localtime'))
+                )
+                """
+            )
+            conn.commit()
+
         finally:
             conn.close()
     except Exception as e:
@@ -823,13 +844,98 @@ def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_s
     }
 
 def load_skills() -> str:
-    """读取 skills/ 目录下所有 .md 文件，拼接为字符串"""
+    """读取 skills/*.md 和 skills/personal/*.md，拼接为字符串。
+    personal/ 内容置于末尾，AI 更容易记住个人画像。"""
     if not SKILLS_DIR.exists():
         return ""
     parts = []
+    # 通用体系
     for f in sorted(SKILLS_DIR.glob("*.md")):
         parts.append(f"## {f.name}\n\n" + f.read_text(encoding="utf-8"))
+    # 个人画像（子目录）
+    personal_dir = SKILLS_DIR / "personal"
+    if personal_dir.exists():
+        personal_files = sorted(personal_dir.glob("*.md"))
+        if personal_files:
+            parts.append("## 个人交易画像（优先参考）")
+            for f in personal_files:
+                parts.append(f.read_text(encoding="utf-8"))
     return "\n\n---\n\n".join(parts)
+
+
+def get_klines_around_date(code: str, center_date: str, n: int = 10) -> list:
+    """取 center_date 前后各 n 个交易日的 K 线（从 daily_records）"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        before = conn.execute(
+            "SELECT date FROM daily_records WHERE code=? AND date<=? ORDER BY date DESC LIMIT ?",
+            (code, center_date, n)
+        ).fetchall()
+        after = conn.execute(
+            "SELECT date FROM daily_records WHERE code=? AND date>? ORDER BY date ASC LIMIT ?",
+            (code, center_date, n)
+        ).fetchall()
+        if not before:
+            return []
+        start_date = before[-1]["date"]
+        end_date   = after[-1]["date"] if after else before[0]["date"]
+        rows = conn.execute(
+            "SELECT date, COALESCE(open, close) AS open, high, low, close, amount "
+            "FROM daily_records WHERE code=? AND date BETWEEN ? AND ? ORDER BY date ASC",
+            (code, start_date, end_date)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def build_review_prompt(trade: dict, stock_klines: list, index_klines: list) -> tuple:
+    """构建单笔复盘的 system_prompt 和 user_prompt"""
+    skills_text = load_skills()
+
+    system_prompt = (
+        "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行复盘分析。\n\n"
+        + skills_text
+        + "\n\n## 复盘分析框架\n\n"
+        "对每笔操作，从以下维度评判：\n"
+        "1. **趋势判断**：操作时处于什么趋势阶段？均线系统是否支持该方向？\n"
+        "2. **时机选择**：买卖点是否符合阿狼体系信号标准？\n"
+        "3. **大盘环境**：操作当日大盘状态？是否逆势操作？\n"
+        f"4. **情绪影响**：情绪状态（{trade['emotion']}）是否影响了决策质量？\n"
+        "5. **综合评分**：A/B/C/D 四档（A=教科书级，B=合格，C=有明显失误，D=严重违规）\n"
+        "6. **改进建议**：如果重来，最关键的一个改变是什么？\n\n"
+        "输出格式：Markdown，结构清晰，语气直接不客套。"
+    )
+
+    def fmt_klines(klines: list, center: str) -> str:
+        if not klines:
+            return "（无数据）"
+        lines = ["日期 | 开 | 高 | 低 | 收", "---|---|---|---|---"]
+        for k in klines:
+            marker = " ◀ 操作日" if k["date"] == center else ""
+            lines.append(
+                f"{k['date']}{marker} | {k['open']} | {k['high']} | {k['low']} | {k['close']}"
+            )
+        return "\n".join(lines)
+
+    trade_date = trade["trade_time"][:10]
+    user_prompt = (
+        f"## 待复盘的交易记录\n\n"
+        f"- **股票**：{trade['name']}（{trade['code']}）\n"
+        f"- **操作时间**：{trade['trade_time']}\n"
+        f"- **操作方向**：{trade['direction']}\n"
+        f"- **成交价格**：{trade['price']} 元\n"
+        f"- **操作手数**：{trade['volume']} 手（{trade['volume'] * 100} 股）\n"
+        f"- **当时想法**：{trade['thought'] or '（未记录）'}\n"
+        f"- **情绪状态**：{trade['emotion']}\n\n"
+        f"---\n\n## {trade['name']}（{trade['code']}）K 线（操作日前后各约10个交易日）\n\n"
+        f"{fmt_klines(stock_klines, trade_date)}\n\n"
+        f"---\n\n## 上证指数同期走势\n\n"
+        f"{fmt_klines(index_klines, trade_date)}\n\n"
+        "请按阿狼体系标准对这笔操作进行完整复盘分析。"
+    )
+    return system_prompt, user_prompt
 
 
 def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "", index_data: dict = None, rousu_data: dict = None) -> str:
@@ -3961,3 +4067,403 @@ async def sector_analyze(request: Request, user_hint: str = Form("")):
         "user_hint":   user_hint,
     })
     return RedirectResponse(url=f"/sector?result_id={rid}", status_code=303)
+
+
+# ── 交易复盘路由 ──────────────────────────────────────────────────────────────
+
+@app.get("/review", response_class=HTMLResponse)
+async def review_page(request: Request, result_id: str = None, type: str = None):
+    """复盘主页：展示录入表单 + 历史记录列表"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        trades = conn.execute(
+            "SELECT * FROM trade_log ORDER BY trade_time DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ai_result = None
+    analyzed_trade_id = None
+    stage_result = None
+    stage_start = None
+    stage_end = None
+    stage_count = 0
+
+    if result_id:
+        data = load_temp_result(result_id)
+        if type == "stage":
+            stage_result = data.get("stage_result")
+            stage_start  = data.get("stage_start")
+            stage_end    = data.get("stage_end")
+            stage_count  = data.get("stage_count", 0)
+        else:
+            ai_result = data.get("review_result")
+            analyzed_trade_id = data.get("trade_id")
+
+    # 查询历史去重（同一 code 只保留最新一条），供股票代码输入框下拉使用
+    raw_history = get_query_history()
+    seen_codes = set()
+    deduped_history = []
+    for item in raw_history:
+        if item["code"] not in seen_codes:
+            seen_codes.add(item["code"])
+            deduped_history.append(item)
+
+    return templates.TemplateResponse("review.html", {
+        "request":           request,
+        "trades":            [dict(t) for t in trades],
+        "ai_result":         ai_result,
+        "analyzed_trade_id": analyzed_trade_id,
+        "stage_result":      stage_result,
+        "stage_start":       stage_start,
+        "stage_end":         stage_end,
+        "stage_count":       stage_count,
+        "query_history":     deduped_history,
+    })
+
+
+@app.post("/review/add", response_class=HTMLResponse)
+async def review_add(
+    request:    Request,
+    code:       str   = Form(...),
+    trade_time: str   = Form(...),
+    direction:  str   = Form(...),
+    price:      float = Form(...),
+    volume:     int   = Form(...),
+    thought:    str   = Form(""),
+    emotion:    str   = Form("冷静"),
+):
+    """录入一笔交易记录"""
+    trade_time = trade_time.replace("T", " ")
+    ts_code = to_ts_code(code)
+    name = get_cached_name(ts_code) or ts_code
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO trade_log (code, name, trade_time, direction, price, volume, thought, emotion) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts_code, name, trade_time, direction, price, volume, thought, emotion)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return RedirectResponse("/review", status_code=303)
+
+
+@app.post("/review/analyze", response_class=HTMLResponse)
+async def review_analyze(request: Request, trade_id: int = Form(...)):
+    """对单笔交易记录发起 AI 复盘"""
+    import uuid
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM trade_log WHERE id=?", (trade_id,)).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return RedirectResponse("/review", status_code=303)
+
+    trade = dict(row)
+    trade_date = trade["trade_time"][:10]
+
+    stock_klines = get_klines_around_date(trade["code"], trade_date, n=10)
+    index_klines = get_klines_around_date("000001.SH", trade_date, n=10)
+
+    system_prompt, user_prompt = build_review_prompt(trade, stock_klines, index_klines)
+
+    logger.info("review_analyze: start trade_id=%s code=%s", trade_id, trade["code"])
+    try:
+        result = call_ai_model_with_tools(system_prompt, user_prompt)
+    except Exception as e:
+        logger.error("review_analyze: AI call failed: %s", e)
+        result = f"AI 分析失败：{e}"
+
+    # 持久化写回 trade_log
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE trade_log SET review_result=?, reviewed_at=datetime('now','localtime') WHERE id=?",
+            (result, trade_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {"review_result": result, "trade_id": str(trade_id)})
+    return RedirectResponse(f"/review?result_id={rid}", status_code=303)
+
+
+# ── 第三步：阶段复盘 ──────────────────────────────────────────────────────────
+
+def get_klines_brief(code: str, center_date: str, before_n: int = 5) -> dict:
+    """取操作日当天 K 线 + 操作日前 before_n 个交易日收盘价（用于阶段复盘，控制 token 量）"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        # 操作日当天
+        today_row = conn.execute(
+            "SELECT date, COALESCE(open, close) AS open, high, low, close "
+            "FROM daily_records WHERE code=? AND date<=? ORDER BY date DESC LIMIT 1",
+            (code, center_date)
+        ).fetchone()
+        # 操作日前 before_n 天（不含操作日）
+        prev_rows = conn.execute(
+            "SELECT date, close FROM daily_records WHERE code=? AND date<? ORDER BY date DESC LIMIT ?",
+            (code, center_date, before_n)
+        ).fetchall()
+        return {
+            "today": dict(today_row) if today_row else None,
+            "prev":  [dict(r) for r in reversed(prev_rows)],
+        }
+    finally:
+        conn.close()
+
+
+def build_stage_review_prompt(trades: list, klines_map: dict) -> tuple:
+    """构建阶段复盘的 system_prompt 和 user_prompt
+
+    trades: list of dict（来自 trade_log）
+    klines_map: {trade_id: {"today": {...}, "prev": [...]}}
+    """
+    skills_text = load_skills()
+
+    system_prompt = (
+        "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行阶段性复盘分析。\n\n"
+        + skills_text
+        + "\n\n## 阶段复盘分析框架\n\n"
+        "你将收到一段时间内的多笔交易记录（可能涉及多只股票）。\n"
+        "你的任务是：\n"
+        "1. **逐笔简评**：用一行表格对每笔操作给出简短评价（不超过30字）和评分（A/B/C/D）\n"
+        "2. **行为模式归纳**：从整体角度找出该交易者的行为规律，重点关注：\n"
+        "   - 是否存在追涨停板行为\n"
+        "   - 止损执行率（有没有死扛）\n"
+        "   - 大盘弱势时是否仍频繁操作\n"
+        "   - 情绪状态（冷静/冲动/纠结）与操作质量的相关性\n"
+        "   - 买卖点选择的系统性偏差\n"
+        "3. **核心结论**：用3条以内的要点总结该交易者最需要改进的地方\n\n"
+        "输出格式：Markdown，先逐笔简评表格，再整体规律总结，语气直接不客套。"
+    )
+
+    def fmt_brief_klines(kdata: dict, trade_date: str) -> str:
+        if not kdata:
+            return "（无K线数据）"
+        parts = []
+        prev = kdata.get("prev", [])
+        if prev:
+            closes = "、".join(f"{r['date'][-5:]}收{r['close']}" for r in prev)
+            parts.append(f"前{len(prev)}日收盘：{closes}")
+        today = kdata.get("today")
+        if today:
+            parts.append(
+                f"操作日（{today['date']}）：开{today['open']} 高{today['high']} "
+                f"低{today['low']} 收{today['close']}"
+            )
+        return "；".join(parts) if parts else "（无K线数据）"
+
+    # 构建每笔操作的文本块
+    trade_blocks = []
+    for i, t in enumerate(trades, 1):
+        trade_date = t["trade_time"][:10]
+        kdata = klines_map.get(t["id"], {})
+        kline_text = fmt_brief_klines(kdata, trade_date)
+        block = (
+            f"### 操作 {i}：{t['name']}（{t['code']}）\n"
+            f"- 时间：{t['trade_time'][:16]}　方向：{t['direction']}　"
+            f"价格：{t['price']} 元　手数：{t['volume']} 手\n"
+            f"- 情绪：{t['emotion']}　当时想法：{t['thought'] or '（未记录）'}\n"
+            f"- K线参考：{kline_text}"
+        )
+        trade_blocks.append(block)
+
+    date_range = f"{trades[0]['trade_time'][:10]} ~ {trades[-1]['trade_time'][:10]}" if trades else "未知"
+    user_prompt = (
+        f"## 阶段复盘请求\n\n"
+        f"**时间范围**：{date_range}　**操作笔数**：{len(trades)} 笔\n\n"
+        "---\n\n"
+        + "\n\n".join(trade_blocks)
+        + "\n\n---\n\n请按阶段复盘框架，先给出逐笔简评表格，再做整体行为模式归纳和核心结论。"
+    )
+    return system_prompt, user_prompt
+
+
+@app.post("/review/stage_analyze", response_class=HTMLResponse)
+async def review_stage_analyze(
+    request:    Request,
+    start_date: str = Form(...),
+    end_date:   str = Form(...),
+):
+    """阶段复盘：取时间范围内所有 trade_log，构建 prompt，调用 AI"""
+    import uuid
+
+    # 查询范围内的交易记录（按时间升序，方便 AI 按时序分析）
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        trades = conn.execute(
+            "SELECT * FROM trade_log WHERE date(trade_time) BETWEEN ? AND ? ORDER BY trade_time ASC",
+            (start_date, end_date)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    trades = [dict(t) for t in trades]
+    if not trades:
+        # 没有数据，直接重定向回复盘页，不调用 AI
+        rid = str(uuid.uuid4())
+        save_temp_result(rid, {
+            "stage_result": "所选时间范围内没有交易记录，请重新选择日期范围。",
+            "stage_start": start_date,
+            "stage_end": end_date,
+            "stage_count": 0,
+        })
+        return RedirectResponse(f"/review?result_id={rid}&type=stage", status_code=303)
+
+    # 为每笔操作获取简要 K 线（操作日 + 前5天）
+    klines_map = {}
+    for t in trades:
+        trade_date = t["trade_time"][:10]
+        klines_map[t["id"]] = get_klines_brief(t["code"], trade_date, before_n=5)
+
+    system_prompt, user_prompt = build_stage_review_prompt(trades, klines_map)
+
+    logger.info(
+        "stage_analyze: start=%s end=%s count=%d", start_date, end_date, len(trades)
+    )
+    try:
+        result = call_ai_model_with_tools(system_prompt, user_prompt)
+    except Exception as e:
+        logger.error("stage_analyze: AI call failed: %s", e)
+        result = f"AI 分析失败：{e}"
+
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "stage_result": result,
+        "stage_start":  start_date,
+        "stage_end":    end_date,
+        "stage_count":  len(trades),
+    })
+    return RedirectResponse(f"/review?result_id={rid}&type=stage", status_code=303)
+
+
+# ── 第四步：个人画像提炼 ──────────────────────────────────────────────────────
+
+TRADING_PROFILE_PATH = Path(__file__).parent / "skills" / "personal" / "trading_profile.md"
+
+
+def build_extract_profile_prompt(review_text: str, current_profile: str) -> tuple:
+    """构建个人画像提炼的 system_prompt 和 user_prompt"""
+    system_prompt = (
+        "你是一位专业的交易行为分析师，擅长从交易复盘记录中提炼交易者的行为模式，"
+        "并将其整理为结构化的个人交易画像文件。\n\n"
+        "## 你的任务\n\n"
+        "根据本次复盘结果，更新交易者的个人交易画像（Markdown 格式）。\n\n"
+        "## 输出要求\n\n"
+        "请输出两个部分，用 `---PROFILE---` 分隔符隔开：\n\n"
+        "**第一部分**：完整的新版 `trading_profile.md` 内容（直接可写入文件的 Markdown）\n\n"
+        "`---PROFILE---`\n\n"
+        "**第二部分**：变更说明（相比旧版，新增了哪些条目、修改了哪些条目、删除了哪些条目）\n\n"
+        "## 注意事项\n\n"
+        "- 保留旧版中已有的有效内容，不要随意删除\n"
+        "- 新增条目要有充分的复盘依据，不要过度归纳\n"
+        "- 语言简洁，每条不超过50字\n"
+        "- 如果本次复盘没有新的值得记录的模式，可以保持原有内容不变，并在变更说明中注明"
+    )
+
+    user_prompt = (
+        f"## 当前个人交易画像\n\n{current_profile}\n\n"
+        "---\n\n"
+        f"## 本次复盘结果\n\n{review_text}\n\n"
+        "---\n\n"
+        "请根据本次复盘结果，生成更新后的个人交易画像，并说明变更内容。"
+    )
+    return system_prompt, user_prompt
+
+
+@app.post("/review/extract_profile", response_class=HTMLResponse)
+async def review_extract_profile(
+    request:     Request,
+    review_text: str = Form(...),
+):
+    """从复盘结果中提炼个人画像更新建议，PRG 到预览页"""
+    import uuid
+
+    current_profile = TRADING_PROFILE_PATH.read_text(encoding="utf-8") \
+        if TRADING_PROFILE_PATH.exists() else "（文件不存在）"
+
+    system_prompt, user_prompt = build_extract_profile_prompt(review_text, current_profile)
+
+    logger.info("extract_profile: calling AI to generate profile update")
+    try:
+        ai_output = call_ai_model_with_tools(system_prompt, user_prompt)
+    except Exception as e:
+        logger.error("extract_profile: AI call failed: %s", e)
+        ai_output = f"AI 分析失败：{e}"
+
+    # 解析 AI 输出：用 ---PROFILE--- 分隔符拆分
+    separator = "---PROFILE---"
+    if separator in ai_output:
+        parts = ai_output.split(separator, 1)
+        new_profile = parts[0].strip()
+        change_summary = parts[1].strip()
+    else:
+        # 如果 AI 没有按格式输出，把全部内容当作新画像，变更说明留空
+        new_profile = ai_output.strip()
+        change_summary = "（AI 未按格式输出变更说明，请人工核对上方内容）"
+
+    rid = str(uuid.uuid4())
+    save_temp_result(rid, {
+        "current_profile": current_profile,
+        "new_profile":     new_profile,
+        "change_summary":  change_summary,
+    })
+    return RedirectResponse(f"/review/profile_preview?result_id={rid}", status_code=303)
+
+
+@app.get("/review/profile_preview", response_class=HTMLResponse)
+async def review_profile_preview(request: Request, result_id: str):
+    """展示现有画像 vs AI 建议的新画像，供用户确认"""
+    data = load_temp_result(result_id)
+    if not data:
+        return RedirectResponse("/review", status_code=303)
+
+    # 把数据再存一次（load_temp_result 是一次性消费，但预览页需要 confirm 时再用）
+    rid2 = str(uuid.uuid4())
+    save_temp_result(rid2, data)
+
+    return templates.TemplateResponse("profile_preview.html", {
+        "request":         request,
+        "current_profile": data.get("current_profile", ""),
+        "new_profile":     data.get("new_profile", ""),
+        "change_summary":  data.get("change_summary", ""),
+        "confirm_rid":     rid2,
+    })
+
+
+@app.post("/review/confirm_profile", response_class=HTMLResponse)
+async def review_confirm_profile(
+    request:     Request,
+    new_profile: str = Form(...),
+):
+    """用户确认后，将新画像写入 trading_profile.md"""
+    try:
+        TRADING_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TRADING_PROFILE_PATH.write_text(new_profile, encoding="utf-8")
+        logger.info("confirm_profile: trading_profile.md updated (%d chars)", len(new_profile))
+        success = True
+        error_msg = ""
+    except Exception as e:
+        logger.error("confirm_profile: write failed: %s", e)
+        success = False
+        error_msg = str(e)
+
+    return templates.TemplateResponse("profile_confirm_result.html", {
+        "request":   request,
+        "success":   success,
+        "error_msg": error_msg,
+    })
