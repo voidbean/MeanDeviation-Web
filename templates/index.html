@@ -513,8 +513,8 @@
 
                                     <!-- AI 分析触发按钮 -->
                                     <div class="mt-3">
-                                        <form id="ai-form" action="/ai_analyze" method="post">
-                                            <input type="hidden" name="stock_code" value="{{ result.code }}">
+                                        <div id="ai-form-wrapper">
+                                            <input type="hidden" id="ai-stock-code" value="{{ result.code if result else '' }}">
                                             <!-- 盘中 / 盘后 切换 -->
                                             <div class="btn-group w-100 mb-2" role="group">
                                                 <input type="radio" class="btn-check" name="ai_mode" id="mode-intraday" value="intraday" autocomplete="off"
@@ -530,14 +530,14 @@
                                             </div>
                                             <!-- 用户补充提示词 -->
                                             <div class="mb-2">
-                                                <textarea name="user_hint" id="user-hint" rows="2"
+                                                <textarea id="user-hint" rows="2"
                                                     class="form-control form-control-sm"
                                                     placeholder="补充说明（可选）：如「今天大盘缩量，半导体板块走弱」「我打算持仓到下周」等，AI 会结合你的描述分析">{{ user_hint if user_hint else '' }}</textarea>
                                             </div>
-                                            <button id="ai-btn" type="submit" class="btn btn-outline-secondary w-100">
+                                            <button id="ai-btn" type="button" class="btn btn-outline-secondary w-100" onclick="startAiStream()">
                                                 🤖 AI分析（阿狼视角）
                                             </button>
-                                        </form>
+                                        </div>
                                         <small class="text-muted d-block mt-1 text-center">
                                             当前模型：{{ ai_provider }} · 手动触发，消耗 token
                                         </small>
@@ -548,9 +548,30 @@
                         </div>
                     </div>
 
-                    <!-- AI 分析结果 -->
+                    <!-- AI 分析结果（流式占位 + 服务端渲染兼容） -->
+                    <div id="ai-stream-card" class="card shadow-sm mt-3 border-0" style="display:none;">
+                        <div class="card-header text-white" style="background-color: #5b4fcf;">
+                            <span id="ai-stream-title">📈 阿狼视角 · 分析中…</span>
+                            <small class="float-end opacity-75" id="ai-stream-provider">{{ ai_provider }}</small>
+                        </div>
+                        <div class="card-body">
+                            <div id="ai-progress-msg" class="text-muted small mb-2" style="display:none;"></div>
+                            <div id="ai-stream-result"></div>
+                            <!-- 对话区域，分析完成后显示 -->
+                            <div id="ai-chat-area" class="mt-3" style="display:none;">
+                                <hr class="my-2">
+                                <div id="ai-chat-history" class="mb-2" style="max-height:400px;overflow-y:auto;"></div>
+                                <div class="input-group input-group-sm">
+                                    <textarea id="ai-chat-input" class="form-control" rows="2"
+                                        placeholder="继续追问 AI…（Enter 发送，Shift+Enter 换行）"></textarea>
+                                    <button class="btn btn-outline-primary" id="ai-chat-send" onclick="sendAiChat()">发送</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     {% if ai_analysis %}
-                    <div class="card shadow-sm mt-3 border-0">
+                    <div class="card shadow-sm mt-3 border-0" id="ai-static-card">
                         <div class="card-header text-white" style="background-color: #5b4fcf;">
                             {% if ai_mode == 'next_day' %}
                                 🌙 阿狼视角 · 明日操作计划
@@ -872,7 +893,7 @@
             });
         }
 
-        // 渲染 AI 分析结果（Markdown → HTML）
+        // 渲染服务端静态 AI 分析结果（旧版兼容）
         const aiResult = document.getElementById('ai-result');
         if (aiResult && typeof marked !== 'undefined') {
             const raw = aiResult.getAttribute('data-raw');
@@ -1428,6 +1449,178 @@
             }
         }
     });
+
+// ── AI 流式分析（全局作用域，供 onclick 调用）────────────────────────────
+let _aiSessionId = '';
+let _aiStockCode = '';
+let _aiStreamBuffer = '';
+let _aiChatStreaming = false;
+
+function startAiStream() {
+    const btn = document.getElementById('ai-btn');
+    const stockCode = (document.getElementById('ai-stock-code') || {}).value || '';
+    if (!stockCode) return;
+    _aiStockCode = stockCode;
+
+    const aiMode = (document.querySelector('input[name="ai_mode"]:checked') || {}).value || 'intraday';
+    const userHint = (document.getElementById('user-hint') || {}).value || '';
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>AI 分析中…';
+
+    const streamCard = document.getElementById('ai-stream-card');
+    const staticCard = document.getElementById('ai-static-card');
+    if (staticCard) staticCard.style.display = 'none';
+    streamCard.style.display = '';
+    document.getElementById('ai-stream-title').textContent =
+        aiMode === 'next_day' ? '🌙 阿狼视角 · 明日操作计划' : '📈 阿狼视角 · 今日买卖点分析';
+    const resultEl = document.getElementById('ai-stream-result');
+    resultEl.innerHTML = '';
+    _aiStreamBuffer = '';
+    const progressEl = document.getElementById('ai-progress-msg');
+    progressEl.style.display = '';
+    progressEl.textContent = '正在连接…';
+    document.getElementById('ai-chat-area').style.display = 'none';
+
+    const params = new URLSearchParams({ stock_code: stockCode, ai_mode: aiMode, user_hint: userHint });
+    const es = new EventSource('/ai_stream?' + params.toString());
+
+    function _restoreBtn() {
+        btn.disabled = false;
+        btn.innerHTML = '🤖 AI分析（阿狼视角）';
+        progressEl.style.display = 'none';
+    }
+
+    es.addEventListener('progress', function(e) {
+        try { progressEl.textContent = JSON.parse(e.data).msg || ''; } catch(_) {}
+    });
+
+    es.addEventListener('token', function(e) {
+        progressEl.style.display = 'none';
+        try {
+            _aiStreamBuffer += JSON.parse(e.data).text || '';
+            resultEl.innerHTML = typeof marked !== 'undefined' ? marked.parse(_aiStreamBuffer) : _aiStreamBuffer;
+            resultEl.scrollTop = resultEl.scrollHeight;
+        } catch(_) {}
+    });
+
+    es.addEventListener('done', function(e) {
+        es.close();
+        _restoreBtn();
+        try {
+            _aiSessionId = JSON.parse(e.data).session_id || '';
+        } catch(_) {}
+        if (_aiStreamBuffer && typeof marked !== 'undefined') {
+            resultEl.innerHTML = marked.parse(_aiStreamBuffer);
+        }
+        document.getElementById('ai-chat-area').style.display = '';
+        document.getElementById('ai-chat-history').innerHTML = '';
+    });
+
+    es.addEventListener('error', function(e) {
+        es.close();
+        _restoreBtn();
+        try {
+            resultEl.innerHTML = '<div class="alert alert-danger">' + (JSON.parse(e.data).msg || '分析失败') + '</div>';
+        } catch(_) {
+            if (!resultEl.innerHTML) resultEl.innerHTML = '<div class="alert alert-danger">连接中断，请重试</div>';
+        }
+    });
+
+    es.onerror = function() {
+        if (es.readyState === EventSource.CLOSED) return;
+        es.close();
+        _restoreBtn();
+        if (!resultEl.innerHTML) resultEl.innerHTML = '<div class="alert alert-danger">连接中断，请重试</div>';
+    };
+}
+
+function sendAiChat() {
+    if (_aiChatStreaming || !_aiSessionId) return;
+    const input = document.getElementById('ai-chat-input');
+    const msg = (input.value || '').trim();
+    if (!msg) return;
+    input.value = '';
+
+    const sendBtn = document.getElementById('ai-chat-send');
+    _aiChatStreaming = true;
+    sendBtn.disabled = true;
+
+    const chatHistory = document.getElementById('ai-chat-history');
+    const userBubble = document.createElement('div');
+    userBubble.className = 'text-end mb-2';
+    userBubble.innerHTML = '<span class="badge bg-secondary text-wrap text-start d-inline-block" style="max-width:80%;white-space:pre-wrap;">' + msg.replace(/</g,'&lt;') + '</span>';
+    chatHistory.appendChild(userBubble);
+
+    const aiBubble = document.createElement('div');
+    aiBubble.className = 'mb-2';
+    aiBubble.innerHTML = '<div class="p-2 rounded" style="background:#f3f0ff;" id="ai-chat-streaming-bubble"></div>';
+    chatHistory.appendChild(aiBubble);
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+
+    let chatBuffer = '';
+    const bubbleEl = document.getElementById('ai-chat-streaming-bubble');
+
+    fetch('/ai_chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: _aiSessionId, stock_code: _aiStockCode, message: msg }),
+    }).then(resp => {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+
+        function read() {
+            reader.read().then(({ done, value }) => {
+                if (done) {
+                    _aiChatStreaming = false;
+                    sendBtn.disabled = false;
+                    if (chatBuffer && typeof marked !== 'undefined') bubbleEl.innerHTML = marked.parse(chatBuffer);
+                    chatHistory.scrollTop = chatHistory.scrollHeight;
+                    return;
+                }
+                buf += decoder.decode(value, { stream: true });
+                const lines = buf.split('\n');
+                buf = lines.pop();
+                let evtType = '', evtData = '';
+                for (const line of lines) {
+                    if (line.startsWith('event: ')) evtType = line.slice(7).trim();
+                    else if (line.startsWith('data: ')) evtData = line.slice(6).trim();
+                    else if (line === '' && evtType && evtData) {
+                        try {
+                            const d = JSON.parse(evtData);
+                            if (evtType === 'token') {
+                                chatBuffer += d.text || '';
+                                bubbleEl.innerHTML = typeof marked !== 'undefined' ? marked.parse(chatBuffer) : chatBuffer;
+                                chatHistory.scrollTop = chatHistory.scrollHeight;
+                            } else if (evtType === 'progress') {
+                                bubbleEl.textContent = d.msg || '';
+                            } else if (evtType === 'error') {
+                                bubbleEl.innerHTML = '<span class="text-danger">' + (d.msg || '出错了') + '</span>';
+                            }
+                        } catch (_) {}
+                        evtType = ''; evtData = '';
+                    }
+                }
+                read();
+            });
+        }
+        read();
+    }).catch(err => {
+        _aiChatStreaming = false;
+        sendBtn.disabled = false;
+        bubbleEl.innerHTML = '<span class="text-danger">请求失败：' + err + '</span>';
+    });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    const chatInput = document.getElementById('ai-chat-input');
+    if (chatInput) {
+        chatInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiChat(); }
+        });
+    }
+});
 </script>
 </body>
 </html>

@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import threading
+import asyncio
 import math
 import tushare as ts
 import os
@@ -207,6 +208,20 @@ def init_db():
                     review_result TEXT    DEFAULT NULL,
                     reviewed_at   TEXT    DEFAULT NULL,
                     created_at    TEXT    DEFAULT (datetime('now','localtime'))
+                )
+                """
+            )
+            conn.commit()
+
+            # AI 对话会话表：存储流式分析产生的多轮对话消息
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_conversations (
+                    session_id  TEXT PRIMARY KEY,
+                    stock_code  TEXT NOT NULL,
+                    messages    TEXT NOT NULL DEFAULT '[]',
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL
                 )
                 """
             )
@@ -3147,6 +3162,242 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
         raise ValueError(f"不支持的 AI_PROVIDER: {provider}，请设置为 claude / openai / gemini")
 
 
+def call_ai_model_streaming(system_prompt: str, messages: list):
+    """
+    带工具调用的流式生成器。
+    工具调用轮次推送 SSE progress 事件，最终文本逐 token 推送 token 事件。
+    messages: OpenAI 格式的消息列表（不含 system），支持多轮对话。
+    最终 yield ("done", full_text) 表示完成，full_text 是完整助手回复。
+    """
+    provider = AI_PROVIDER
+    MAX_TOKENS = 4096
+
+    # ── Claude ──────────────────────────────────────────────────────────────
+    if provider == "claude":
+        import anthropic
+        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 180.0, "default_headers": {"api-key": CLAUDE_API_KEY}}
+        if CLAUDE_BASE_URL:
+            kwargs["base_url"] = CLAUDE_BASE_URL
+        client = anthropic.Anthropic(**kwargs)
+        claude_tools = _build_claude_tools()
+
+        # 转换 messages 为 Claude 格式（claude 的 system 单独传，messages 只含 user/assistant）
+        claude_messages = []
+        for m in messages:
+            role = m["role"]
+            content = m["content"]
+            if role in ("user", "assistant"):
+                claude_messages.append({"role": role, "content": content})
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                tools=claude_tools,
+                messages=claude_messages,
+            )
+            logger.info("claude streaming round=%d stop_reason=%s", _round, resp.stop_reason)
+            response_content = resp.content or []
+
+            if resp.stop_reason == "end_turn":
+                # 最终文本：逐字符模拟流式（Claude 同步 API 不直接流式，整块文本切片推送）
+                full_text = "".join(b.text for b in response_content if hasattr(b, "text"))
+                chunk_size = 4
+                for i in range(0, len(full_text), chunk_size):
+                    yield ("token", full_text[i:i+chunk_size])
+                yield ("done", full_text)
+                return
+
+            if resp.stop_reason == "tool_use":
+                tool_names = [b.name for b in response_content if b.type == "tool_use"]
+                yield ("progress", f"调用工具：{', '.join(tool_names)}…")
+                claude_messages.append({"role": "assistant", "content": response_content})
+                tool_results = []
+                for block in response_content:
+                    if block.type == "tool_use":
+                        result_str = execute_tool(block.name, block.input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_str,
+                        })
+                claude_messages.append({"role": "user", "content": tool_results})
+            else:
+                full_text = "".join(b.text for b in response_content if hasattr(b, "text"))
+                if full_text:
+                    chunk_size = 4
+                    for i in range(0, len(full_text), chunk_size):
+                        yield ("token", full_text[i:i+chunk_size])
+                yield ("done", full_text)
+                return
+
+        logger.warning("claude streaming exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+        final_content = resp.content or []
+        full_text = "".join(b.text for b in final_content if hasattr(b, "text"))
+        yield ("done", full_text)
+
+    # ── OpenAI ───────────────────────────────────────────────────────────────
+    elif provider == "openai":
+        from openai import OpenAI
+        kwargs = {"api_key": OPENAI_API_KEY, "timeout": 180.0}
+        if OPENAI_BASE_URL:
+            kwargs["base_url"] = OPENAI_BASE_URL
+        client = OpenAI(**kwargs)
+        openai_tools = _build_openai_tools()
+
+        oai_messages = [{"role": "system", "content": system_prompt}] + list(messages)
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                max_tokens=MAX_TOKENS,
+                tools=openai_tools,
+                messages=oai_messages,
+            )
+            choice = resp.choices[0]
+            logger.info("openai streaming round=%d finish_reason=%s", _round, choice.finish_reason)
+
+            if choice.finish_reason == "stop":
+                full_text = choice.message.content or ""
+                chunk_size = 4
+                for i in range(0, len(full_text), chunk_size):
+                    yield ("token", full_text[i:i+chunk_size])
+                yield ("done", full_text)
+                return
+
+            if choice.finish_reason == "tool_calls":
+                msg = choice.message
+                tool_names = [tc.function.name for tc in msg.tool_calls]
+                yield ("progress", f"调用工具：{', '.join(tool_names)}…")
+                oai_messages.append(msg.model_dump())
+                for tc in msg.tool_calls:
+                    args = json.loads(tc.function.arguments)
+                    result_str = execute_tool(tc.function.name, args)
+                    oai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_str,
+                    })
+            else:
+                full_text = choice.message.content or ""
+                chunk_size = 4
+                for i in range(0, len(full_text), chunk_size):
+                    yield ("token", full_text[i:i+chunk_size])
+                yield ("done", full_text)
+                return
+
+        logger.warning("openai streaming exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+        full_text = resp.choices[0].message.content or ""
+        yield ("done", full_text)
+
+    # ── Gemini ───────────────────────────────────────────────────────────────
+    elif provider == "gemini":
+        import google.generativeai as genai
+        from google.generativeai import types as genai_types
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_tool = _build_gemini_tools()
+        model_obj = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=system_prompt,
+            tools=[gemini_tool],
+        )
+        chat = model_obj.start_chat()
+
+        # 重放历史（除最后一条 user 消息）
+        history_msgs = list(messages)
+        last_user = None
+        for i in range(len(history_msgs) - 1, -1, -1):
+            if history_msgs[i]["role"] == "user":
+                last_user = history_msgs.pop(i)
+                break
+        for m in history_msgs:
+            role = "user" if m["role"] == "user" else "model"
+            try:
+                chat.send_message(m["content"], generation_config=genai_types.GenerationConfig(max_output_tokens=1))
+            except Exception:
+                pass
+
+        user_content = last_user["content"] if last_user else ""
+        resp = chat.send_message(
+            user_content,
+            generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
+            request_options={"timeout": 180},
+        )
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            fc_parts = [p for p in resp.parts if p.function_call.name]
+            logger.info("gemini streaming round=%d fc_count=%d", _round, len(fc_parts))
+
+            if not fc_parts:
+                full_text = resp.text
+                chunk_size = 4
+                for i in range(0, len(full_text), chunk_size):
+                    yield ("token", full_text[i:i+chunk_size])
+                yield ("done", full_text)
+                return
+
+            tool_names = [p.function_call.name for p in fc_parts]
+            yield ("progress", f"调用工具：{', '.join(tool_names)}…")
+            fn_responses = []
+            for part in fc_parts:
+                fc = part.function_call
+                result_str = execute_tool(fc.name, dict(fc.args))
+                fn_responses.append(
+                    genai_types.Part.from_function_response(
+                        name=fc.name,
+                        response={"result": result_str},
+                    )
+                )
+            resp = chat.send_message(
+                fn_responses,
+                generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
+                request_options={"timeout": 180},
+            )
+
+        logger.warning("gemini streaming exceeded MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+        full_text = resp.text
+        yield ("done", full_text)
+
+    else:
+        yield ("error", f"不支持的 AI_PROVIDER: {provider}")
+        yield ("done", "")
+
+
+def _save_ai_conversation(session_id: str, stock_code: str, messages: list) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT INTO ai_conversations(session_id, stock_code, messages, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages, updated_at=excluded.updated_at
+            """,
+            (session_id, stock_code, json.dumps(messages, ensure_ascii=False), now, now),
+        )
+        # 清理 2 小时前的会话
+        conn.execute("DELETE FROM ai_conversations WHERE updated_at < ?", (now - 7200,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("_save_ai_conversation failed: %s", e)
+
+
+def _load_ai_conversation(session_id: str) -> list:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT messages FROM ai_conversations WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return json.loads(row[0])
+    except Exception as e:
+        logger.error("_load_ai_conversation failed: %s", e)
+    return []
+
+
 def call_ai_model(system_prompt: str, user_prompt: str) -> str:
     """统一调用接口，根据 AI_PROVIDER 分发到对应模型"""
     provider = AI_PROVIDER
@@ -3700,6 +3951,264 @@ async def ai_analyze(request: Request, stock_code: str = Form(...), ai_mode: str
         "user_hint":       user_hint,
     })
     return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
+
+
+@app.get("/ai_stream")
+async def ai_stream(request: Request, stock_code: str, ai_mode: str = "intraday", user_hint: str = "", session_id: str = ""):
+    """
+    SSE 端点：首次 AI 分析，流式推送进度和 token。
+    前端通过 EventSource 连接，接收 progress/token/done/error 事件。
+    完成后将对话历史存入 ai_conversations。
+    """
+    import uuid as _uuid
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+
+        # 1. 获取股票数据（在线程池中执行阻塞调用）
+        yield "event: progress\ndata: 正在获取股票行情…\n\n"
+        result = await loop.run_in_executor(None, calculate_8848, stock_code)
+        if result.get("error"):
+            err_msg = json.dumps({"msg": f"获取股票数据失败：{result.get('error')}"}, ensure_ascii=False)
+            yield f"event: error\ndata: {err_msg}\n\n"
+            return
+
+        # 2. 历史数据
+        yield "event: progress\ndata: 加载历史数据…\n\n"
+        history = []
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT date, close, high, low, avg_price, COALESCE(open, close) AS open "
+                "FROM daily_records WHERE code = ? ORDER BY date DESC LIMIT 60",
+                (stock_code,),
+            ).fetchall()
+            conn.close()
+            history = [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning("ai_stream: history load failed %s", e)
+
+        # 3. 构建 prompt
+        yield "event: progress\ndata: 构建分析 Prompt…\n\n"
+
+        def _build_prompts():
+            skills_text = load_skills()
+            system_prompt = (
+                "你是基于阿狼投资体系的 A 股分析助手。"
+                "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
+                + skills_text
+            )
+            index_data = get_index_market_data(days=20)
+            stock_daily_rousu    = analyze_rousu_lines(history, n=10, label="日K")
+            stock_intraday_rousu = analyze_rousu_lines_intraday(stock_code)
+            index_daily_rousu = {}
+            for ts_code, idx_info in index_data.items():
+                idx_records  = idx_info.get("records", [])
+                idx_patterns = analyze_rousu_lines(idx_records, n=5, label="日K")
+                index_daily_rousu[ts_code] = {
+                    "name":     idx_info.get("name", ts_code),
+                    "patterns": idx_patterns,
+                }
+            rousu_data = {
+                "stock_daily":    stock_daily_rousu,
+                "stock_intraday": stock_intraday_rousu,
+                "index_daily":    index_daily_rousu,
+            }
+            user_prompt = build_ai_prompt(
+                result, history,
+                mode=ai_mode,
+                user_hint=user_hint,
+                index_data=index_data,
+                rousu_data=rousu_data,
+            )
+            return system_prompt, user_prompt
+
+        system_prompt, user_prompt = await loop.run_in_executor(None, _build_prompts)
+
+        # 4. 流式 AI 调用
+        yield "event: progress\ndata: AI 分析中…\n\n"
+        messages = [{"role": "user", "content": user_prompt}]
+
+        full_text = ""
+        try:
+            import queue as _queue
+            import threading as _threading
+            q = _queue.Queue()
+
+            def _stream_thread():
+                try:
+                    for evt in call_ai_model_streaming(system_prompt, messages):
+                        q.put(evt)
+                except Exception as ex:
+                    q.put(("error", str(ex)))
+                finally:
+                    q.put(None)  # sentinel
+
+            t = _threading.Thread(target=_stream_thread, daemon=True)
+            t.start()
+
+            last_heartbeat = asyncio.get_event_loop().time()
+            while True:
+                try:
+                    item = q.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.1)
+                    now = asyncio.get_event_loop().time()
+                    if now - last_heartbeat > 15:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = now
+                    continue
+
+                if item is None:
+                    break
+                evt_type, evt_data = item
+                if evt_type == "progress":
+                    payload = json.dumps({"msg": evt_data}, ensure_ascii=False)
+                    yield f"event: progress\ndata: {payload}\n\n"
+                elif evt_type == "token":
+                    payload = json.dumps({"text": evt_data}, ensure_ascii=False)
+                    yield f"event: token\ndata: {payload}\n\n"
+                elif evt_type == "done":
+                    full_text = evt_data
+                elif evt_type == "error":
+                    payload = json.dumps({"msg": evt_data}, ensure_ascii=False)
+                    yield f"event: error\ndata: {payload}\n\n"
+                    return
+        except Exception as e:
+            logger.error("ai_stream: AI call failed %s", e)
+            payload = json.dumps({"msg": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+
+        # 5. 保存对话历史
+        sid = session_id or str(_uuid.uuid4())
+        conv_messages = [
+            {"role": "user",      "content": user_prompt},
+            {"role": "assistant", "content": full_text},
+        ]
+        await loop.run_in_executor(None, _save_ai_conversation, sid, stock_code, conv_messages)
+
+        done_payload = json.dumps({"session_id": sid, "provider": AI_PROVIDER}, ensure_ascii=False)
+        yield f"event: done\ndata: {done_payload}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/ai_chat")
+async def ai_chat(request: Request):
+    """
+    SSE 端点：多轮对话追问。
+    请求体 JSON: {"session_id": "...", "stock_code": "...", "message": "用户追问"}
+    流式推送和 /ai_stream 相同格式的事件。
+    """
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    stock_code  = body.get("stock_code", "")
+    user_message = body.get("message", "").strip()
+
+    if not session_id or not user_message:
+        async def _err():
+            yield f"event: error\ndata: {json.dumps({'msg': '缺少 session_id 或 message'})}\n\n"
+        return StreamingResponse(_err(), media_type="text/event-stream")
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+
+        # 加载历史对话
+        conv_messages = await loop.run_in_executor(None, _load_ai_conversation, session_id)
+        if not conv_messages:
+            payload = json.dumps({"msg": "会话已过期，请重新发起 AI 分析"}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+
+        # 拼接新用户消息
+        conv_messages.append({"role": "user", "content": user_message})
+
+        # 重建 system_prompt（加载 skills）
+        def _load_sys():
+            skills_text = load_skills()
+            return (
+                "你是基于阿狼投资体系的 A 股分析助手。"
+                "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
+                + skills_text
+            )
+        system_prompt = await loop.run_in_executor(None, _load_sys)
+
+        full_text = ""
+        try:
+            import queue as _queue
+            import threading as _threading
+            q = _queue.Queue()
+
+            def _stream_thread():
+                try:
+                    for evt in call_ai_model_streaming(system_prompt, conv_messages):
+                        q.put(evt)
+                except Exception as ex:
+                    q.put(("error", str(ex)))
+                finally:
+                    q.put(None)
+
+            t = _threading.Thread(target=_stream_thread, daemon=True)
+            t.start()
+
+            last_heartbeat = asyncio.get_event_loop().time()
+            while True:
+                try:
+                    item = q.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.1)
+                    now = asyncio.get_event_loop().time()
+                    if now - last_heartbeat > 15:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = now
+                    continue
+
+                if item is None:
+                    break
+                evt_type, evt_data = item
+                if evt_type == "progress":
+                    payload = json.dumps({"msg": evt_data}, ensure_ascii=False)
+                    yield f"event: progress\ndata: {payload}\n\n"
+                elif evt_type == "token":
+                    payload = json.dumps({"text": evt_data}, ensure_ascii=False)
+                    yield f"event: token\ndata: {payload}\n\n"
+                elif evt_type == "done":
+                    full_text = evt_data
+                elif evt_type == "error":
+                    payload = json.dumps({"msg": evt_data}, ensure_ascii=False)
+                    yield f"event: error\ndata: {payload}\n\n"
+                    return
+        except Exception as e:
+            logger.error("ai_chat: failed %s", e)
+            payload = json.dumps({"msg": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+
+        # 更新对话历史
+        conv_messages.append({"role": "assistant", "content": full_text})
+        await loop.run_in_executor(None, _save_ai_conversation, session_id, stock_code, conv_messages)
+
+        done_payload = json.dumps({"session_id": session_id, "provider": AI_PROVIDER}, ensure_ascii=False)
+        yield f"event: done\ndata: {done_payload}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @app.post("/update_common_stocks", response_class=HTMLResponse)
 async def update_common_stocks(request: Request, codes: str = Form(...)):
