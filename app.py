@@ -3177,6 +3177,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
                 claude_messages.append({"role": role, "content": content})
 
         for _round in range(MAX_TOOL_ROUNDS):
+            yield ("progress", f"AI 第 {_round + 1} 轮推理中，请稍候…")
             resp = client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=MAX_TOKENS,
@@ -3198,12 +3199,14 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
 
             if resp.stop_reason == "tool_use":
                 tool_names = [b.name for b in response_content if b.type == "tool_use"]
-                yield ("progress", f"调用工具：{', '.join(tool_names)}…")
+                yield ("progress", f"AI 决定调用 {len(tool_names)} 个工具：{', '.join(tool_names)}")
                 claude_messages.append({"role": "assistant", "content": response_content})
                 tool_results = []
                 for block in response_content:
                     if block.type == "tool_use":
+                        yield ("progress", f"正在获取数据：{block.name}…")
                         result_str = execute_tool(block.name, block.input)
+                        yield ("progress", f"{block.name} 数据就绪，等待下一轮推理…")
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -3236,6 +3239,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
         oai_messages = [{"role": "system", "content": system_prompt}] + list(messages)
 
         for _round in range(MAX_TOOL_ROUNDS):
+            yield ("progress", f"AI 第 {_round + 1} 轮推理中，请稍候…")
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 max_tokens=MAX_TOKENS,
@@ -3256,11 +3260,13 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
             if choice.finish_reason == "tool_calls":
                 msg = choice.message
                 tool_names = [tc.function.name for tc in msg.tool_calls]
-                yield ("progress", f"调用工具：{', '.join(tool_names)}…")
+                yield ("progress", f"AI 决定调用 {len(tool_names)} 个工具：{', '.join(tool_names)}")
                 oai_messages.append(msg.model_dump())
                 for tc in msg.tool_calls:
                     args = json.loads(tc.function.arguments)
+                    yield ("progress", f"正在获取数据：{tc.function.name}…")
                     result_str = execute_tool(tc.function.name, args)
+                    yield ("progress", f"{tc.function.name} 数据就绪，等待下一轮推理…")
                     oai_messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -3306,6 +3312,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
                 pass
 
         user_content = last_user["content"] if last_user else ""
+        yield ("progress", "AI 第 1 轮推理中，请稍候…")
         resp = chat.send_message(
             user_content,
             generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
@@ -3325,17 +3332,20 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
                 return
 
             tool_names = [p.function_call.name for p in fc_parts]
-            yield ("progress", f"调用工具：{', '.join(tool_names)}…")
+            yield ("progress", f"AI 决定调用 {len(tool_names)} 个工具：{', '.join(tool_names)}")
             fn_responses = []
             for part in fc_parts:
                 fc = part.function_call
+                yield ("progress", f"正在获取数据：{fc.name}…")
                 result_str = execute_tool(fc.name, dict(fc.args))
+                yield ("progress", f"{fc.name} 数据就绪，等待下一轮推理…")
                 fn_responses.append(
                     genai_types.Part.from_function_response(
                         name=fc.name,
                         response={"result": result_str},
                     )
                 )
+            yield ("progress", f"AI 第 {_round + 2} 轮推理中，请稍候…")
             resp = chat.send_message(
                 fn_responses,
                 generation_config=genai_types.GenerationConfig(max_output_tokens=MAX_TOKENS),
