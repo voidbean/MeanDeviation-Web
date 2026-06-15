@@ -43,21 +43,28 @@ uv run python fetch_history.py --backfill  # last 90 days (first-time init)
 All application logic lives in `app.py` — no separate modules. Key sections:
 
 - **AI provider config** (top of file): reads `AI_PROVIDER` env var to select Claude / OpenAI / Gemini. `call_ai_model()` dispatches to the correct SDK.
-- **SQLite persistence** (`stock_cache.db`): four tables managed inline:
+- **SQLite persistence** (`stock_cache.db`): five tables managed inline:
   - `stock_name_cache` — stock code → name, two-layer cache (in-memory dict + SQLite)
   - `daily_records` — OHLC + avg_price per (date, code), written on every query and by `fetch_history.py`
   - `portfolio` — per-stock cost price, stage high/low, historical max price for dynamic stop-profit
   - `query_history` — last 50 queries, shown in the UI sidebar
+  - `ai_conversations` — multi-turn chat history keyed by `session_id`; auto-purged after 2 hours
 - **8848 formula**: `upper_line = avg_price / 0.98848`, `lower_line = avg_price * 0.98848`, where `avg_price = amount / volume` from real-time quote
 - **Strategy signals** (`calculate_strategy()`): holding mode uses dynamic stop-profit based on `max_price`; watching mode uses Fibonacci levels (38.2%, 61.8%, 78.6%) derived from user-set stage high/low
-- **AI analysis** (`/ai_analyze`): loads all `skills/*.md` files as system prompt, builds a structured user prompt with current quote + 60-day history + 20-day market index data, then calls `call_ai_model_with_tools()` which runs an agentic tool-use loop
+- **AI analysis**: three endpoints:
+  - `/ai_analyze` (POST) — legacy synchronous path, still works, redirects to `/?result_id=`
+  - `/ai_stream` (GET, SSE) — streaming analysis; frontend connects via `EventSource`, receives `progress` / `token` / `done` / `error` events. On completion, saves conversation to `ai_conversations` and returns `session_id`.
+  - `/ai_chat` (POST, SSE) — follow-up chat; loads history by `session_id`, appends user message, streams reply, saves updated history.
+- **`call_ai_model_streaming()`**: sync generator that yields `(event_type, data)` tuples. Tool-call rounds emit `progress` events; final text is chunked into `token` events. Runs in a background thread via `queue.Queue` so the async SSE generator can poll without blocking the event loop. A `: heartbeat` SSE comment is sent every 15 s to prevent browser timeout during long AI calls.
 - **Tool use layer**: `TOOL_DEFINITIONS` → `_build_claude/openai/gemini_tools()` → `execute_tool()` → `_tool_*()` functions. The LLM can call up to `MAX_TOOL_ROUNDS=5` rounds of tools before the loop exits. `call_ai_model()` (no tools) is kept as a fallback.
 
 ### `fetch_history.py`
 Standalone script (not imported by `app.py`) that pulls daily OHLC from Tushare Pro API and upserts into `daily_records`. Run manually or via cron. Requires `TUSHARE_TOKEN`.
 
 ### `templates/index.html`
-Single Jinja2 template rendering the entire UI. All pages are server-side rendered — no JS framework. Form POSTs trigger page reloads.
+Single Jinja2 template rendering the entire UI. Most pages are server-side rendered with Form POSTs triggering page reloads. Exception: the AI analysis button calls `startAiStream()` (global JS function) which opens an `EventSource` to `/ai_stream` and streams results in-place without a page reload. After analysis completes a chat input appears for follow-up questions via `/ai_chat`.
+
+**Important**: `startAiStream()` and `sendAiChat()` must be defined in the **global JS scope** (outside `DOMContentLoaded`), not inside it — they are referenced by `onclick` attributes in the HTML.
 
 ### `skills/` directory
 Markdown files (`01_*.md` through `11_*.md`) containing the "阿狼投资体系" trading methodology. Loaded at AI analysis time by `load_skills()` and injected as the LLM system prompt. `agent_prompt_template.md` contains the recommended agent invocation pattern.
@@ -102,4 +109,5 @@ Markdown files (`01_*.md` through `11_*.md`) containing the "阿狼投资体系"
 - **`max_price` auto-update**: on every query while `cost_price > 0`, if today's high exceeds the stored `max_price`, it is saved immediately — no manual intervention needed.
 - **Stock code normalization**: both `app.py` and `fetch_history.py` contain a `to_ts_code()` helper that converts `600519` / `sh600519` / `600519.SH` to Tushare Pro format. Keep them in sync if modifying.
 - **AI timeout**: `call_ai_model_with_tools()` uses 180-second timeout (vs 120s for the no-tool version) to accommodate multi-round tool loops. `MAX_TOOL_ROUNDS=5` prevents infinite loops.
+- **SSE streaming pattern**: `call_ai_model_streaming()` is a sync generator run in a `threading.Thread`; events are passed through a `queue.Queue` to the async FastAPI generator. This avoids blocking the uvicorn event loop during long AI calls. Both `/ai_stream` and `/ai_chat` use this pattern.
 - **`daily_records.amount` column**: stores trading amount in 千元 (same unit as `pro.daily`). Index data from `pro.index_daily` also uses 千元. Display conversion: `amount / 100000` = 亿元.

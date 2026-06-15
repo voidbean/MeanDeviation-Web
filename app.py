@@ -2396,19 +2396,6 @@ def _tool_get_technical_indicators(ts_code: str) -> dict:
         else:
             boll_position = "价格在BOLL中轨与下轨之间（弱势区间）"
 
-    latest_close = closes[-1]
-    latest_date  = rows[-1][0]
-
-    # 均线多空排列判断
-    ma_trend = "数据不足"
-    if ma5 and ma10 and ma20:
-        if ma5 > ma10 > ma20:
-            ma_trend = "多头排列（MA5>MA10>MA20，趋势向上）"
-        elif ma5 < ma10 < ma20:
-            ma_trend = "空头排列（MA5<MA10<MA20，趋势向下）"
-        else:
-            ma_trend = "均线纠缠（无明确趋势）"
-
     return {
         "ts_code": ts_code,
         "latest_date": latest_date,
