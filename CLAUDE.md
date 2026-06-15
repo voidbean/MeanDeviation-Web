@@ -78,6 +78,7 @@ Markdown files (`01_*.md` through `11_*.md`) containing the "阿狼投资体系"
 | `AI_PROVIDER` | `claude` | `claude` / `openai` / `gemini` |
 | `CLAUDE_API_KEY` / `CLAUDE_MODEL` / `CLAUDE_BASE_URL` | — | Claude config; `CLAUDE_BASE_URL` enables proxy/compatible endpoints |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | — | OpenAI config; `OPENAI_BASE_URL` supports DeepSeek, local Ollama, etc. |
+| `OPENAI_MAX_TOKENS` | `16384` | OpenAI/兼容接口的 max_tokens；DeepSeek-R1 等推理模型会先消耗 reasoning token，建议保持默认或更高 |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | — | Gemini config |
 
 ### Tool Use Architecture

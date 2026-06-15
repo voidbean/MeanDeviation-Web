@@ -48,6 +48,7 @@ CLAUDE_BASE_URL  = os.getenv("CLAUDE_BASE_URL", "")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
 OPENAI_BASE_URL  = os.getenv("OPENAI_BASE_URL", "")
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
@@ -3067,12 +3068,16 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
         for _round in range(MAX_TOOL_ROUNDS):
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
-                max_tokens=MAX_TOKENS,
+                max_tokens=OPENAI_MAX_TOKENS,
                 tools=openai_tools,
                 messages=messages,
             )
             choice = resp.choices[0]
             logger.info("openai tool_use round=%d finish_reason=%s", _round, choice.finish_reason)
+
+            if choice.finish_reason == "length":
+                logger.warning("openai tool_use round=%d truncated by max_tokens=%d", _round, OPENAI_MAX_TOKENS)
+                return choice.message.content or ""
 
             if choice.finish_reason == "stop":
                 return choice.message.content or ""
@@ -3242,12 +3247,21 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
             yield ("progress", f"AI 第 {_round + 1} 轮推理中，请稍候…")
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
-                max_tokens=MAX_TOKENS,
+                max_tokens=OPENAI_MAX_TOKENS,
                 tools=openai_tools,
                 messages=oai_messages,
             )
             choice = resp.choices[0]
             logger.info("openai streaming round=%d finish_reason=%s", _round, choice.finish_reason)
+
+            if choice.finish_reason == "length":
+                logger.warning("openai streaming round=%d truncated by max_tokens=%d", _round, OPENAI_MAX_TOKENS)
+                full_text = choice.message.content or ""
+                chunk_size = 4
+                for i in range(0, len(full_text), chunk_size):
+                    yield ("token", full_text[i:i+chunk_size])
+                yield ("done", full_text)
+                return
 
             if choice.finish_reason == "stop":
                 full_text = choice.message.content or ""
