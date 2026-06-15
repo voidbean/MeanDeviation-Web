@@ -4213,6 +4213,20 @@ async def update_common_stocks(request: Request, codes: str = Form(...)):
     return RedirectResponse(url="/", status_code=303)
 
 
+@app.post("/update_ai_provider", response_class=HTMLResponse)
+async def update_ai_provider(request: Request, provider: str = Form(...)):
+    """热切换 AI provider，无需重启。"""
+    global AI_PROVIDER
+    allowed = {"claude", "openai", "gemini"}
+    provider = provider.strip().lower()
+    if provider not in allowed:
+        return RedirectResponse(url="/", status_code=303)
+    AI_PROVIDER = provider
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    _update_env_key(env_path, "AI_PROVIDER", provider)
+    return RedirectResponse(url="/", status_code=303)
+
+
 @app.post("/clear_history", response_class=HTMLResponse)
 async def clear_history(request: Request):
     """清空查询历史记录。"""
