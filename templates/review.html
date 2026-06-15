@@ -269,11 +269,32 @@
                 </div>
             </div>
 
+            <!-- 导入结果提示 -->
+            {% if imported is not none %}
+            <div class="alert alert-success alert-dismissible fade show py-2" role="alert">
+                成功导入 {{ imported }} 条记录（已存在的自动跳过）。
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            {% endif %}
+            {% if import_error %}
+            <div class="alert alert-danger alert-dismissible fade show py-2" role="alert">
+                导入失败：文件格式不正确，请上传从本系统导出的 JSON 文件。
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            {% endif %}
+
             <!-- 历史记录列表 -->
             <div class="card shadow-sm">
                 <div class="card-header d-flex justify-content-between align-items-center">
                     <span class="fw-bold">交易记录</span>
-                    <span class="badge bg-secondary">共 {{ trades|length }} 条</span>
+                    <div class="d-flex gap-2 align-items-center">
+                        <span class="badge bg-secondary">共 {{ trades|length }} 条</span>
+                        <a href="/review/export" class="btn btn-xs btn-outline-secondary" title="导出为 JSON">导出</a>
+                        <button class="btn btn-xs btn-outline-secondary" onclick="document.getElementById('import-file-input').click()" title="从 JSON 导入">导入</button>
+                        <form id="import-form" method="post" action="/review/import" enctype="multipart/form-data" class="d-none">
+                            <input type="file" id="import-file-input" name="file" accept=".json" onchange="document.getElementById('import-form').submit()">
+                        </form>
+                    </div>
                 </div>
                 <div class="card-body p-0">
                     {% if trades %}
@@ -340,6 +361,18 @@
                                                 查看
                                             </button>
                                             {% endif %}
+                                            <!-- 编辑按钮 -->
+                                            <button class="btn btn-xs btn-outline-secondary"
+                                                    onclick="openEditModal({{ t.id }})"
+                                                    title="编辑此条记录">
+                                                编辑
+                                            </button>
+                                            <!-- 删除按钮 -->
+                                            <form method="post" action="/review/delete" class="d-inline"
+                                                  onsubmit="return confirm('确认删除这条记录？')">
+                                                <input type="hidden" name="trade_id" value="{{ t.id }}">
+                                                <button type="submit" class="btn btn-xs btn-outline-danger" title="删除">删</button>
+                                            </form>
                                         </div>
                                     </td>
                                 </tr>
@@ -464,6 +497,88 @@
         document.body.appendChild(form);
         form.submit();
     }
+
+    // 编辑 modal
+    function openEditModal(tradeId) {
+        fetch('/review/edit?id=' + tradeId)
+            .then(function(r) { return r.json(); })
+            .then(function(t) {
+                document.getElementById('edit-trade-id').value    = t.id;
+                document.getElementById('edit-trade-time').value  = t.trade_time.replace(' ', 'T').slice(0, 16);
+                document.getElementById('edit-direction').value   = t.direction;
+                document.getElementById('edit-price').value       = t.price;
+                document.getElementById('edit-volume').value      = t.volume;
+                document.getElementById('edit-emotion').value     = t.emotion;
+                document.getElementById('edit-thought').value     = t.thought || '';
+                var modal = new bootstrap.Modal(document.getElementById('editModal'));
+                modal.show();
+            });
+    }
 </script>
+
+<!-- 编辑 Modal -->
+<div class="modal fade" id="editModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold">编辑交易记录</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="post" action="/review/edit">
+                <div class="modal-body">
+                    <input type="hidden" name="trade_id" id="edit-trade-id">
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">操作时间</label>
+                        <input type="datetime-local" name="trade_time" id="edit-trade-time" class="form-control" required>
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label fw-semibold">操作方向</label>
+                            <select name="direction" id="edit-direction" class="form-select">
+                                <option value="买入">🟢 买入</option>
+                                <option value="加仓">📈 加仓</option>
+                                <option value="减仓">📉 减仓</option>
+                                <option value="卖出">🔴 卖出</option>
+                            </select>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label fw-semibold">情绪状态</label>
+                            <select name="emotion" id="edit-emotion" class="form-select">
+                                <option value="冷静">😌 冷静</option>
+                                <option value="有点冲动">😤 有点冲动</option>
+                                <option value="很纠结">😰 很纠结</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label fw-semibold">成交价格</label>
+                            <div class="input-group">
+                                <input type="number" name="price" id="edit-price" class="form-control" step="0.0001" min="0.0001" required>
+                                <span class="input-group-text">元</span>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label fw-semibold">手数</label>
+                            <div class="input-group">
+                                <input type="number" name="volume" id="edit-volume" class="form-control" min="1" required>
+                                <span class="input-group-text">手</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label fw-semibold">当时的想法</label>
+                        <textarea name="thought" id="edit-thought" class="form-control" rows="3"></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">取消</button>
+                    <button type="submit" class="btn btn-primary btn-sm">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 </body>
 </html>

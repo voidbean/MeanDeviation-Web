@@ -1,5 +1,5 @@
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import threading
@@ -4591,7 +4591,8 @@ async def sector_analyze(request: Request, user_hint: str = Form("")):
 # ── 交易复盘路由 ──────────────────────────────────────────────────────────────
 
 @app.get("/review", response_class=HTMLResponse)
-async def review_page(request: Request, result_id: str = None, type: str = None):
+async def review_page(request: Request, result_id: str = None, type: str = None,
+                      imported: int = None, import_error: int = None):
     """复盘主页：展示录入表单 + 历史记录列表"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -4639,6 +4640,8 @@ async def review_page(request: Request, result_id: str = None, type: str = None)
         "stage_end":         stage_end,
         "stage_count":       stage_count,
         "query_history":     deduped_history,
+        "imported":          imported,
+        "import_error":      import_error,
     })
 
 
@@ -4986,3 +4989,111 @@ async def review_confirm_profile(
         "success":   success,
         "error_msg": error_msg,
     })
+
+
+# ── 交易记录编辑 ─────────────────────────────────────────────────
+@app.get("/review/edit", response_class=HTMLResponse)
+async def review_edit_get(request: Request, id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM trade_log WHERE id=?", (id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return RedirectResponse("/review", status_code=303)
+    return JSONResponse(dict(row))
+
+
+@app.post("/review/edit", response_class=HTMLResponse)
+async def review_edit_post(
+    request:    Request,
+    trade_id:   int   = Form(...),
+    trade_time: str   = Form(...),
+    direction:  str   = Form(...),
+    price:      float = Form(...),
+    volume:     int   = Form(...),
+    thought:    str   = Form(""),
+    emotion:    str   = Form("冷静"),
+):
+    trade_time = trade_time.replace("T", " ")
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE trade_log SET trade_time=?, direction=?, price=?, volume=?, thought=?, emotion=? WHERE id=?",
+            (trade_time, direction, price, volume, thought, emotion, trade_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse("/review", status_code=303)
+
+
+@app.post("/review/delete", response_class=HTMLResponse)
+async def review_delete(request: Request, trade_id: int = Form(...)):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("DELETE FROM trade_log WHERE id=?", (trade_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse("/review", status_code=303)
+
+
+# ── 导出 / 导入 ──────────────────────────────────────────────────
+@app.get("/review/export")
+async def review_export():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM trade_log ORDER BY trade_time ASC").fetchall()
+    finally:
+        conn.close()
+    data = [dict(r) for r in rows]
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=trade_log.json"},
+    )
+
+
+@app.post("/review/import", response_class=HTMLResponse)
+async def review_import(request: Request, file: UploadFile = File(...)):
+    try:
+        raw = await file.read()
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            raise ValueError("JSON 根节点需为数组")
+    except Exception as e:
+        logger.error("review_import: parse error %s", e)
+        return RedirectResponse("/review?import_error=1", status_code=303)
+
+    required = {"code", "name", "trade_time", "direction", "price", "volume"}
+    inserted = 0
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        for r in records:
+            if not required.issubset(r.keys()):
+                continue
+            conn.execute(
+                """INSERT OR IGNORE INTO trade_log
+                   (id, code, name, trade_time, direction, price, volume, thought, emotion,
+                    review_result, reviewed_at, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    r.get("id"),
+                    r["code"], r["name"], r["trade_time"],
+                    r["direction"], r["price"], r["volume"],
+                    r.get("thought", ""), r.get("emotion", "冷静"),
+                    r.get("review_result"), r.get("reviewed_at"),
+                    r.get("created_at"),
+                ),
+            )
+            inserted += conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info("review_import: inserted %d records", inserted)
+    return RedirectResponse(f"/review?imported={inserted}", status_code=303)
