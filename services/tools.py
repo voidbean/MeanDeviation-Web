@@ -5,7 +5,7 @@ import sqlite3
 
 import tushare as ts
 
-from config import (
+from core.config import (
     DB_PATH, logger, pro,
     AI_PROVIDER,
     CLAUDE_API_KEY, CLAUDE_MODEL, CLAUDE_BASE_URL,

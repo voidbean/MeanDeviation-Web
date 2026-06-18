@@ -2,7 +2,7 @@ import sqlite3
 import time
 import json
 
-from config import DB_PATH, STOCK_NAME_CACHE, logger
+from core.config import DB_PATH, STOCK_NAME_CACHE, logger
 
 # 三大指数代码与名称
 INDEX_CODES = [
@@ -78,7 +78,6 @@ def init_db():
             """)
             conn.commit()
 
-            # ── 迁移 ─────────────────────────────────────────────────────────
             for stmt, label in [
                 ("ALTER TABLE portfolio ADD COLUMN max_price REAL DEFAULT 0",    "max_price"),
                 ("ALTER TABLE daily_records ADD COLUMN amount REAL DEFAULT 0",   "amount"),

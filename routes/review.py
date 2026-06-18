@@ -6,13 +6,13 @@ from pathlib import Path
 from fastapi import File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from config import logger, DB_PATH
-from db import (
+from core.config import logger, DB_PATH
+from core.db import (
     get_query_history,
     save_temp_result, load_temp_result,
     get_klines_around_date,
 )
-from tools import call_ai_model_with_tools
+from services.tools import call_ai_model_with_tools
 
 TRADING_PROFILE_PATH = Path(__file__).parent / "skills" / "personal" / "trading_profile.md"
 
@@ -86,8 +86,8 @@ def _register_routes(app, templates):
         thought:    str   = Form(""),
         emotion:    str   = Form("冷静"),
     ):
-        from app import to_ts_code
-        from db import get_cached_name
+        from core.strategy import to_ts_code
+        from core.db import get_cached_name
         trade_time = trade_time.replace("T", " ")
         ts_code = to_ts_code(code)
         name = get_cached_name(ts_code) or ts_code
@@ -106,7 +106,7 @@ def _register_routes(app, templates):
 
     @app.post("/review/analyze", response_class=HTMLResponse)
     async def review_analyze(request: Request, trade_id: int = Form(...)):
-        from app import build_review_prompt
+        from core.strategy import build_review_prompt
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
@@ -178,7 +178,7 @@ def _register_routes(app, templates):
             trade_date = t["trade_time"][:10]
             klines_map[t["id"]] = get_klines_brief(t["code"], trade_date, before_n=5)
 
-        from app import load_skills
+        from core.strategy import load_skills
         system_prompt, user_prompt = build_stage_review_prompt(trades, klines_map, load_skills())
 
         logger.info("stage_analyze: start=%s end=%s count=%d", start_date, end_date, len(trades))

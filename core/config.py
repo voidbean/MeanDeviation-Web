@@ -7,8 +7,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 项目根目录（core/ 的上一级）
+_ROOT = Path(__file__).parent.parent
+
 logging.basicConfig(
-    filename=os.path.join(os.path.dirname(__file__), "app.log"),
+    filename=str(_ROOT / "app.log"),
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
@@ -26,7 +29,7 @@ OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
-SKILLS_DIR = Path(__file__).parent / "skills"
+SKILLS_DIR = _ROOT / "skills"
 
 # Tushare
 TS_TOKEN = os.getenv("TUSHARE_TOKEN", "")
@@ -37,7 +40,7 @@ if TS_TOKEN:
 
 # SQLite
 STOCK_NAME_CACHE: dict = {}
-DB_PATH = os.path.join(os.path.dirname(__file__), "stock_cache.db")
+DB_PATH = str(_ROOT / "stock_cache.db")
 
 
 def load_common_stocks() -> list:

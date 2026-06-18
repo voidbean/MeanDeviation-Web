@@ -5,14 +5,14 @@ import uuid
 from fastapi import Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-import config as _cfg
-from config import logger, DB_PATH, pro
-from db import (
+import core.config as _cfg
+from core.config import logger, DB_PATH, pro
+from core.db import (
     get_cached_name,
     save_temp_result, load_temp_result,
     get_index_market_data,
 )
-from tools import call_ai_model
+from services.tools import call_ai_model
 
 # app 和 templates 在注册时注入
 _app = None
@@ -54,7 +54,7 @@ def _register_routes(app, templates):
             len(sector_data["errors"]),
         )
 
-        from app import load_skills, to_ts_code
+        from core.strategy import load_skills, to_ts_code
         skills_text = load_skills()
         system_prompt = (
             "你是基于阿狼投资体系的 A 股板块轮动分析助手。"
@@ -90,7 +90,7 @@ def build_sector_prompt_data() -> dict:
     每个 Tushare 接口独立 try/except，失败时 logger.warning 并填充空值，不崩溃。
     """
     from datetime import datetime, timedelta
-    from app import to_ts_code
+    from core.strategy import to_ts_code
 
     result = {
         "sector_perf": [],
