@@ -6,7 +6,7 @@ from fastapi.templating import Jinja2Templates
 
 from core.config import logger
 from core.db import init_db
-from services.tools import _intraday_bg_loop
+from services.indicators import _intraday_bg_loop
 
 
 @asynccontextmanager

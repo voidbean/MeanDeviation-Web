@@ -12,7 +12,7 @@ from core.db import (
     save_temp_result, load_temp_result,
     get_klines_around_date,
 )
-from services.tools import call_ai_model_with_tools
+from services.ai import call_ai_model_with_tools
 
 TRADING_PROFILE_PATH = Path(__file__).parent / "skills" / "personal" / "trading_profile.md"
 

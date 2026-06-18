@@ -12,7 +12,7 @@ from core.db import (
     save_temp_result, load_temp_result,
     get_index_market_data,
 )
-from services.tools import call_ai_model
+from services.ai import call_ai_model
 
 # app 和 templates 在注册时注入
 _app = None
