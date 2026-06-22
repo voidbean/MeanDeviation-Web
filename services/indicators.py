@@ -84,7 +84,9 @@ def _fetch_and_save_intraday_snapshots() -> None:
     try:
         conn = sqlite3.connect(DB_PATH)
         try:
-            conn.execute("DELETE FROM intraday_snapshots WHERE date != ?", (today,))
+            import datetime as _dt
+            cutoff = (_dt.date.today() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+            conn.execute("DELETE FROM intraday_snapshots WHERE date < ?", (cutoff,))
             conn.commit()
         finally:
             conn.close()
@@ -219,6 +221,119 @@ def _build_intraday_candles(points: list, window_minutes: int = 30) -> list:
 
 
 # ── 揉搓线分析 ───────────────────────────────────────────────────────────────
+
+def get_intraday_volatility_stats(code: str, n_days: int = 7) -> dict | None:
+    """
+    从历史分时快照计算该股近N个交易日的日内波动特征，用于指导条件单参数设置。
+    返回：
+      - avg_upper_shadow_pct: 近N日 (日内最高 - 收盘) / 收盘 均值，对应"冲高后典型回落幅度"
+      - avg_lower_shadow_pct: 近N日 (收盘 - 日内最低) / 收盘 均值，对应"低点后典型反弹幅度"
+      - avg_daily_range_pct:  近N日 (最高 - 最低) / 收盘 均值，对应"日内总振幅"
+      - days_used: 实际用到的天数
+    """
+    bare_code = code.split(".")[0] if "." in code else code
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            import datetime as _dt
+            cutoff = (_dt.date.today() - _dt.timedelta(days=n_days + 3)).strftime("%Y-%m-%d")
+            rows = conn.execute(
+                """
+                SELECT date,
+                       MAX(price) AS day_high,
+                       MIN(price) AS day_low,
+                       MAX(CASE WHEN time = (SELECT MAX(time) FROM intraday_snapshots s2
+                                             WHERE s2.code = s1.code AND s2.date = s1.date)
+                                THEN price END) AS day_close
+                FROM intraday_snapshots s1
+                WHERE code = ? AND date >= ?
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                (bare_code, cutoff, n_days),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("get_intraday_volatility_stats: DB error code=%s %s", code, e)
+        return None
+
+    if not rows:
+        return None
+
+    upper_shadows, lower_shadows, ranges = [], [], []
+    for _date, day_high, day_low, day_close in rows:
+        if not day_close or day_close <= 0:
+            continue
+        upper_shadows.append((day_high - day_close) / day_close * 100)
+        lower_shadows.append((day_close - day_low) / day_close * 100)
+        ranges.append((day_high - day_low) / day_close * 100)
+
+    if not upper_shadows:
+        return None
+
+    return {
+        "avg_upper_shadow_pct": round(sum(upper_shadows) / len(upper_shadows), 2),
+        "avg_lower_shadow_pct": round(sum(lower_shadows) / len(lower_shadows), 2),
+        "avg_daily_range_pct":  round(sum(ranges) / len(ranges), 2),
+        "days_used": len(upper_shadows),
+        "source": "intraday",
+    }
+
+
+def get_daily_volatility_stats(code: str, n_days: int = 20) -> dict | None:
+    """
+    从日K记录计算波动特征，作为分时数据缺失时的 fallback。
+    上影线用 (high - close) / close，下影线用 (close - low) / close。
+    """
+    bare_code = code.split(".")[0] if "." in code else code
+    ts_code   = code if "." in code else None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = None
+        for q in ([ts_code, bare_code] if ts_code else [bare_code]):
+            if not q:
+                continue
+            cur = conn.execute(
+                "SELECT high, low, close FROM daily_records "
+                "WHERE code = ? AND high > 0 AND low > 0 AND close > 0 "
+                "ORDER BY date DESC LIMIT ?",
+                (q, n_days),
+            )
+            rows = cur.fetchall()
+            if rows:
+                break
+        conn.close()
+    except Exception as e:
+        logger.error("get_daily_volatility_stats: DB error code=%s %s", code, e)
+        return None
+
+    if not rows:
+        return None
+
+    upper_shadows, lower_shadows, ranges = [], [], []
+    for high, low, close in rows:
+        upper_shadows.append((high - close) / close * 100)
+        lower_shadows.append((close - low)  / close * 100)
+        ranges.append((high - low) / close * 100)
+
+    return {
+        "avg_upper_shadow_pct": round(sum(upper_shadows) / len(upper_shadows), 2),
+        "avg_lower_shadow_pct": round(sum(lower_shadows) / len(lower_shadows), 2),
+        "avg_daily_range_pct":  round(sum(ranges) / len(ranges), 2),
+        "days_used": len(upper_shadows),
+        "source": "daily_kline",
+    }
+
+
+def get_volatility_stats(code: str) -> dict | None:
+    """优先使用分时快照，没有则 fallback 到日K影线法。"""
+    stats = get_intraday_volatility_stats(code, n_days=7)
+    if stats:
+        return stats
+    return get_daily_volatility_stats(code, n_days=20)
+
 
 def analyze_rousu_lines(records: list, n: int = 10, label: str = "日K") -> list:
     INTERPRETATIONS = {
