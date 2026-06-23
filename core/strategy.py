@@ -365,7 +365,10 @@ def build_review_prompt(trade: dict, stock_klines: list, index_klines: list) -> 
     skills_text = load_skills()
 
     system_prompt = (
-        "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行复盘分析。\n\n"
+        "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行复盘分析。\n"
+        "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
+        "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
+        "在复盘分析和评价操作时必须以此规则为前提，评估买卖时序是否合规。\n\n"
         + skills_text
         + "\n\n## 复盘分析框架\n\n"
         "对每笔操作，从以下维度评判：\n"

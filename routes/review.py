@@ -397,7 +397,10 @@ def get_klines_brief(code: str, center_date: str, before_n: int = 5) -> dict:
 
 def build_stage_review_prompt(trades: list, klines_map: dict, skills_text: str) -> tuple:
     system_prompt = (
-        "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行阶段性复盘分析。\n\n"
+        "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行阶段性复盘分析。\n"
+        "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
+        "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
+        "在复盘分析和评价操作时必须以此规则为前提，评估买卖时序是否合规。\n\n"
         + skills_text
         + "\n\n## 阶段复盘分析框架\n\n"
         "你将收到一段时间内的多笔交易记录（可能涉及多只股票）。\n"
