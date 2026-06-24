@@ -26,6 +26,25 @@
         #ai-result hr { margin: 0.6rem 0; border-color: #dee2e6; }
         #ai-result code { background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.82rem; }
         #ai-result blockquote { border-left: 3px solid #5b4fcf; padding-left: 0.8rem; color: #555; margin: 0.5rem 0; }
+        /* 行业 tag 过滤 pills */
+        .tag-pills .btn { font-size: 0.75rem; padding: 0.15rem 0.55rem; }
+        /* 行业 badge */
+        .stock-tag-badge { font-size: 0.68rem; padding: 0.15em 0.45em; cursor: pointer; border-radius: 3px; background:#6c757d; color:#fff; }
+        /* tag 输入框：去掉边框，底线样式 */
+        .tag-text-input {
+            border: none;
+            border-bottom: 1px solid #ced4da;
+            border-radius: 0;
+            background: transparent;
+            box-shadow: none !important;
+            font-size: 0.8rem;
+            color: #495057;
+        }
+        .tag-text-input:focus {
+            border-bottom-color: #86b7fe;
+            background: transparent;
+            outline: none;
+        }
     </style>
 </head>
 <body>
@@ -683,6 +702,11 @@
             <form id="common-stocks-form" action="/update_common_stocks" method="post" class="d-none">
                 <input type="hidden" id="common-stocks-codes" name="codes" value="">
             </form>
+            {# 隐藏 form：设置行业 tag #}
+            <form id="tag-form" action="/update_stock_tag" method="post" class="d-none">
+                <input type="hidden" id="tag-form-code" name="code" value="">
+                <input type="hidden" id="tag-form-tag"  name="tag"  value="">
+            </form>
 
             <div class="card shadow-sm mb-3">
                 <div class="card-header bg-white d-flex justify-content-between align-items-center">
@@ -690,6 +714,16 @@
                 </div>
                 <div class="card-body">
                     {% if common_stocks %}
+                        {# 行业过滤 pills #}
+                        {% set all_tags = common_stocks | map(attribute='tag') | select | list | unique | list %}
+                        {% if all_tags %}
+                        <div class="tag-pills d-flex flex-wrap gap-1 mb-2" id="tag-filter-pills">
+                            <button type="button" class="btn btn-secondary btn-sm active" onclick="filterByTag('')" id="pill-all">全部</button>
+                            {% for t in all_tags %}
+                            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="filterByTag('{{ t }}')" id="pill-{{ t }}">{{ t }}</button>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
                         <div class="table-responsive mb-2">
                             <table class="table table-sm table-hover mb-0">
                                 <thead>
@@ -699,11 +733,24 @@
                                     <th scope="col"></th>
                                 </tr>
                                 </thead>
-                                <tbody>
+                                <tbody id="common-stocks-tbody">
                                 {% for s in common_stocks %}
-                                    <tr>
+                                    <tr data-tag="{{ s.tag }}">
                                         <td>{{ s.code }}</td>
-                                        <td>{{ s.name }}</td>
+                                        <td>
+                                            {{ s.name }}
+                                            {% if s.tag %}
+                                            <span class="stock-tag-badge ms-1"
+                                                  data-tag-name="{{ s.tag }}"
+                                                  onclick="openTagModal('{{ s.code }}', '{{ s.tag }}')"
+                                                  title="点击修改行业">{{ s.tag }}</span>
+                                            {% else %}
+                                            <span class="stock-tag-badge ms-1"
+                                                  style="background:#adb5bd;"
+                                                  onclick="openTagModal('{{ s.code }}', '')"
+                                                  title="点击设置行业">+行业</span>
+                                            {% endif %}
+                                        </td>
                                         <td>
                                             <button type="button"
                                                     class="btn btn-link btn-sm text-danger p-0"
@@ -724,11 +771,22 @@
                     {% endif %}
 
                     {# 新增股票输入区 #}
-                    <div class="input-group input-group-sm mt-2">
-                        <input type="text" id="add-stock-input" class="form-control"
-                               placeholder="输入代码，如 000001">
-                        <button type="button" class="btn btn-outline-success"
-                                onclick="addStock()">添加</button>
+                    <div class="mt-2">
+                        <div class="input-group input-group-sm mb-1">
+                            <input type="text" id="add-stock-input" class="form-control"
+                                   placeholder="输入代码，如 000001">
+                            <input type="text" id="add-stock-tag" class="form-control tag-text-input"
+                                   placeholder="行业（可选）" list="tag-datalist" style="max-width:100px;">
+                            <datalist id="tag-datalist">
+                                {% set _default_tags = ['白酒','银行','科技','新能源','消费','医药','券商','地产'] %}
+                                {% set _used_tags = tag_suggestions | default([]) %}
+                                {% for t in (_used_tags + _default_tags) | unique %}
+                                <option value="{{ t }}">
+                                {% endfor %}
+                            </datalist>
+                            <button type="button" class="btn btn-outline-success"
+                                    onclick="addStock()">添加</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -819,6 +877,26 @@
     </div>
 </div>
 
+<!-- 行业 tag 编辑 Modal -->
+<div class="modal fade" id="tagModal" tabindex="-1" aria-labelledby="tagModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header py-2">
+                <h6 class="modal-title" id="tagModalLabel">设置行业分类</h6>
+                <button type="button" class="btn-close btn-sm" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body py-2">
+                <input type="text" id="tag-modal-input" class="form-control form-control-sm tag-text-input"
+                       placeholder="输入或选择行业" list="tag-datalist">
+            </div>
+            <div class="modal-footer py-2">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary btn-sm" onclick="saveTagModal()">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
@@ -829,6 +907,31 @@
         const lowInput  = document.getElementById('input-stage-low');
         if (highInput) { highInput.value = high; highInput.classList.remove('border-warning'); }
         if (lowInput)  { lowInput.value  = low;  lowInput.classList.remove('border-warning');  }
+    }
+
+    // tag → 颜色，固定映射 + 动态 hash 兜底
+    const _tagColorMap = {
+        '白酒':   '#c0392b',
+        '银行':   '#1a5276',
+        '科技':   '#1f618d',
+        '新能源': '#1e8449',
+        '消费':   '#d68910',
+        '医药':   '#6c3483',
+        '券商':   '#117a65',
+        '地产':   '#784212',
+    };
+    const _tagPalette = ['#5d6d7e','#6e2f7a','#1a6b4a','#7d4a00','#1a4971','#7a2828','#296653','#5a4000'];
+    function _tagColor(tag) {
+        if (!tag) return '#adb5bd';
+        if (_tagColorMap[tag]) return _tagColorMap[tag];
+        let h = 0;
+        for (let i = 0; i < tag.length; i++) h = (h * 31 + tag.charCodeAt(i)) >>> 0;
+        return _tagPalette[h % _tagPalette.length];
+    }
+    function applyTagColors() {
+        document.querySelectorAll('.stock-tag-badge[data-tag-name]').forEach(el => {
+            el.style.background = _tagColor(el.dataset.tagName);
+        });
     }
 
     // 再次查询：填入代码并提交表单
@@ -857,6 +960,7 @@
 
     function addStock() {
         const addInput = document.getElementById('add-stock-input');
+        const tagSelect = document.getElementById('add-stock-tag');
         if (!addInput) return;
         const code = addInput.value.trim();
         if (!code) return;
@@ -864,7 +968,56 @@
             alert('该股票代码已在列表中：' + code);
             return;
         }
-        _submitCommonStocks([..._currentCodes, code]);
+        const tag = tagSelect ? tagSelect.value.trim() : '';
+        if (tag) {
+            // 先保存 tag，再提交股票列表（两步连续提交：tag 保存用 fetch，不跳转）
+            const fd = new FormData();
+            fd.append('code', code);
+            fd.append('tag', tag);
+            fetch('/update_stock_tag', { method: 'POST', body: fd }).finally(() => {
+                _submitCommonStocks([..._currentCodes, code]);
+            });
+        } else {
+            _submitCommonStocks([..._currentCodes, code]);
+        }
+    }
+
+    // 行业 tag 过滤
+    let _activeTag = '';
+    function filterByTag(tag) {
+        _activeTag = tag;
+        const rows = document.querySelectorAll('#common-stocks-tbody tr');
+        rows.forEach(tr => {
+            const rowTag = tr.dataset.tag || '';
+            tr.style.display = (!tag || rowTag === tag) ? '' : 'none';
+        });
+        document.querySelectorAll('#tag-filter-pills .btn').forEach(btn => {
+            btn.classList.remove('active', 'btn-secondary');
+            btn.classList.add('btn-outline-secondary');
+        });
+        const activePill = document.getElementById(tag ? 'pill-' + tag : 'pill-all');
+        if (activePill) {
+            activePill.classList.remove('btn-outline-secondary');
+            activePill.classList.add('btn-secondary', 'active');
+        }
+    }
+
+    // tag 编辑 modal
+    let _tagEditCode = '';
+    function openTagModal(code, currentTag) {
+        _tagEditCode = code;
+        const inp = document.getElementById('tag-modal-input');
+        if (inp) inp.value = currentTag || '';
+        const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('tagModal'));
+        modal.show();
+    }
+    function saveTagModal() {
+        const inp = document.getElementById('tag-modal-input');
+        const tag = inp ? inp.value.trim() : '';
+        const form = document.getElementById('tag-form');
+        document.getElementById('tag-form-code').value = _tagEditCode;
+        document.getElementById('tag-form-tag').value = tag;
+        if (form) form.submit();
     }
 
     document.addEventListener('DOMContentLoaded', function () {
@@ -872,6 +1025,8 @@
         document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
             new bootstrap.Tooltip(el, { trigger: 'hover' });
         });
+        // 应用 tag 颜色
+        applyTagColors();
         const analyzeForm = document.getElementById('analyze-form');
         const analyzeBtn = document.getElementById('analyze-btn');
         if (analyzeForm && analyzeBtn) {

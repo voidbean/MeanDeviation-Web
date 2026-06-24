@@ -134,10 +134,22 @@ AI 生成"建议修改内容"（diff 形式：新增哪些条目、修改哪些�
 ## 文件结构参考
 
 ```
-app.py                          # 所有后端逻辑
+app.py                          # 入口：初始化 FastAPI，注册路由
+core/
+  config.py                     # 环境变量、Tushare 初始化
+  db.py                         # 所有 SQLite 读写
+  strategy.py                   # 8848 计算、AI prompt 构建
+services/
+  ai.py                         # AI 调用（流式 / 工具调用）
+  tushare_tools.py              # 13 个 Tushare 工具定义与执行
+  indicators.py                 # 技术指标、揉搓线、分时快照
+  tools.py                      # 向后兼容的 re-export
+routes/
+  main.py                       # 主页、分析、自选股、AI 流
+  sector.py                     # 板块分析
+  review.py                     # 交易复盘
 templates/
   index.html                    # 主分析页面
-  review.html                   # 复盘页面（已创建）
 skills/
   01_*.md ~ 11_*.md             # 阿狼体系（通用）
   personal/

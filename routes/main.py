@@ -21,6 +21,7 @@ from core.db import (
     save_query_history, get_query_history,
     save_temp_result, load_temp_result,
     get_index_market_data, get_index_trend_chart_data,
+    get_stock_tag, set_stock_tag, get_all_stock_tags, get_distinct_tags,
 )
 from core.strategy import (
     calculate_8848, calculate_8848_history, calculate_strategy,
@@ -42,6 +43,10 @@ def load_common_stocks():
 
 
 COMMON_STOCKS = load_common_stocks()
+
+
+# 项目根目录的 .env（和 core/config.py 读取的是同一个文件）
+_ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
 
 
 def _update_env_key(path: str, key: str, value: str) -> None:
@@ -71,10 +76,9 @@ def build_common_stocks_with_name():
     import tushare as ts
     from core.db import get_cached_name, set_cached_name
     entries = []
-    for item in COMMON_STOCKS:
-        code = item.get("code")
-        if not code:
-            continue
+    codes = [item.get("code") for item in COMMON_STOCKS if item.get("code")]
+    tag_map = get_all_stock_tags(codes)
+    for code in codes:
         name = get_cached_name(code)
         if not name:
             try:
@@ -84,7 +88,7 @@ def build_common_stocks_with_name():
                     set_cached_name(code, name)
             except Exception:
                 pass
-        entries.append({"code": code, "name": name})
+        entries.append({"code": code, "name": name, "tag": tag_map.get(code, "")})
     return entries
 
 
@@ -100,6 +104,7 @@ def _register_routes(app, templates):
     async def read_root(request: Request, result_id: str = None):
         defaults = {
             "common_stocks":   build_common_stocks_with_name(),
+            "tag_suggestions": get_distinct_tags(),
             "batch_results":   None,
             "history_results": None,
             "stock_volume":    None,
@@ -117,6 +122,7 @@ def _register_routes(app, templates):
         ctx.pop("query_history", None)
         ctx.pop("common_stocks", None)
         ctx.pop("index_trend", None)
+        ctx.pop("tag_suggestions", None)
         return templates.TemplateResponse("index.html", {"request": request, **defaults, **ctx})
 
     @app.post("/analyze", response_class=HTMLResponse)
@@ -213,10 +219,14 @@ def _register_routes(app, templates):
         global COMMON_STOCKS
         code_list = [c.strip() for c in codes.replace("，", ",").split(",") if c.strip()]
         new_val = ",".join(code_list)
-        env_path = os.path.join(os.path.dirname(__file__), ".env")
-        _update_env_key(env_path, "COMMON_STOCK_CODES", new_val)
+        _update_env_key(_ENV_PATH, "COMMON_STOCK_CODES", new_val)
         load_dotenv(override=True)
         COMMON_STOCKS = load_common_stocks()
+        return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/update_stock_tag", response_class=HTMLResponse)
+    async def update_stock_tag(request: Request, code: str = Form(...), tag: str = Form("")):
+        set_stock_tag(code.strip(), tag.strip())
         return RedirectResponse(url="/", status_code=303)
 
     @app.post("/update_ai_provider", response_class=HTMLResponse)
@@ -226,8 +236,7 @@ def _register_routes(app, templates):
         if provider not in allowed:
             return RedirectResponse(url="/", status_code=303)
         _cfg.AI_PROVIDER = provider
-        env_path = os.path.join(os.path.dirname(__file__), ".env")
-        _update_env_key(env_path, "AI_PROVIDER", provider)
+        _update_env_key(_ENV_PATH, "AI_PROVIDER", provider)
         return RedirectResponse(url="/", status_code=303)
 
     @app.post("/clear_history", response_class=HTMLResponse)

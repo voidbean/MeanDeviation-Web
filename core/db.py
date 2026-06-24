@@ -118,6 +118,13 @@ def init_db():
                 )
             """)
             conn.commit()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS stock_tags (
+                    code TEXT PRIMARY KEY,
+                    tag  TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            conn.commit()
         finally:
             conn.close()
     except Exception as e:
@@ -474,6 +481,74 @@ def save_ai_conversation(session_id: str, stock_code: str, messages: list) -> No
         conn.close()
     except Exception as e:
         logger.error("save_ai_conversation failed: %s", e)
+
+
+def get_stock_tag(code: str) -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute("SELECT tag FROM stock_tags WHERE code = ?", (code,))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            return row[0] or ""
+    except Exception as e:
+        logger.error(f"Failed to get tag for {code}: {e}")
+    return ""
+
+
+def set_stock_tag(code: str, tag: str) -> None:
+    if not code:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute("""
+                INSERT INTO stock_tags(code, tag) VALUES(?, ?)
+                ON CONFLICT(code) DO UPDATE SET tag = excluded.tag
+            """, (code, tag.strip()))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Failed to set tag for {code}: {e}")
+
+
+def get_all_stock_tags(codes: list) -> dict:
+    if not codes:
+        return {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            placeholders = ",".join("?" * len(codes))
+            cur = conn.execute(
+                f"SELECT code, tag FROM stock_tags WHERE code IN ({placeholders})", codes
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        return {r[0]: r[1] for r in rows if r[1]}
+    except Exception as e:
+        logger.error(f"Failed to get all tags: {e}")
+    return {}
+
+
+def get_distinct_tags() -> list:
+    """返回数据库中所有已使用的 tag，去重排序。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(
+                "SELECT DISTINCT tag FROM stock_tags WHERE tag != '' ORDER BY tag"
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to get distinct tags: {e}")
+    return []
 
 
 def load_ai_conversation(session_id: str) -> list:
