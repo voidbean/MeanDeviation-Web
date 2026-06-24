@@ -12,7 +12,7 @@ import uuid
 
 from dotenv import load_dotenv
 from fastapi import Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 import core.config as _cfg
 from core.config import logger, DB_PATH
@@ -22,6 +22,7 @@ from core.db import (
     save_temp_result, load_temp_result,
     get_index_market_data, get_index_trend_chart_data,
     get_stock_tag, set_stock_tag, get_all_stock_tags, get_distinct_tags,
+    get_all_holdings, get_prev_close,
 )
 from core.strategy import (
     calculate_8848, calculate_8848_history, calculate_strategy,
@@ -185,10 +186,11 @@ def _register_routes(app, templates):
         stage_high: float = Form(0.0),
         stage_low:  float = Form(0.0),
         max_price:  float = Form(0.0),
+        quantity:   int   = Form(0),
     ):
         current = get_portfolio(code)
         effective_max_price = max_price if max_price > 0 else current["max_price"]
-        save_portfolio(code, cost_price, stage_high, stage_low, effective_max_price)
+        save_portfolio(code, cost_price, stage_high, stage_low, effective_max_price, quantity)
 
         result = calculate_8848(code)
         if isinstance(result, dict) and result.get("status") == "success":
@@ -223,6 +225,115 @@ def _register_routes(app, templates):
         load_dotenv(override=True)
         COMMON_STOCKS = load_common_stocks()
         return RedirectResponse(url="/", status_code=303)
+
+    @app.get("/api/portfolio_overview", response_class=JSONResponse)
+    async def portfolio_overview():
+        holdings = get_all_holdings()
+        if not holdings:
+            return JSONResponse({"stocks": [], "total_pnl_pct": None, "today_avg_pct": None})
+
+        loop = asyncio.get_event_loop()
+
+        def _fetch(holding: dict) -> dict:
+            import tushare as ts
+            code = holding["code"]
+            cost = holding["cost"]
+            name = holding["name"]
+            quantity = holding["quantity"]
+            short_code = code.split(".")[0] if "." in code else code
+            try:
+                df = ts.get_realtime_quotes(short_code)
+                if df is None or df.empty:
+                    raise ValueError("empty")
+                price = float(df.loc[0, "price"])
+                if price == 0:
+                    raise ValueError("zero price")
+                open_ = float(df.loc[0, "open"])
+                if not name:
+                    name = str(df.loc[0, "name"])
+            except Exception:
+                price = None
+                open_ = None
+
+            prev_close = get_prev_close(code) or get_prev_close(short_code)
+
+            if price is not None and cost > 0:
+                total_pnl_pct = round((price - cost) / cost * 100, 2)
+                total_pnl_abs = round((price - cost) * quantity, 2) if quantity > 0 else None
+            else:
+                total_pnl_pct = None
+                total_pnl_abs = None
+
+            if price is not None and open_ is not None and open_ > 0:
+                today_pnl_pct = round((price - open_) / open_ * 100, 2)
+                today_pnl_abs = round((price - open_) * quantity, 2) if quantity > 0 else None
+            elif price is not None and prev_close is not None and prev_close > 0:
+                today_pnl_pct = round((price - prev_close) / prev_close * 100, 2)
+                today_pnl_abs = round((price - prev_close) * quantity, 2) if quantity > 0 else None
+            else:
+                today_pnl_pct = None
+                today_pnl_abs = None
+
+            market_value = round(price * quantity, 2) if price is not None and quantity > 0 else None
+
+            return {
+                "code": short_code,
+                "name": name or short_code,
+                "cost": cost,
+                "quantity": quantity,
+                "current_price": price,
+                "market_value": market_value,
+                "total_pnl_pct": total_pnl_pct,
+                "total_pnl_abs": total_pnl_abs,
+                "today_pnl_pct": today_pnl_pct,
+                "today_pnl_abs": today_pnl_abs,
+            }
+
+        results = await loop.run_in_executor(
+            None,
+            lambda: [_fetch(h) for h in holdings],
+        )
+
+        valid = [r for r in results if r["total_pnl_pct"] is not None]
+        total_avg = round(sum(r["total_pnl_pct"] for r in valid) / len(valid), 2) if valid else None
+        today_valid = [r for r in results if r["today_pnl_pct"] is not None]
+        today_avg = round(sum(r["today_pnl_pct"] for r in today_valid) / len(today_valid), 2) if today_valid else None
+
+        abs_valid = [r for r in results if r["total_pnl_abs"] is not None]
+        total_abs = round(sum(r["total_pnl_abs"] for r in abs_valid), 2) if abs_valid else None
+        today_abs_valid = [r for r in results if r["today_pnl_abs"] is not None]
+        today_abs = round(sum(r["today_pnl_abs"] for r in today_abs_valid), 2) if today_abs_valid else None
+        total_mv = round(sum(r["market_value"] for r in results if r["market_value"] is not None), 2)
+
+        return JSONResponse({
+            "stocks": results,
+            "total_pnl_pct": total_avg,
+            "today_avg_pct": today_avg,
+            "total_pnl_abs": total_abs,
+            "today_pnl_abs": today_abs,
+            "total_market_value": total_mv if total_mv else None,
+        })
+
+    @app.post("/api/holdings_batch_save", response_class=JSONResponse)
+    async def holdings_batch_save(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+        items = body if isinstance(body, list) else []
+        for item in items:
+            code = str(item.get("code", "")).strip()
+            if not code:
+                continue
+            cost = float(item.get("cost", 0) or 0)
+            quantity = int(item.get("quantity", 0) or 0)
+            current = get_portfolio(code)
+            save_portfolio(
+                code, cost,
+                current["stage_high"], current["stage_low"],
+                current["max_price"], quantity,
+            )
+        return JSONResponse({"ok": True, "saved": len(items)})
 
     @app.post("/update_stock_tag", response_class=HTMLResponse)
     async def update_stock_tag(request: Request, code: str = Form(...), tag: str = Form("")):

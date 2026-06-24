@@ -168,10 +168,11 @@ def calculate_8848(code: str):
         stage_high = portfolio["stage_high"]
         stage_low = portfolio["stage_low"]
         max_price = portfolio["max_price"]
+        quantity = portfolio["quantity"]
 
         if cost_price > 0 and high > max_price:
             max_price = high
-            save_portfolio(code, cost_price, stage_high, stage_low, max_price)
+            save_portfolio(code, cost_price, stage_high, stage_low, max_price, quantity)
 
         st_high = max_price if max_price > 0 else high
         stage_params_set = (
@@ -225,6 +226,7 @@ def calculate_8848(code: str):
             "high": high,
             "low": low,
             "cost_price": cost_price,
+            "quantity": quantity,
             "stage_high": stage_high,
             "stage_low": stage_low,
             "max_price": round(max_price, 4),

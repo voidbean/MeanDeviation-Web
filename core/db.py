@@ -80,6 +80,7 @@ def init_db():
 
             for stmt, label in [
                 ("ALTER TABLE portfolio ADD COLUMN max_price REAL DEFAULT 0",    "max_price"),
+                ("ALTER TABLE portfolio ADD COLUMN quantity INTEGER DEFAULT 0",  "quantity"),
                 ("ALTER TABLE daily_records ADD COLUMN amount REAL DEFAULT 0",   "amount"),
                 ("ALTER TABLE daily_records ADD COLUMN open REAL DEFAULT 0",     "open"),
             ]:
@@ -198,7 +199,7 @@ def get_portfolio(code: str):
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.execute(
-            "SELECT cost_price, stage_high, stage_low, max_price FROM portfolio WHERE code = ?",
+            "SELECT cost_price, stage_high, stage_low, max_price, COALESCE(quantity, 0) FROM portfolio WHERE code = ?",
             (code,)
         )
         row = cur.fetchone()
@@ -209,26 +210,28 @@ def get_portfolio(code: str):
                 "stage_high": row[1],
                 "stage_low":  row[2],
                 "max_price":  row[3] if row[3] is not None else 0.0,
+                "quantity":   int(row[4]) if row[4] else 0,
             }
     except Exception as e:
         logger.error(f"Failed to get portfolio for {code}: {e}")
-    return {"cost": 0, "stage_high": 0, "stage_low": 0, "max_price": 0.0}
+    return {"cost": 0, "stage_high": 0, "stage_low": 0, "max_price": 0.0, "quantity": 0}
 
 
-def save_portfolio(code: str, cost: float, high: float, low: float, max_price: float = 0.0):
+def save_portfolio(code: str, cost: float, high: float, low: float, max_price: float = 0.0, quantity: int = 0):
     try:
         conn = sqlite3.connect(DB_PATH)
         ts_now = int(time.time())
         conn.execute("""
-            INSERT INTO portfolio(code, cost_price, stage_high, stage_low, max_price, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?)
+            INSERT INTO portfolio(code, cost_price, stage_high, stage_low, max_price, quantity, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 cost_price = excluded.cost_price,
                 stage_high = excluded.stage_high,
                 stage_low  = excluded.stage_low,
                 max_price  = excluded.max_price,
+                quantity   = excluded.quantity,
                 updated_at = excluded.updated_at
-        """, (code, cost, high, low, max_price, ts_now))
+        """, (code, cost, high, low, max_price, quantity, ts_now))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -549,6 +552,46 @@ def get_distinct_tags() -> list:
     except Exception as e:
         logger.error(f"Failed to get distinct tags: {e}")
     return []
+
+
+def get_all_holdings() -> list:
+    """返回所有已设置成本价的持仓，含股票名称缓存。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute("""
+            SELECT p.code, p.cost_price, p.max_price,
+                   COALESCE(s.name, '') AS name,
+                   COALESCE(p.quantity, 0) AS quantity
+            FROM portfolio p
+            LEFT JOIN stock_name_cache s ON s.code = p.code
+            WHERE p.cost_price > 0
+            ORDER BY p.updated_at DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {"code": row[0], "cost": row[1], "max_price": row[2] or 0.0, "name": row[3], "quantity": int(row[4])}
+            for row in rows
+        ]
+    except Exception as e:
+        logger.error("get_all_holdings failed: %s", e)
+        return []
+
+
+def get_prev_close(code: str) -> float | None:
+    """从 daily_records 取最近一个交易日的收盘价（即昨收）。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            "SELECT close FROM daily_records WHERE code = ? AND close > 0 ORDER BY date DESC LIMIT 1",
+            (code,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return float(row[0]) if row else None
+    except Exception as e:
+        logger.error("get_prev_close failed for %s: %s", code, e)
+        return None
 
 
 def load_ai_conversation(session_id: str) -> list:
