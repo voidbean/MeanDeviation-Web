@@ -6,13 +6,8 @@ import json
 import sqlite3
 import time
 
-from core.config import (
-    DB_PATH, logger,
-    AI_PROVIDER,
-    CLAUDE_API_KEY, CLAUDE_MODEL, CLAUDE_BASE_URL,
-    OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL, OPENAI_MAX_TOKENS,
-    GEMINI_API_KEY, GEMINI_MODEL,
-)
+import core.config as _cfg
+from core.config import DB_PATH, logger
 from services.tushare_tools import (
     MAX_TOOL_ROUNDS,
     execute_tool,
@@ -62,19 +57,19 @@ def _load_ai_conversation(session_id: str) -> list:
 # ── 带工具的同步调用 ──────────────────────────────────────────────────────────
 
 def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
-    provider = AI_PROVIDER
+    provider = _cfg.AI_PROVIDER
 
     if provider == "claude":
         import anthropic
-        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 180.0, "default_headers": {"api-key": CLAUDE_API_KEY}}
-        if CLAUDE_BASE_URL:
-            kwargs["base_url"] = CLAUDE_BASE_URL
+        kwargs: dict = {"api_key": _cfg.CLAUDE_API_KEY, "timeout": 180.0, "default_headers": {"api-key": _cfg.CLAUDE_API_KEY}}
+        if _cfg.CLAUDE_BASE_URL:
+            kwargs["base_url"] = _cfg.CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         claude_tools = _build_claude_tools()
         messages = [{"role": "user", "content": user_prompt}]
         for _round in range(MAX_TOOL_ROUNDS):
             resp = client.messages.create(
-                model=CLAUDE_MODEL,
+                model=_cfg.CLAUDE_MODEL,
                 max_tokens=_MAX_TOKENS,
                 system=system_prompt,
                 tools=claude_tools,
@@ -105,9 +100,9 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
 
     elif provider == "openai":
         from openai import OpenAI
-        kwargs = {"api_key": OPENAI_API_KEY, "timeout": 180.0}
-        if OPENAI_BASE_URL:
-            kwargs["base_url"] = OPENAI_BASE_URL
+        kwargs = {"api_key": _cfg.OPENAI_API_KEY, "timeout": 180.0}
+        if _cfg.OPENAI_BASE_URL:
+            kwargs["base_url"] = _cfg.OPENAI_BASE_URL
         client = OpenAI(**kwargs)
         openai_tools = _build_openai_tools()
         messages = [
@@ -116,15 +111,15 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
         ]
         for _round in range(MAX_TOOL_ROUNDS):
             resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                max_tokens=OPENAI_MAX_TOKENS,
+                model=_cfg.OPENAI_MODEL,
+                max_tokens=_cfg.OPENAI_MAX_TOKENS,
                 tools=openai_tools,
                 messages=messages,
             )
             choice = resp.choices[0]
             logger.info("openai tool_use round=%d finish_reason=%s", _round, choice.finish_reason)
             if choice.finish_reason == "length":
-                logger.warning("openai tool_use truncated by max_tokens=%d", OPENAI_MAX_TOKENS)
+                logger.warning("openai tool_use truncated by max_tokens=%d", _cfg.OPENAI_MAX_TOKENS)
                 return choice.message.content or ""
             if choice.finish_reason == "stop":
                 return choice.message.content or ""
@@ -143,10 +138,10 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
     elif provider == "gemini":
         import google.generativeai as genai
         from google.generativeai import types as genai_types
-        genai.configure(api_key=GEMINI_API_KEY)
+        genai.configure(api_key=_cfg.GEMINI_API_KEY)
         gemini_tool = _build_gemini_tools()
         model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
+            model_name=_cfg.GEMINI_MODEL,
             system_instruction=system_prompt,
             tools=[gemini_tool],
         )
@@ -191,13 +186,13 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
     yield ("progress", msg) / ("token", chunk) / ("done", full_text) / ("error", msg)
     messages: OpenAI 格式消息列表（不含 system），支持多轮对话。
     """
-    provider = AI_PROVIDER
+    provider = _cfg.AI_PROVIDER
 
     if provider == "claude":
         import anthropic
-        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 180.0, "default_headers": {"api-key": CLAUDE_API_KEY}}
-        if CLAUDE_BASE_URL:
-            kwargs["base_url"] = CLAUDE_BASE_URL
+        kwargs: dict = {"api_key": _cfg.CLAUDE_API_KEY, "timeout": 180.0, "default_headers": {"api-key": _cfg.CLAUDE_API_KEY}}
+        if _cfg.CLAUDE_BASE_URL:
+            kwargs["base_url"] = _cfg.CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         claude_tools = _build_claude_tools()
 
@@ -209,7 +204,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
         for _round in range(MAX_TOOL_ROUNDS):
             yield ("progress", f"AI 第 {_round + 1} 轮推理中，请稍候…")
             resp = client.messages.create(
-                model=CLAUDE_MODEL,
+                model=_cfg.CLAUDE_MODEL,
                 max_tokens=_MAX_TOKENS,
                 system=system_prompt,
                 tools=claude_tools,
@@ -254,9 +249,9 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
 
     elif provider == "openai":
         from openai import OpenAI
-        kwargs = {"api_key": OPENAI_API_KEY, "timeout": 180.0}
-        if OPENAI_BASE_URL:
-            kwargs["base_url"] = OPENAI_BASE_URL
+        kwargs = {"api_key": _cfg.OPENAI_API_KEY, "timeout": 180.0}
+        if _cfg.OPENAI_BASE_URL:
+            kwargs["base_url"] = _cfg.OPENAI_BASE_URL
         client = OpenAI(**kwargs)
         openai_tools = _build_openai_tools()
         oai_messages = [{"role": "system", "content": system_prompt}] + list(messages)
@@ -264,8 +259,8 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
         for _round in range(MAX_TOOL_ROUNDS):
             yield ("progress", f"AI 第 {_round + 1} 轮推理中，请稍候…")
             resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                max_tokens=OPENAI_MAX_TOKENS,
+                model=_cfg.OPENAI_MODEL,
+                max_tokens=_cfg.OPENAI_MAX_TOKENS,
                 tools=openai_tools,
                 messages=oai_messages,
             )
@@ -273,7 +268,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
             logger.info("openai streaming round=%d finish_reason=%s", _round, choice.finish_reason)
 
             if choice.finish_reason == "length":
-                logger.warning("openai streaming truncated by max_tokens=%d", OPENAI_MAX_TOKENS)
+                logger.warning("openai streaming truncated by max_tokens=%d", _cfg.OPENAI_MAX_TOKENS)
                 full_text = choice.message.content or ""
                 for i in range(0, len(full_text), 4):
                     yield ("token", full_text[i:i+4])
@@ -316,10 +311,10 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
     elif provider == "gemini":
         import google.generativeai as genai
         from google.generativeai import types as genai_types
-        genai.configure(api_key=GEMINI_API_KEY)
+        genai.configure(api_key=_cfg.GEMINI_API_KEY)
         gemini_tool = _build_gemini_tools()
         model_obj = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
+            model_name=_cfg.GEMINI_MODEL,
             system_instruction=system_prompt,
             tools=[gemini_tool],
         )
@@ -387,16 +382,16 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
 # ── 无工具的简单调用 ──────────────────────────────────────────────────────────
 
 def call_ai_model(system_prompt: str, user_prompt: str) -> str:
-    provider = AI_PROVIDER
+    provider = _cfg.AI_PROVIDER
 
     if provider == "claude":
         import anthropic
-        kwargs: dict = {"api_key": CLAUDE_API_KEY, "timeout": 120.0, "default_headers": {"api-key": CLAUDE_API_KEY}}
-        if CLAUDE_BASE_URL:
-            kwargs["base_url"] = CLAUDE_BASE_URL
+        kwargs: dict = {"api_key": _cfg.CLAUDE_API_KEY, "timeout": 120.0, "default_headers": {"api-key": _cfg.CLAUDE_API_KEY}}
+        if _cfg.CLAUDE_BASE_URL:
+            kwargs["base_url"] = _cfg.CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         msg = client.messages.create(
-            model=CLAUDE_MODEL,
+            model=_cfg.CLAUDE_MODEL,
             max_tokens=_MAX_TOKENS,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
@@ -405,12 +400,12 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
 
     elif provider == "openai":
         from openai import OpenAI
-        kwargs = {"api_key": OPENAI_API_KEY, "timeout": 120.0}
-        if OPENAI_BASE_URL:
-            kwargs["base_url"] = OPENAI_BASE_URL
+        kwargs = {"api_key": _cfg.OPENAI_API_KEY, "timeout": 120.0}
+        if _cfg.OPENAI_BASE_URL:
+            kwargs["base_url"] = _cfg.OPENAI_BASE_URL
         client = OpenAI(**kwargs)
         resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=_cfg.OPENAI_MODEL,
             max_tokens=_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -422,9 +417,9 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
     elif provider == "gemini":
         import google.generativeai as genai
         from google.generativeai import types as genai_types
-        genai.configure(api_key=GEMINI_API_KEY)
+        genai.configure(api_key=_cfg.GEMINI_API_KEY)
         model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
+            model_name=_cfg.GEMINI_MODEL,
             system_instruction=system_prompt,
         )
         resp = model.generate_content(

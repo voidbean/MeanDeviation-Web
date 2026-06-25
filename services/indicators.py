@@ -8,7 +8,8 @@ import time
 
 import tushare as ts
 
-from core.config import DB_PATH, logger, COMMON_STOCKS
+import core.config as _cfg
+from core.config import DB_PATH, logger
 
 _INDEX_RT_CODES = [
     ("sh000001", "000001.SH"),
@@ -75,7 +76,7 @@ def _save_intraday_snapshot(code: str, today: str, now_hhmm: str,
 
 
 def _fetch_and_save_intraday_snapshots() -> None:
-    if not COMMON_STOCKS:
+    if not _cfg.COMMON_STOCKS:
         return
     import datetime
     today    = _today_str()
@@ -93,7 +94,7 @@ def _fetch_and_save_intraday_snapshots() -> None:
     except Exception as e:
         logger.error("intraday_fetch: 清理旧数据失败 %s", e)
 
-    for item in COMMON_STOCKS:
+    for item in _cfg.COMMON_STOCKS:
         code = item["code"]
         try:
             df = ts.get_realtime_quotes(code)
