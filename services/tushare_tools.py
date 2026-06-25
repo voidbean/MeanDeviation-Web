@@ -16,9 +16,15 @@ TOOL_DEFINITIONS = [
     {
         "name": "get_intraday_lines",
         "description": (
-            "获取个股今日分时数据，包含白线（每分钟收盘价）和黄线（分时均价，即累计成交额/累计成交量）。"
-            "用于判断日内价格趋势、均价支撑/压力位、做T时机。每5分钟一个采样点。"
-            "仅在交易时段（09:30-15:00）有数据，非交易时段返回空。"
+            "获取个股今日分时数据，包含白线（当前价）、黄线（分时均价/资金成本重心）和每时段量能节奏（vol_ratio=相对均量倍数）。"
+            "黄白线解读规则（参考 Skill 05）：\n"
+            "  - 黄线持续高于白线：大资金净流入，多头主导，可加仓\n"
+            "  - 白线持续高于黄线：小盘/个股活跃但大资金偏弱，谨慎追高\n"
+            "  - 白线主动下穿黄线（化解放量智障）：散户未大量进场，行情可延续\n"
+            "  - 黄线快速下穿白线 + vol_ratio>1.5：顶部信号，停止加仓并逢高减仓\n"
+            "  - 缩量（vol_ratio<0.5）+ 白线在上 + 过开盘点：顶级诱多走势，卖点\n"
+            "  - 放量（vol_ratio>1.5）不过新高：上方压力大，主力出货\n"
+            "每30分钟一个采样点，仅交易时段（09:30-15:00）有数据。"
         ),
         "parameters": {
             "ts_code": {"type": "string", "description": "股票代码，标准格式如 600519.SH 或 000001.SZ"},
@@ -215,14 +221,37 @@ def _tool_get_intraday_lines(ts_code: str) -> dict:
     points = _get_intraday_points(code)
     if not points:
         return {"error": "暂无分时数据，后台任务尚未抓取（交易时段每30分钟更新一次）"}
-    latest = points[-1]
+
+    vols = [p["vol"] for p in points if p["vol"] > 0]
+    avg_vol = sum(vols) / len(vols) if vols else 0
+    annotated = []
+    for p in points:
+        vol_ratio = round(p["vol"] / avg_vol, 2) if avg_vol > 0 else None
+        annotated.append({
+            "time":      p["time"],
+            "price":     p["price"],
+            "avg":       p["avg"],
+            "vol":       p["vol"],
+            "vol_ratio": vol_ratio,
+        })
+
+    latest = annotated[-1]
+    white_vs_yellow = (
+        "白线在上" if (latest["price"] and latest["avg"] and latest["price"] > latest["avg"])
+        else "黄线在上"
+    )
     return {
-        "ts_code": ts_code,
-        "date": _today_str(),
-        "latest_price": latest["price"],
-        "latest_avg": latest["avg"],
-        "points": points,
-        "note": "price=白线（分钟收盘价），avg=黄线（分时均价），每30分钟更新一次",
+        "ts_code":        ts_code,
+        "date":           _today_str(),
+        "latest_price":   latest["price"],
+        "latest_avg":     latest["avg"],
+        "white_vs_yellow": white_vs_yellow,
+        "points":         annotated,
+        "note": (
+            "price=白线（当前价），avg=黄线（分时均价/资金成本重心）；"
+            "vol_ratio=当前时段成交量/全天均量，>1.5为放量，<0.5为缩量；"
+            "每30分钟更新一次。"
+        ),
     }
 
 
@@ -241,7 +270,6 @@ def _tool_get_index_intraday() -> dict:
             result[store_code] = {"name": name, "error": "暂无分时数据"}
             continue
 
-        latest = points[-1]
         vols = [p["vol"] for p in points if p["vol"] > 0]
         avg_vol = sum(vols) / len(vols) if vols else 0
 
@@ -256,13 +284,18 @@ def _tool_get_index_intraday() -> dict:
                 "vol_ratio": vol_ratio,
             })
 
+        latest_a = annotated[-1]
+        white_vs_yellow = (
+            "白线在上" if (latest_a["price"] and latest_a["avg"] and latest_a["price"] > latest_a["avg"])
+            else "黄线在上"
+        )
         result[store_code] = {
-            "name":         name,
-            "date":         today,
-            "latest_price": latest["price"],
-            "latest_avg":   latest["avg"],
-            "price_vs_avg": "价格高于均线" if latest["price"] and latest["avg"] and latest["price"] > latest["avg"] else "价格低于均线",
-            "points":       annotated,
+            "name":            name,
+            "date":            today,
+            "latest_price":    latest_a["price"],
+            "latest_avg":      latest_a["avg"],
+            "white_vs_yellow": white_vs_yellow,
+            "points":          annotated,
         }
 
     return {

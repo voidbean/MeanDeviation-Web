@@ -39,12 +39,18 @@ def to_ts_code(code: str) -> str:
     return ""
 
 
-def load_skills() -> str:
-    """读取 skills/*.md 和 skills/personal/*.md，拼接为字符串。"""
+def load_skills(subset: list = None) -> str:
+    """读取 skills/*.md 和 skills/personal/*.md，拼接为字符串。
+
+    subset: 文件名前缀列表，如 ["01", "04", "05", "08"]，None 表示加载全部。
+    personal/ 目录下的文件始终全量加载（个人交易画像）。
+    """
     if not SKILLS_DIR.exists():
         return ""
     parts = []
     for f in sorted(SKILLS_DIR.glob("*.md")):
+        if subset is not None and not any(f.name.startswith(p) for p in subset):
+            continue
         parts.append(f"## {f.name}\n\n" + f.read_text(encoding="utf-8"))
     personal_dir = SKILLS_DIR / "personal"
     if personal_dir.exists():
@@ -645,7 +651,10 @@ VWAP均价：{result['avg_price']}
 
 2. **股票类型判断**（参考 Skill 11）：属于哪种类型（A/B/C/D/E类及子类）？
 
-3. **量价状态**（参考 Skill 05）：近期量能趋势如何？资金动向？
+3. **量价 + 盘口资金状态**（参考 Skill 05）：
+   - 结合 get_index_intraday 返回的大盘黄白线状态：当前黄线在上还是白线在上？是否出现放量智障/顶级诱多/化解信号？
+   - 结合 get_intraday_lines 返回的个股白/黄线和 vol_ratio：个股与大盘是否共振？资金方向是否一致？
+   - 结合 get_moneyflow：近5日超大单/大单净流入趋势如何？
 
 4. **{op3_label}**（参考 Skill 03 + 对应类型操作规则）：结合静态规则信号参考（{result['signal']}），{op3_focus}
 {extra_instruction}

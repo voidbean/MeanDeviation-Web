@@ -12,7 +12,7 @@ from core.db import (
     save_temp_result, load_temp_result,
     get_index_market_data,
 )
-from services.ai import call_ai_model
+from services.ai import call_ai_model_with_tools
 
 # app 和 templates 在注册时注入
 _app = None
@@ -55,14 +55,19 @@ def _register_routes(app, templates):
         )
 
         from core.strategy import load_skills, to_ts_code
-        skills_text = load_skills()
+        # 板块分析只需 行情阶段/板块轮动/量价/市场参与者 四个技能
+        skills_text = load_skills(subset=["01", "04", "05", "08"])
         system_prompt = (
-            "你是基于阿狼投资体系的 A 股板块轮动分析助手。"
+            "你是基于阿狼投资体系的 A 股板块轮动分析助手。\n"
             "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
             "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
             "在给出买卖建议时必须严格遵守此规则，不得建议投资者当日买入后同日卖出。\n"
-            "以下是阿狼投资体系的技能库，请在分析中参考它，但也要结合你自己的知识进行独立判断，"
-            "不要过度依赖框架导致分析僵化：\n\n"
+            "【工具使用】你可以调用可用工具补充以下数据：\n"
+            "  - get_sector_flow：获取主要板块资金净流入，判断轮动方向\n"
+            "  - get_futures_positions：获取期指多空持仓，辅助判断大盘方向\n"
+            "  - get_moneyflow（指定某只风向标个股）：确认龙头资金健康度\n"
+            "请在分析前主动调用 get_sector_flow，其余工具按需调用。\n\n"
+            "以下是阿狼投资体系的技能库（已裁剪为板块分析相关章节）：\n\n"
             + skills_text
         )
         user_prompt = build_sector_ai_prompt(sector_data, user_hint=user_hint)
@@ -70,7 +75,7 @@ def _register_routes(app, templates):
         ai_analysis = None
         ai_error = None
         try:
-            ai_analysis = call_ai_model(system_prompt, user_prompt)
+            ai_analysis = call_ai_model_with_tools(system_prompt, user_prompt)
             logger.info("sector_analyze: done")
         except Exception as e:
             ai_error = str(e)
@@ -137,7 +142,7 @@ def build_sector_prompt_data() -> dict:
                         "trade_date": str(row.get("trade_date", "")),
                         "close":      float(row.get("close", 0) or 0),
                         "pct_change": float(row.get("pct_change", 0) or 0),
-                        "amount":     float(row.get("turnover_rate", 0) or 0),
+                        "amount_rate": float(row.get("turnover_rate", 0) or 0),
                     })
                 logger.info("build_sector_prompt_data: got ths_daily for %d sectors", len(sector_daily))
             else:
@@ -296,6 +301,18 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
 
     user_hint_text = f"\n【用户补充说明】\n{user_hint.strip()}" if user_hint and user_hint.strip() else ""
 
+    # 辅助：从活跃个股数据里提取换手率最高的票，用于"发散判断"提示
+    dispersion_hints = []
+    for sector_name, stocks in data["sector_stocks"].items():
+        if not stocks:
+            continue
+        top = stocks[0]  # 已按换手率排序，第一只换手率最高
+        dispersion_hints.append(
+            f"  {sector_name}：换手率最高 {top['name']}（{top['ts_code']}）"
+            f" {top['turnover_rate']:.1f}% 今日{top['pct_chg']:+.2f}%"
+        )
+    dispersion_text = "\n".join(dispersion_hints) if dispersion_hints else "（暂无数据）"
+
     return f"""【分析日期】{today_str}
 
 【大盘风向标（近5日，按日期倒序）】
@@ -310,29 +327,43 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
 【涨幅前8板块的活跃个股（换手率前5，含基本面）】
 {stocks_text}
 
+【各板块换手率最高个股（用于判断是否发散到边缘/不正宗票）】
+{dispersion_text}
+
 【数据说明】{errors_text}
 {user_hint_text}
 
 【分析要求】
-你是一位基于阿狼投资体系的 A 股分析师。请根据以上数据，给出板块轮动分析和个股推荐。
+请先调用 get_sector_flow 工具获取主要板块资金净流入数据，再结合以上数据，按以下结构给出板块轮动分析。
 
-以下是分析框架（仅供参考，请结合你自己的判断，不要机械套用）：
+---
 
-1. **大盘阶段判断**（参考 Skill 01 的 3-X 框架）：根据三大指数的量能和价格走势，当前大盘处于哪个阶段？对操作有何影响？
+1. **大盘阶段判断**（Skill 01 的 3-X 框架）
+   - 当前处于哪个阶段（3-1/3-2/3-3/3-4/3-5）？若处于 3-4 请进一步判断子形态（绞肉机/机构自救/B反/弱C/强C）；若处于 3-5 请判断 A浪/B反/C杀位置
+   - 量能水平（与 8000亿增量底线 / 3000亿缩量离场线 对比）
+   - 阶段判断对当前操作的影响（满仓轮动 / 降仓等待 / 提现避让）
 
-2. **当前主线板块**：根据近期涨跌幅和资金流向，哪 2-3 个板块处于主升或启动阶段？请说明判断依据（量能持续性、资金来源）。
+2. **主线板块确认**（Skill 04）
+   - 结合 get_sector_flow 返回的资金净流入，当前哪 1-2 个板块是真正的主线（持续净流入 + 换手活跃）？
+   - 机构行情 vs 柚子情绪行情的判断：当前哪种主导？依据是什么？
+   - 是否已进入"发散到不正宗票"阶段？（参考上方换手率最高个股，判断是否偏离核心）
 
-3. **板块轮动方向**（参考 Skill 04 的轮动逻辑）：资金从哪里流出，往哪里流入？当前处于哪个轮动节点？
+3. **板块轮动节点**（Skill 04 轮动规则）
+   - 当前资金从哪里流出，流向哪里？（注意：钱只去下一个同风偏加速板块，不会跨风偏）
+   - 是否有明确的"高标退潮信号"（如龙头出现龙虎榜/换手异常放量）？
+   - 风向标龙头健康度：结合涨跌幅和换手数据，各板块龙头是否仍在正常运作？
 
-4. **个股推荐**（每个推荐板块 1-2 只，从上方候选个股中选择或根据你的知识补充）：
-   - 股票代码 + 名称
-   - 类型判断（参考 Skill 11：A/B/C/D/E 类）
-   - 推荐理由（不超过 3 句，重点说明为什么是这只而不是其他）
-   - 操作建议（买入条件 / 关键风险提示）
+4. **个股推荐**（每板块 1-2 只，从候选个股中选或根据你的知识补充）
+   - 代码 + 名称
+   - 类型（A/B/C/D/E类，参考 Skill 11）
+   - 选择理由（≤3句，说明为什么是这只而非其他；换手率高≠推荐理由）
+   - 操作建议：买入条件 + 止损位 + 关键风险
 
-5. **不建议参与的方向**：当前哪些板块或个股应该回避？原因是什么？
+5. **黑名单核查**
+   - 上方数据中哪些方向命中以下黑名单，需要明确回避：
+     风电、战争资源、软件ETF、券商、ST/准ST、X多多概念、红利做T、量子科技、白酒/地产（科技牛市风偏不同）
 
 注意：
-- 以上分析基于有限的量化数据，仅供参考，不构成投资建议
-- 如果某类数据不可用，请跳过依赖该数据的分析，不要编造数据
-- 个股推荐要有明确的选择理由，不要仅因为涨幅高就推荐"""
+- 分析基于有限数据，仅供参考，不构成投资建议
+- 数据不可用的部分直接跳过，不要编造
+- 策略用"当出现X做X，不出现X不做X"格式书写，避免模糊建议"""
