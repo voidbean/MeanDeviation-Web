@@ -178,6 +178,60 @@ def _register_routes(app, templates):
         })
         return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
 
+    @app.get("/api/common_stocks_status")
+    async def common_stocks_status():
+        """返回所有自选股的实时信号和关键价位，用于自选股列表异步刷新。"""
+        import concurrent.futures
+
+        def _fetch(item):
+            code = item.get("code")
+            if not code:
+                return None
+            try:
+                res = calculate_8848(code)
+                if res.get("status") != "success":
+                    return {"code": code, "error": True}
+                # 止损价：有持仓用 cost*0.93，无持仓用 stage_low（若有），否则 None
+                stop_loss = None
+                cost = res.get("cost_price", 0)
+                stage_low = res.get("stage_low", 0)
+                stage_high = res.get("stage_high", 0)
+                if cost > 0:
+                    stop_loss = round(cost * 0.93, 2)
+                elif stage_low > 0:
+                    stop_loss = round(stage_low, 2)
+
+                tooltip_parts = []
+                if res.get("stage_params_set"):
+                    tooltip_parts.append(f"区间 {stage_low}~{stage_high}")
+                    tooltip_parts.append(f"F382={res['f382']} F618={res['f618']} F786={res['f786']}")
+                if stop_loss is not None:
+                    tooltip_parts.append(f"止损 {stop_loss}")
+                if cost > 0:
+                    tooltip_parts.append(f"成本 {cost}")
+
+                return {
+                    "code": code,
+                    "signal": res["signal"],
+                    "advice_class": res["advice_class"],
+                    "current_price": res["current_price"],
+                    "stop_loss": stop_loss,
+                    "tooltip": " | ".join(tooltip_parts),
+                    "error": False,
+                }
+            except Exception:
+                return {"code": code, "error": True}
+
+        loop = asyncio.get_event_loop()
+        items = [item for item in COMMON_STOCKS if item.get("code")]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = await loop.run_in_executor(
+                None,
+                lambda: list(pool.map(_fetch, items)),
+            )
+        results = [r for r in results if r is not None]
+        return JSONResponse({"stocks": results})
+
     @app.post("/update_portfolio", response_class=HTMLResponse)
     async def update_portfolio(
         request: Request,

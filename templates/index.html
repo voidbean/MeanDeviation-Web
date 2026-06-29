@@ -768,12 +768,13 @@
                                 <tr>
                                     <th scope="col">代码</th>
                                     <th scope="col">名称</th>
+                                    <th scope="col">信号</th>
                                     <th scope="col"></th>
                                 </tr>
                                 </thead>
                                 <tbody id="common-stocks-tbody">
                                 {% for s in common_stocks %}
-                                    <tr data-tag="{{ s.tag }}">
+                                    <tr data-tag="{{ s.tag }}" data-code="{{ s.code }}">
                                         <td>{{ s.code }}</td>
                                         <td>
                                             {{ s.name }}
@@ -788,6 +789,9 @@
                                                   onclick="openTagModal('{{ s.code }}', '')"
                                                   title="点击设置行业">+行业</span>
                                             {% endif %}
+                                        </td>
+                                        <td class="signal-cell" id="signal-{{ s.code }}">
+                                            <span class="text-muted small">…</span>
                                         </td>
                                         <td>
                                             <button type="button"
@@ -1078,6 +1082,45 @@
         if (form) form.submit();
     }
 
+    // ── 自选股信号轮询 ────────────────────────────────────────────────────────
+    const _SIGNAL_CLASS_MAP = {
+        'danger':    'badge bg-danger',
+        'warning':   'badge bg-warning text-dark',
+        'primary':   'badge bg-primary',
+        'info':      'badge bg-info text-dark',
+        'secondary': 'badge bg-secondary',
+    };
+
+    function _renderSignalBadge(stock) {
+        const cls = _SIGNAL_CLASS_MAP[stock.advice_class] || 'badge bg-secondary';
+        const price = stock.current_price != null ? ` <small class="text-muted">${stock.current_price}</small>` : '';
+        const tip = stock.tooltip ? ` title="${stock.tooltip}"` : '';
+        return `<span class="${cls}"${tip}>${stock.signal}</span>${price}`;
+    }
+
+    function refreshCommonStocksSignal() {
+        fetch('/api/common_stocks_status')
+            .then(r => r.json())
+            .then(data => {
+                (data.stocks || []).forEach(s => {
+                    const cell = document.getElementById('signal-' + s.code);
+                    if (!cell) return;
+                    if (s.error) {
+                        cell.innerHTML = '<span class="text-muted small">-</span>';
+                    } else {
+                        cell.innerHTML = _renderSignalBadge(s);
+                        // 初始化 tooltip（Bootstrap 5）
+                        cell.querySelectorAll('[title]').forEach(el => {
+                            if (!el.dataset.bsOriginalTitle) {
+                                new bootstrap.Tooltip(el, { trigger: 'hover' });
+                            }
+                        });
+                    }
+                });
+            })
+            .catch(() => {});
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         // 初始化所有 Bootstrap tooltip
         document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
@@ -1085,6 +1128,11 @@
         });
         // 应用 tag 颜色
         applyTagColors();
+        // 首次加载即刷新信号，之后每 30 秒轮询一次
+        if (document.getElementById('common-stocks-tbody')) {
+            refreshCommonStocksSignal();
+            setInterval(refreshCommonStocksSignal, 30000);
+        }
         const analyzeForm = document.getElementById('analyze-form');
         const analyzeBtn = document.getElementById('analyze-btn');
         if (analyzeForm && analyzeBtn) {
