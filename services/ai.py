@@ -19,6 +19,53 @@ from services.tushare_tools import (
 _MAX_TOKENS = 4096
 
 
+def _claude_system_blocks(system_prompt: str) -> list:
+    """将系统提示包装为带 prompt caching 的 content blocks。
+
+    skills 系统提示是每轮工具调用都逐字节重发的巨大前缀（约 15 万 token），
+    打上 cache_control 后：首轮写缓存按 1.25x 计费，后续轮命中按 0.1x，
+    5 分钟 TTL 内一次工具循环（写1+读N）净省 60%+。内容不变，零质量损失。
+    """
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _log_claude_cache(tag: str, resp) -> None:
+    """打印 Claude usage 中的缓存字段，用于验证网关是否透传缓存。"""
+    try:
+        u = resp.usage
+        logger.info(
+            "%s usage input=%s cache_write=%s cache_read=%s output=%s",
+            tag,
+            getattr(u, "input_tokens", None),
+            getattr(u, "cache_creation_input_tokens", None),
+            getattr(u, "cache_read_input_tokens", None),
+            getattr(u, "output_tokens", None),
+        )
+    except Exception:
+        pass
+
+
+def _log_openai_cache(tag: str, resp) -> None:
+    """打印 OpenAI usage 中的 cached_tokens（自动缓存，无需传参）。"""
+    try:
+        u = resp.usage
+        details = getattr(u, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None) if details else None
+        logger.info(
+            "%s usage prompt=%s cached=%s completion=%s",
+            tag,
+            getattr(u, "prompt_tokens", None),
+            cached,
+            getattr(u, "completion_tokens", None),
+        )
+    except Exception:
+        pass
+
+
 def _make_openai_client(timeout: float = 180.0):
     """构造 OpenAI 兼容 client；若配置了 OPENAI_PROXY，仅此 client 的请求走代理
     （不影响 Tushare 等其它出站流量）。"""
@@ -79,16 +126,18 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
             kwargs["base_url"] = _cfg.CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         claude_tools = _build_claude_tools()
+        system_blocks = _claude_system_blocks(system_prompt)
         messages = [{"role": "user", "content": user_prompt}]
         for _round in range(MAX_TOOL_ROUNDS):
             resp = client.messages.create(
                 model=_cfg.CLAUDE_MODEL,
                 max_tokens=_MAX_TOKENS,
-                system=system_prompt,
+                system=system_blocks,
                 tools=claude_tools,
                 messages=messages,
             )
             logger.info("claude tool_use round=%d stop_reason=%s", _round, resp.stop_reason)
+            _log_claude_cache(f"claude tool_use round={_round}", resp)
             response_content = resp.content or []
             if resp.stop_reason == "end_turn":
                 return "".join(b.text for b in response_content if hasattr(b, "text"))
@@ -127,6 +176,7 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
             )
             choice = resp.choices[0]
             logger.info("openai tool_use round=%d finish_reason=%s", _round, choice.finish_reason)
+            _log_openai_cache(f"openai tool_use round={_round}", resp)
             if choice.finish_reason == "length":
                 logger.warning("openai tool_use truncated by max_tokens=%d", _cfg.OPENAI_MAX_TOKENS)
                 return choice.message.content or ""
@@ -204,6 +254,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
             kwargs["base_url"] = _cfg.CLAUDE_BASE_URL
         client = anthropic.Anthropic(**kwargs)
         claude_tools = _build_claude_tools()
+        system_blocks = _claude_system_blocks(system_prompt)
 
         claude_messages = [
             {"role": m["role"], "content": m["content"]}
@@ -215,11 +266,12 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
             resp = client.messages.create(
                 model=_cfg.CLAUDE_MODEL,
                 max_tokens=_MAX_TOKENS,
-                system=system_prompt,
+                system=system_blocks,
                 tools=claude_tools,
                 messages=claude_messages,
             )
             logger.info("claude streaming round=%d stop_reason=%s", _round, resp.stop_reason)
+            _log_claude_cache(f"claude streaming round={_round}", resp)
             response_content = resp.content or []
 
             if resp.stop_reason == "end_turn":
@@ -271,6 +323,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
             )
             choice = resp.choices[0]
             logger.info("openai streaming round=%d finish_reason=%s", _round, choice.finish_reason)
+            _log_openai_cache(f"openai streaming round={_round}", resp)
 
             if choice.finish_reason == "length":
                 logger.warning("openai streaming truncated by max_tokens=%d", _cfg.OPENAI_MAX_TOKENS)
@@ -398,9 +451,10 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
         msg = client.messages.create(
             model=_cfg.CLAUDE_MODEL,
             max_tokens=_MAX_TOKENS,
-            system=system_prompt,
+            system=_claude_system_blocks(system_prompt),
             messages=[{"role": "user", "content": user_prompt}],
         )
+        _log_claude_cache("claude simple", msg)
         return "".join(b.text for b in (msg.content or []) if hasattr(b, "text"))
 
     elif provider == "openai":
