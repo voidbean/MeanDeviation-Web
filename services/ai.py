@@ -19,6 +19,19 @@ from services.tushare_tools import (
 _MAX_TOKENS = 4096
 
 
+def _make_openai_client(timeout: float = 180.0):
+    """构造 OpenAI 兼容 client；若配置了 OPENAI_PROXY，仅此 client 的请求走代理
+    （不影响 Tushare 等其它出站流量）。"""
+    from openai import OpenAI
+    kwargs: dict = {"api_key": _cfg.OPENAI_API_KEY, "timeout": timeout}
+    if _cfg.OPENAI_BASE_URL:
+        kwargs["base_url"] = _cfg.OPENAI_BASE_URL
+    if _cfg.OPENAI_PROXY:
+        import httpx
+        kwargs["http_client"] = httpx.Client(proxy=_cfg.OPENAI_PROXY, timeout=timeout)
+    return OpenAI(**kwargs)
+
+
 # ── 会话持久化 ────────────────────────────────────────────────────────────────
 
 def _save_ai_conversation(session_id: str, stock_code: str, messages: list) -> None:
@@ -99,11 +112,7 @@ def call_ai_model_with_tools(system_prompt: str, user_prompt: str) -> str:
         return "".join(b.text for b in (resp.content or []) if hasattr(b, "text"))
 
     elif provider == "openai":
-        from openai import OpenAI
-        kwargs = {"api_key": _cfg.OPENAI_API_KEY, "timeout": 180.0}
-        if _cfg.OPENAI_BASE_URL:
-            kwargs["base_url"] = _cfg.OPENAI_BASE_URL
-        client = OpenAI(**kwargs)
+        client = _make_openai_client(timeout=180.0)
         openai_tools = _build_openai_tools()
         messages = [
             {"role": "system", "content": system_prompt},
@@ -248,11 +257,7 @@ def call_ai_model_streaming(system_prompt: str, messages: list):
         yield ("done", full_text)
 
     elif provider == "openai":
-        from openai import OpenAI
-        kwargs = {"api_key": _cfg.OPENAI_API_KEY, "timeout": 180.0}
-        if _cfg.OPENAI_BASE_URL:
-            kwargs["base_url"] = _cfg.OPENAI_BASE_URL
-        client = OpenAI(**kwargs)
+        client = _make_openai_client(timeout=180.0)
         openai_tools = _build_openai_tools()
         oai_messages = [{"role": "system", "content": system_prompt}] + list(messages)
 
@@ -399,11 +404,7 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
         return "".join(b.text for b in (msg.content or []) if hasattr(b, "text"))
 
     elif provider == "openai":
-        from openai import OpenAI
-        kwargs = {"api_key": _cfg.OPENAI_API_KEY, "timeout": 120.0}
-        if _cfg.OPENAI_BASE_URL:
-            kwargs["base_url"] = _cfg.OPENAI_BASE_URL
-        client = OpenAI(**kwargs)
+        client = _make_openai_client(timeout=120.0)
         resp = client.chat.completions.create(
             model=_cfg.OPENAI_MODEL,
             max_tokens=_MAX_TOKENS,

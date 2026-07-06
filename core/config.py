@@ -25,6 +25,7 @@ CLAUDE_BASE_URL   = os.getenv("CLAUDE_BASE_URL", "")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o")
 OPENAI_BASE_URL   = os.getenv("OPENAI_BASE_URL", "")
+OPENAI_PROXY      = os.getenv("OPENAI_PROXY", "")  # 仅 OpenAI 兼容请求走此代理（如 OpenRouter 走日本出口）
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL      = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")

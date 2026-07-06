@@ -700,7 +700,7 @@
             {% endif %}
         </div>
 
-        <!-- 右侧：常用股票 + 批量分析 + 历史查询记录 -->
+        <!-- 右侧：常用股票 + 历史查询记录 -->
         <div class="col-12 col-lg-5">
 
             {# 三大指数走势对比图 #}
@@ -774,19 +774,21 @@
                                 </thead>
                                 <tbody id="common-stocks-tbody">
                                 {% for s in common_stocks %}
-                                    <tr data-tag="{{ s.tag }}" data-code="{{ s.code }}">
+                                    <tr data-tag="{{ s.tag }}" data-code="{{ s.code }}"
+                                        onclick="requery('{{ s.code }}')"
+                                        style="cursor:pointer;">
                                         <td>{{ s.code }}</td>
                                         <td>
                                             {{ s.name }}
                                             {% if s.tag %}
                                             <span class="stock-tag-badge ms-1"
                                                   data-tag-name="{{ s.tag }}"
-                                                  onclick="openTagModal('{{ s.code }}', '{{ s.tag }}')"
+                                                  onclick="event.stopPropagation(); openTagModal('{{ s.code }}', '{{ s.tag }}')"
                                                   title="点击修改行业">{{ s.tag }}</span>
                                             {% else %}
                                             <span class="stock-tag-badge ms-1"
                                                   style="background:#adb5bd;"
-                                                  onclick="openTagModal('{{ s.code }}', '')"
+                                                  onclick="event.stopPropagation(); openTagModal('{{ s.code }}', '')"
                                                   title="点击设置行业">+行业</span>
                                             {% endif %}
                                         </td>
@@ -796,18 +798,21 @@
                                         <td>
                                             <button type="button"
                                                     class="btn btn-link btn-sm text-danger p-0"
-                                                    onclick="removeStock('{{ s.code }}')">✕</button>
+                                                    onclick="event.stopPropagation(); removeStock('{{ s.code }}')">✕</button>
                                         </td>
                                     </tr>
                                 {% endfor %}
                                 </tbody>
                             </table>
                         </div>
-                        <form id="batch-form" action="/analyze_batch" method="post">
-                            <button id="batch-btn" type="submit" class="btn btn-outline-primary btn-sm w-100">
-                                批量分析常用股票
-                            </button>
-                        </form>
+                        <div class="d-flex gap-1">
+                            <form id="batch-form" action="/analyze_batch" method="post" class="flex-grow-1">
+                                <button id="batch-btn" type="submit" class="btn btn-outline-primary btn-sm w-100">
+                                    刷新信号
+                                </button>
+                            </form>
+                            <a href="/batch" class="btn btn-outline-secondary btn-sm">查看详情</a>
+                        </div>
                     {% else %}
                         <p class="text-muted small mb-2">暂无常用股票。</p>
                     {% endif %}
@@ -833,43 +838,6 @@
                 </div>
             </div>
 
-            {% if batch_results %}
-                <div class="card shadow-sm mb-3">
-                    <div class="card-header bg-white">
-                        <h6 class="mb-0">批量分析结果</h6>
-                    </div>
-                    <div class="card-body p-0">
-                        <div class="table-responsive">
-                            <table class="table table-striped table-sm mb-0">
-                                <thead>
-                                <tr>
-                                    <th scope="col">代码</th>
-                                    <th scope="col">名称</th>
-                                    <th scope="col">当前价</th>
-                                    <th scope="col">均价</th>
-                                    <th scope="col">上轨</th>
-                                    <th scope="col">下轨</th>
-                                    <th scope="col">信号</th>
-                                </tr>
-                                </thead>
-                                <tbody>
-                                {% for r in batch_results %}
-                                    <tr>
-                                        <td>{{ r.code }}</td>
-                                        <td>{{ r.name }}</td>
-                                        <td>{{ r.current_price }}</td>
-                                        <td>{{ r.avg_price }}</td>
-                                        <td>{{ r.upper_line }}</td>
-                                        <td>{{ r.lower_line }}</td>
-                                        <td><span class="badge bg-{{ r.advice_class }}">{{ r.signal }}</span></td>
-                                    </tr>
-                                {% endfor %}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-            {% endif %}
 
             <div class="card shadow-sm mb-3">
                 <div class="card-header bg-white">
@@ -1153,7 +1121,7 @@
                 batchBtn.disabled = true;
                 batchBtn.innerHTML =
                     '<span class=”spinner-border spinner-border-sm me-1” role=”status” aria-hidden=”true”></span>' +
-                    '批量分析中...';
+                    '刷新信号中...';
             });
         }
 

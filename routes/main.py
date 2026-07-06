@@ -155,28 +155,34 @@ def _register_routes(app, templates):
 
     @app.post("/analyze_batch", response_class=HTMLResponse)
     async def analyze_batch(request: Request):
-        results = []
-        for item in COMMON_STOCKS:
-            code = item.get("code")
-            if not code:
-                continue
-            res = calculate_8848(code)
-            if res.get("status") == "success":
-                results.append(res)
+        import concurrent.futures
+        import time
 
-        rid = str(uuid.uuid4())
-        save_temp_result(rid, {
-            "result":          None,
-            "last_code":       "",
-            "batch_results":   results,
-            "history_results": None,
-            "ai_analysis":     None,
-            "ai_error":        None,
-            "ai_provider":     _cfg.AI_PROVIDER,
-            "ai_mode":         "intraday",
-            "user_hint":       "",
+        items = [item for item in COMMON_STOCKS if item.get("code")]
+
+        def _fetch(item):
+            res = calculate_8848(item["code"])
+            return res if res.get("status") == "success" else None
+
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            raw = await loop.run_in_executor(None, lambda: list(pool.map(_fetch, items)))
+        results = [r for r in raw if r is not None]
+
+        save_temp_result("batch_latest", {
+            "batch_results": results,
+            "batch_time":    time.strftime("%Y-%m-%d %H:%M:%S"),
         })
-        return RedirectResponse(url=f"/?result_id={rid}", status_code=303)
+        return RedirectResponse(url="/batch", status_code=303)
+
+    @app.get("/batch", response_class=HTMLResponse)
+    async def batch_page(request: Request):
+        data = load_temp_result("batch_latest", keep=True)
+        return templates.TemplateResponse("batch.html", {
+            "request":       request,
+            "batch_results": data.get("batch_results", []),
+            "batch_time":    data.get("batch_time", ""),
+        })
 
     @app.get("/api/common_stocks_status")
     async def common_stocks_status():

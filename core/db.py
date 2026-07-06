@@ -284,7 +284,7 @@ def save_temp_result(result_id: str, payload: dict) -> None:
         logger.error("save_temp_result failed: %s", e)
 
 
-def load_temp_result(result_id: str) -> dict:
+def load_temp_result(result_id: str, keep: bool = False) -> dict:
     if not result_id:
         return {}
     try:
@@ -294,8 +294,9 @@ def load_temp_result(result_id: str) -> dict:
         )
         row = cur.fetchone()
         if row:
-            conn.execute("DELETE FROM temp_results WHERE result_id = ?", (result_id,))
-            conn.commit()
+            if not keep:
+                conn.execute("DELETE FROM temp_results WHERE result_id = ?", (result_id,))
+                conn.commit()
             conn.close()
             return json.loads(row[0])
         conn.close()
