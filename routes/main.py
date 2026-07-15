@@ -10,7 +10,6 @@ import sqlite3
 import threading as _threading
 import uuid
 
-from dotenv import load_dotenv
 from fastapi import Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
@@ -47,7 +46,7 @@ COMMON_STOCKS = load_common_stocks()
 
 
 # 项目根目录的 .env（和 core/config.py 读取的是同一个文件）
-_ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 
 def _update_env_key(path: str, key: str, value: str) -> None:
@@ -281,9 +280,12 @@ def _register_routes(app, templates):
         global COMMON_STOCKS
         code_list = [c.strip() for c in codes.replace("，", ",").split(",") if c.strip()]
         new_val = ",".join(code_list)
+        # 先更新进程内环境变量与内存列表，再写 .env。
+        # 不能只靠 load_dotenv()：无路径时可能因 cwd 找不到文件，导致 UI 仍读旧值。
+        os.environ["COMMON_STOCK_CODES"] = new_val
+        COMMON_STOCKS = [{"code": c} for c in code_list]
+        _cfg.COMMON_STOCKS = COMMON_STOCKS
         _update_env_key(_ENV_PATH, "COMMON_STOCK_CODES", new_val)
-        load_dotenv(override=True)
-        COMMON_STOCKS = load_common_stocks()
         return RedirectResponse(url="/", status_code=303)
 
     @app.get("/api/portfolio_overview", response_class=JSONResponse)

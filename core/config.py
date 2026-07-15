@@ -5,10 +5,11 @@ from pathlib import Path
 import tushare as ts
 from dotenv import load_dotenv
 
-load_dotenv()
-
 # 项目根目录（core/ 的上一级）
 _ROOT = Path(__file__).parent.parent
+
+# 必须指定根目录 .env，避免 cwd 变化时 find_dotenv 找不到文件
+load_dotenv(_ROOT / ".env", override=True)
 
 logging.basicConfig(
     filename=str(_ROOT / "app.log"),
