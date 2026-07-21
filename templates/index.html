@@ -245,6 +245,9 @@
                             <!-- BOLL 布林带 -->
                             {% if result.boll %}
                             <h6 class="border-bottom pb-2 mb-2">BOLL 布林带（20日，2σ）</h6>
+                            {% if result.boll.indicator_note %}
+                            <p class="text-muted mb-2" style="font-size:0.75rem;">{{ result.boll.indicator_note }}</p>
+                            {% endif %}
                             <ul class="list-group list-group-flush mb-2">
                                 <li class="list-group-item d-flex justify-content-between align-items-center bg-danger-subtle py-1"
                                     data-bs-toggle="tooltip" data-bs-placement="left"
@@ -285,6 +288,9 @@
                             {% if result.macd %}
                             {% set macd = result.macd %}
                             <h6 class="border-bottom pb-2 mb-2">MACD（12,26,9）</h6>
+                            {% if macd.indicator_note %}
+                            <p class="text-muted mb-2" style="font-size:0.75rem;">{{ macd.indicator_note }}</p>
+                            {% endif %}
 
                             {# 背离告警 —— 最优先展示 #}
                             {% if macd.divergence == "top" %}

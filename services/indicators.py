@@ -441,20 +441,81 @@ def _get_daily_records_for_rousu(code: str, n: int = 15) -> list:
 
 # ── 技术指标计算 ─────────────────────────────────────────────────────────────
 
-def _calc_macd(code: str) -> dict | None:
+def _is_etf_code(code: str) -> bool:
+    """与 fetch_history.is_etf 一致：上交所 5 开头、深交所 1 开头为 ETF/基金。"""
     short_code = code.split(".")[0] if "." in code else code
-    ts_code    = code if "." in code else None
+    if len(short_code) != 6 or not short_code.isdigit():
+        return False
+    if short_code.startswith("5"):
+        return True
+    if short_code.startswith("1"):
+        return True
+    return False
+
+
+def _resolve_db_code(conn: sqlite3.Connection, code: str) -> str | None:
+    short_code = code.split(".")[0] if "." in code else code
+    ts_code = code if "." in code else None
+    for q in ([ts_code, short_code] if ts_code else [short_code]):
+        if q and conn.execute(
+            "SELECT 1 FROM daily_records WHERE code=? LIMIT 1", (q,)
+        ).fetchone():
+            return q
+    return None
+
+
+def _load_recent_daily(conn: sqlite3.Connection, db_code: str, limit: int, *, with_factors: bool = False) -> list:
+    if with_factors:
+        sql = """
+            SELECT date, close, macd, macd_dif, macd_dea,
+                   boll_upper, boll_mid, boll_lower, ma5, ma10, ma20
+            FROM daily_records WHERE code=? ORDER BY date DESC LIMIT ?
+        """
+    else:
+        sql = "SELECT date, close FROM daily_records WHERE code=? ORDER BY date DESC LIMIT ?"
+    rows = conn.execute(sql, (db_code, limit)).fetchall()
+    return list(reversed(rows))
+
+
+def _ema_first_close(data: list[float], period: int) -> list[float]:
+    k = 2 / (period + 1)
+    out = [data[0]] * len(data)
+    for i in range(1, len(data)):
+        out[i] = data[i] * k + out[i - 1] * (1 - k)
+    return out
+
+
+def _compute_macd_from_closes(closes: list[float]) -> tuple[list[float], list[float], list[float]]:
+    """MACD(12,26,9)，柱值按国内常用口径 2×(DIF−DEA)。"""
+    n = len(closes)
+    ema12 = _ema_first_close(closes, 12)
+    ema26 = _ema_first_close(closes, 26)
+    dif = [ema12[i] - ema26[i] for i in range(n)]
+    dea = _ema_first_close(dif, 9)
+    hist = [2 * (dif[i] - dea[i]) for i in range(n)]
+    return dif, dea, hist
+
+
+def _indicator_stale_note(latest_date: str, factor_date: str | None, source: str) -> str | None:
+    if source == "tushare":
+        return None
+    if factor_date and factor_date < latest_date:
+        return f"因子数据截至 {factor_date}（现价日 {latest_date}），以下为本地计算"
+    return None
+
+
+def _calc_macd(code: str) -> dict | None:
     try:
         conn = sqlite3.connect(DB_PATH)
-        rows = None
-        for q in ([ts_code, short_code] if ts_code else [short_code]):
-            if q is None:
-                continue
-            rows = conn.execute(
-                "SELECT date, close FROM daily_records WHERE code=? ORDER BY date ASC LIMIT 90", (q,)
-            ).fetchall()
-            if rows:
-                break
+        db_code = _resolve_db_code(conn, code)
+        if not db_code:
+            conn.close()
+            return None
+        rows = _load_recent_daily(conn, db_code, 90, with_factors=True)
+        factor_date = conn.execute(
+            "SELECT MAX(date) FROM daily_records WHERE code=? AND macd_dif IS NOT NULL",
+            (db_code,),
+        ).fetchone()[0]
         conn.close()
     except Exception:
         return None
@@ -462,22 +523,23 @@ def _calc_macd(code: str) -> dict | None:
     if not rows or len(rows) < 35:
         return None
 
-    dates  = [r[0] for r in rows]
+    dates = [r[0] for r in rows]
     closes = [float(r[1]) for r in rows]
-    n      = len(closes)
+    n = len(closes)
+    dif, dea, hist = _compute_macd_from_closes(closes)
 
-    def _ema(data, period):
-        k = 2 / (period + 1)
-        out = [data[0]] * len(data)
-        for i in range(1, len(data)):
-            out[i] = data[i] * k + out[i - 1] * (1 - k)
-        return out
+    use_db_latest = False
+    if not _is_etf_code(code):
+        for i, r in enumerate(rows):
+            if r[3] is not None and r[4] is not None:
+                dif[i] = float(r[3])
+                dea[i] = float(r[4])
+                hist[i] = float(r[2]) if r[2] is not None else round(2 * (dif[i] - dea[i]), 4)
+        if factor_date == dates[-1] and rows[-1][3] is not None:
+            use_db_latest = True
 
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    dif   = [ema12[i] - ema26[i] for i in range(n)]
-    dea   = _ema(dif, 9)
-    hist  = [dif[i] - dea[i] for i in range(n)]
+    source = "tushare" if use_db_latest else "calc"
+    indicator_note = _indicator_stale_note(dates[-1], factor_date, source)
 
     latest = {"date": dates[-1], "dif": round(dif[-1], 4), "dea": round(dea[-1], 4), "hist": round(hist[-1], 4)}
 
@@ -533,6 +595,8 @@ def _calc_macd(code: str) -> dict | None:
             "dea":   [round(v, 4) for v in dea[-20:]],
             "hist":  [round(v, 4) for v in hist[-20:]],
         },
+        "indicator_source": source,
+        "indicator_note": indicator_note,
     }
 
 
@@ -621,19 +685,17 @@ def _calc_yidong(code: str, current_price: float) -> dict | None:
 
 
 def _calc_boll(code: str) -> dict | None:
-    ts_code    = code if "." in code else None
-    short_code = code.split(".")[0] if "." in code else code
     try:
         conn = sqlite3.connect(DB_PATH)
-        rows = None
-        for q_code in ([ts_code, short_code] if ts_code else [short_code]):
-            if q_code is None:
-                continue
-            rows = conn.execute(
-                "SELECT date, close FROM daily_records WHERE code = ? ORDER BY date DESC LIMIT 60", (q_code,)
-            ).fetchall()
-            if rows:
-                break
+        db_code = _resolve_db_code(conn, code)
+        if not db_code:
+            conn.close()
+            return None
+        rows = _load_recent_daily(conn, db_code, 60, with_factors=True)
+        factor_date = conn.execute(
+            "SELECT MAX(date) FROM daily_records WHERE code=? AND boll_upper IS NOT NULL",
+            (db_code,),
+        ).fetchone()[0]
         conn.close()
     except Exception:
         return None
@@ -641,9 +703,8 @@ def _calc_boll(code: str) -> dict | None:
     if not rows or len(rows) < 5:
         return None
 
-    rows   = list(reversed(rows))
-    closes = [r[1] for r in rows if r[1] is not None]
-    n      = len(closes)
+    closes = [float(r[1]) for r in rows if r[1] is not None]
+    n = len(closes)
 
     def sma(data, period):
         return round(sum(data[-period:]) / period, 4) if len(data) >= period else None
@@ -651,16 +712,33 @@ def _calc_boll(code: str) -> dict | None:
     def boll_calc(data, period=20, k=2.0):
         if len(data) < period:
             return None, None, None
-        w   = data[-period:]
+        w = data[-period:]
         mid = sum(w) / period
         std = (sum((x - mid) ** 2 for x in w) / period) ** 0.5
         return round(mid + k * std, 4), round(mid, 4), round(mid - k * std, 4)
 
     upper, mid, lower = boll_calc(closes)
-    ma5   = sma(closes, 5)
-    ma10  = sma(closes, 10)
-    ma20  = sma(closes, 20)
+    ma5 = sma(closes, 5)
+    ma10 = sma(closes, 10)
+    ma20 = sma(closes, 20)
     latest = closes[-1]
+
+    source = "calc"
+    indicator_note = None
+    latest_date = rows[-1][0]
+    if not _is_etf_code(code) and factor_date == latest_date:
+        lr = rows[-1]
+        if lr[6] is not None and lr[7] is not None and lr[8] is not None:
+            upper, mid, lower = float(lr[6]), float(lr[7]), float(lr[8])
+            if lr[9] is not None:
+                ma5 = float(lr[9])
+            if lr[10] is not None:
+                ma10 = float(lr[10])
+            if lr[11] is not None:
+                ma20 = float(lr[11])
+            source = "tushare"
+    else:
+        indicator_note = _indicator_stale_note(latest_date, factor_date, "calc")
 
     if upper and lower and mid:
         if latest >= upper:
@@ -692,4 +770,6 @@ def _calc_boll(code: str) -> dict | None:
         "recent_closes": [{"date": rows[i][0], "close": rows[i][1]} for i in range(max(0, n - 20), n)],
         "ma_series": {"dates": ma_series_dates, "ma5": ma_series_ma5,
                       "ma10": ma_series_ma10, "ma20": ma_series_ma20},
+        "indicator_source": source,
+        "indicator_note": indicator_note,
     }

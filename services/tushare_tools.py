@@ -405,7 +405,7 @@ def _tool_get_technical_indicators(ts_code: str) -> dict:
         "ma": {"ma5": ma5, "ma10": ma10, "ma20": ma20, "trend": ma_trend},
         "boll": {"upper": boll_upper, "mid": boll_mid, "lower": boll_lower, "position": boll_position},
         "recent_closes": boll_data["recent_closes"],
-        "note": "BOLL参数：20日，2倍标准差；均线：简单移动平均",
+        "note": "BOLL参数：20日，2倍标准差；均线：简单移动平均；MACD柱=2×(DIF−DEA)",
     }
 
 
