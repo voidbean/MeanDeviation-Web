@@ -8,6 +8,7 @@ from services.indicators import (
     _get_intraday_points,
     _today_str,
     _calc_boll,
+    detect_box_consolidation,
 )
 
 MAX_TOOL_ROUNDS = 5
@@ -82,8 +83,10 @@ TOOL_DEFINITIONS = [
         "name": "get_technical_indicators",
         "description": (
             "基于个股近60日历史K线，计算并返回技术指标：BOLL布林带（上轨/中轨/下轨）、"
-            "5日/10日/20日均线（MA5/MA10/MA20），以及最近20日的收盘价序列。"
+            "5日/10日/20日均线（MA5/MA10/MA20）、箱体震荡检测（多窗口上下轨/置信度），"
+            "以及最近20日的收盘价序列。"
             "用于判断当前价格所处位置（BOLL位置）、趋势方向（均线多头/空头排列）、"
+            "箱体震荡区间（箱顶/箱底/是否在箱体内），"
             "支撑压力位（Skill 02仓位管理、Skill 03买卖信号、Skill 09长线持仓）。"
             "数据来自本地 daily_records 表，无需 Tushare 调用。"
         ),
@@ -369,6 +372,7 @@ def _tool_get_technical_indicators(ts_code: str) -> dict:
     boll_data = _calc_boll(ts_code)
     if boll_data is None:
         return {"error": "暂无历史K线数据，请先运行 fetch_history.py 拉取数据"}
+    box_data = detect_box_consolidation(ts_code)
     closes     = [r["close"] for r in boll_data["recent_closes"]]
     n          = boll_data["data_points"]
     boll_upper = boll_data["upper"]
@@ -404,8 +408,10 @@ def _tool_get_technical_indicators(ts_code: str) -> dict:
         "data_points": n,
         "ma": {"ma5": ma5, "ma10": ma10, "ma20": ma20, "trend": ma_trend},
         "boll": {"upper": boll_upper, "mid": boll_mid, "lower": boll_lower, "position": boll_position},
+        "box": box_data,
         "recent_closes": boll_data["recent_closes"],
-        "note": "BOLL参数：20日，2倍标准差；均线：简单移动平均；MACD柱=2×(DIF−DEA)",
+        "note": "BOLL参数：20日，2倍标准差；均线：简单移动平均；MACD柱=2×(DIF−DEA)；"
+                "箱体：摆动高/低点聚类中位数（±2%容差），孤立尖刺降权",
     }
 
 

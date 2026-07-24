@@ -21,6 +21,7 @@ from services.indicators import (
     _get_intraday_points, _build_intraday_candles,
     _get_daily_records_for_rousu,
     get_volatility_stats,
+    detect_box_consolidation,
 )
 
 
@@ -284,6 +285,7 @@ def calculate_8848(code: str):
         _pts = _get_intraday_points(code)
         _daily_recs = _get_daily_records_for_rousu(code, n=15)
         _vol_stats = get_volatility_stats(code)
+        _box = detect_box_consolidation(code)
 
         return {
             "code": code,
@@ -308,8 +310,11 @@ def calculate_8848(code: str):
             "f786": strat["f786"],
             "n20_high": n_day["n20_high"],
             "n20_low": n_day["n20_low"],
+            "n40_high": n_day["n40_high"],
+            "n40_low": n_day["n40_low"],
             "n60_high": n_day["n60_high"],
             "n60_low": n_day["n60_low"],
+            "box": _box,
             "intraday_points": _pts,
             "intraday_candles_5": _build_intraday_candles(_pts, window_minutes=5),
             "intraday_candles_15": _build_intraday_candles(_pts, window_minutes=15),
@@ -681,6 +686,22 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
     else:
         vol_stats_line = "日内波动特征：暂无数据（COMMON_STOCKS 列表外的票需积累分时快照后可用）"
 
+    box = result.get("box")
+    if box and not box.get("error"):
+        box_line = (
+            f"箱体震荡检测：{box['label']}（置信度 {box['confidence']}%，{box['window_days']}日窗口）\n"
+            f"  箱顶={box['box_top']}  箱底={box['box_bottom']}  箱体高度={box['box_height_pct']}%\n"
+            f"  触顶/触底次数={box['top_touches']}/{box['bottom_touches']}（聚类摆动点）  "
+            f"均线粘合度={box.get('ma_spread_pct')}%  收盘在箱内比例={box['in_box_ratio']}\n"
+            f"  当前位置：{box['position']}（箱内 {box['position_pct']}% 处）"
+        )
+        if box.get("multi_window_consistent"):
+            box_line += "\n  多周期（20/30/40/60日）高低点一致，箱体结构较稳固"
+    elif box and box.get("error"):
+        box_line = f"箱体震荡检测：{box['error']}"
+    else:
+        box_line = "箱体震荡检测：暂无数据（请先运行 fetch_history.py 拉取历史K线）"
+
     return f"""{mode_context}
 
 【当前股票信息】
@@ -692,11 +713,13 @@ VWAP均价：{result['avg_price']}
 静态8848下轨：{result['lower_line']}
 {atr_line}
 {ddp_line + chr(10) if ddp_line else ""}{vol_stats_line}
+{box_line}
 持仓状态：{"持仓中，成本价 " + str(result['cost_price']) if holding else "未持仓"}
 阶段高点：{result['stage_high'] if result['stage_high'] > 0 else "未设置"}
 阶段低点：{result['stage_low'] if result['stage_low'] > 0 else "未设置"}
 {fib_text}
 20日高点：{result['n20_high']}  20日低点：{result['n20_low']}
+40日高点：{result.get('n40_high', 0)}  40日低点：{result.get('n40_low', 0)}
 60日高点：{result['n60_high']}  60日低点：{result['n60_low']}
 静态规则信号参考：{result['signal']}
 

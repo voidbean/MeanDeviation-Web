@@ -306,11 +306,16 @@ def load_temp_result(result_id: str, keep: bool = False) -> dict:
 
 
 def get_n_day_stats(code: str):
-    result = {"n20_high": 0, "n20_low": 0, "n60_high": 0, "n60_low": 0}
+    result = {
+        "n20_high": 0, "n20_low": 0,
+        "n40_high": 0, "n40_low": 0,
+        "n60_high": 0, "n60_low": 0,
+    }
     try:
         conn = sqlite3.connect(DB_PATH)
         for days, high_key, low_key in [
             (20, "n20_high", "n20_low"),
+            (40, "n40_high", "n40_low"),
             (60, "n60_high", "n60_low"),
         ]:
             cur = conn.execute(

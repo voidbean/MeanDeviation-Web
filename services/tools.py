@@ -18,6 +18,7 @@ from services.indicators import (
     _get_benchmark_index,
     _calc_yidong,
     _calc_boll,
+    detect_box_consolidation,
 )
 
 # tushare_tools

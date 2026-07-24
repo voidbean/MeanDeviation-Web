@@ -4,6 +4,7 @@ services/indicators.py — 技术指标计算 + 分时快照 + 揉搓线分析
 """
 import math
 import sqlite3
+import statistics
 import time
 
 import tushare as ts
@@ -334,6 +335,340 @@ def get_volatility_stats(code: str) -> dict | None:
     if stats:
         return stats
     return get_daily_volatility_stats(code, n_days=20)
+
+
+# ── 箱体震荡检测 ─────────────────────────────────────────────────────────────
+
+def _price_decimals(code: str) -> int:
+    short = code.split(".")[0] if "." in code else code
+    return 3 if short.startswith(("51", "15", "16", "18")) else 2
+
+
+def _load_recent_daily_ohlc(conn: sqlite3.Connection, db_code: str, limit: int) -> list:
+    rows = conn.execute(
+        """
+        SELECT date, open, high, low, close, COALESCE(amount, 0)
+        FROM daily_records
+        WHERE code = ? AND high > 0 AND low > 0 AND close > 0
+        ORDER BY date DESC LIMIT ?
+        """,
+        (db_code, limit),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def _sma(closes: list[float], period: int) -> float | None:
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def _swing_points(values: list[float], lookback: int = 2, kind: str = "high") -> list[float]:
+    """提取局部摆动高/低点（左右各 lookback 根 K 线内的极值）。"""
+    n = len(values)
+    if n < 2 * lookback + 1:
+        return list(values)
+    swings: list[float] = []
+    for i in range(lookback, n - lookback):
+        window = values[i - lookback: i + lookback + 1]
+        if kind == "high":
+            if values[i] >= max(window) - 1e-9:
+                swings.append(values[i])
+        else:
+            if values[i] <= min(window) + 1e-9:
+                swings.append(values[i])
+    return swings
+
+
+def _cluster_price_level(
+    prices: list[float],
+    tol: float,
+    side: str = "top",
+) -> tuple[float, int]:
+    """
+    将相近价位聚类，取主导簇的中位数作为箱顶/箱底。
+    side='top'：优先触达次数多，其次价位更高；'bottom' 反之。
+    孤立尖刺（仅 1 次触及且远离次主导簇）会被降权。
+    """
+    if not prices:
+        return 0.0, 0
+
+    ordered = sorted(prices, reverse=(side == "top"))
+    clusters: list[list[float]] = []
+    for p in ordered:
+        for cluster in clusters:
+            center = statistics.median(cluster)
+            if center > 0 and abs(p - center) / center <= tol:
+                cluster.append(p)
+                break
+        else:
+            clusters.append([p])
+
+    def _cluster_key(c: list[float]) -> tuple:
+        med = statistics.median(c)
+        return (len(c), med if side == "top" else -med)
+
+    clusters.sort(key=_cluster_key, reverse=True)
+    best = clusters[0]
+    level = statistics.median(best)
+    touches = len(best)
+
+    # 孤立尖刺：仅 1 次触及且明显高于/低于次主导簇 → 采用次簇
+    if touches == 1 and len(clusters) > 1:
+        second = clusters[1]
+        if len(second) >= 2:
+            c1 = statistics.median(best)
+            c2 = statistics.median(second)
+            if c1 > 0:
+                gap = (c1 - c2) / c1 if side == "top" else (c2 - c1) / c2
+                if gap > tol * 1.5:
+                    level = statistics.median(second)
+                    touches = len(second)
+
+    return level, touches
+
+
+def _resolve_box_levels(
+    highs: list[float],
+    lows: list[float],
+    touch_tol: float = 0.02,
+    swing_lookback: int = 2,
+) -> tuple[float, float, int, int, str]:
+    """
+    箱顶/箱底：摆动高/低点聚类后的中位数。
+    摆动点不足时 fallback 到全日 high/low 聚类。
+    """
+    swing_highs = _swing_points(highs, swing_lookback, "high")
+    swing_lows = _swing_points(lows, swing_lookback, "low")
+
+    if len(swing_highs) >= 3:
+        box_top, top_touches = _cluster_price_level(swing_highs, touch_tol, "top")
+        top_method = "swing"
+    else:
+        box_top, top_touches = _cluster_price_level(highs, touch_tol, "top")
+        top_method = "daily"
+
+    if len(swing_lows) >= 3:
+        box_bottom, bottom_touches = _cluster_price_level(swing_lows, touch_tol, "bottom")
+        bottom_method = "swing"
+    else:
+        box_bottom, bottom_touches = _cluster_price_level(lows, touch_tol, "bottom")
+        bottom_method = "daily"
+
+    method = "swing_cluster_median" if top_method == "swing" and bottom_method == "swing" else "cluster_median"
+    return box_top, box_bottom, top_touches, bottom_touches, method
+
+
+def _analyze_box_window(ohlc_rows: list, touch_tol: float = 0.02) -> dict | None:
+    """对给定 OHLC 窗口评估箱体特征，返回评分与各指标。"""
+    if len(ohlc_rows) < 10:
+        return None
+
+    highs = [float(r[2]) for r in ohlc_rows]
+    lows = [float(r[3]) for r in ohlc_rows]
+    closes = [float(r[4]) for r in ohlc_rows]
+    amounts = [float(r[5]) for r in ohlc_rows]
+
+    box_top, box_bottom, top_touches, bottom_touches, level_method = _resolve_box_levels(
+        highs, lows, touch_tol,
+    )
+    avg_close = sum(closes) / len(closes)
+    if avg_close <= 0 or box_top <= box_bottom:
+        return None
+
+    box_height_pct = (box_top - box_bottom) / avg_close * 100
+
+    ma5, ma10, ma20 = _sma(closes, 5), _sma(closes, 10), _sma(closes, 20)
+    ma_spread_pct = None
+    if ma5 is not None and ma10 is not None and ma20 is not None:
+        ma_spread_pct = (max(ma5, ma10, ma20) - min(ma5, ma10, ma20)) / closes[-1] * 100
+
+    period = min(20, len(closes))
+    w = closes[-period:]
+    mid = sum(w) / period
+    std = (sum((x - mid) ** 2 for x in w) / period) ** 0.5
+    boll_bw_pct = (4 * std / mid) * 100 if mid > 0 else None
+
+    in_box = sum(1 for c in closes if box_bottom <= c <= box_top) / len(closes)
+
+    vol_shrink = None
+    if len(amounts) >= 10 and any(amounts):
+        half = len(amounts) // 2
+        first_avg = sum(amounts[:half]) / half
+        second_avg = sum(amounts[half:]) / (len(amounts) - half)
+        if first_avg > 0:
+            vol_shrink = second_avg / first_avg
+
+    score = 0
+    if 8 <= box_height_pct <= 25:
+        score += 25
+    elif 5 <= box_height_pct <= 30:
+        score += 12
+    elif box_height_pct < 40:
+        score += 5
+
+    if top_touches >= 2:
+        score += min(15, 5 * top_touches)
+    if bottom_touches >= 2:
+        score += min(15, 5 * bottom_touches)
+
+    if ma_spread_pct is not None:
+        if ma_spread_pct < 3:
+            score += 20
+        elif ma_spread_pct < 5:
+            score += 10
+        elif ma_spread_pct < 8:
+            score += 5
+
+    if in_box >= 0.9:
+        score += 15
+    elif in_box >= 0.8:
+        score += 10
+    elif in_box >= 0.7:
+        score += 5
+
+    if boll_bw_pct is not None:
+        if boll_bw_pct < 12:
+            score += 10
+        elif boll_bw_pct < 18:
+            score += 5
+
+    if vol_shrink is not None and vol_shrink < 0.85:
+        score += 5
+
+    latest = closes[-1]
+    box_range = box_top - box_bottom
+    pos_pct = (latest - box_bottom) / box_range * 100 if box_range > 0 else 50.0
+
+    if pos_pct >= 80:
+        position, advice_class = "接近箱顶（注意压力）", "warning"
+    elif pos_pct <= 20:
+        position, advice_class = "接近箱底（关注支撑）", "success"
+    else:
+        position, advice_class = "箱体内中部", "secondary"
+
+    return {
+        "window_days": len(ohlc_rows),
+        "box_top": box_top,
+        "box_bottom": box_bottom,
+        "box_height_pct": round(box_height_pct, 2),
+        "top_touches": top_touches,
+        "bottom_touches": bottom_touches,
+        "ma_spread_pct": round(ma_spread_pct, 2) if ma_spread_pct is not None else None,
+        "boll_bw_pct": round(boll_bw_pct, 2) if boll_bw_pct is not None else None,
+        "in_box_ratio": round(in_box, 2),
+        "vol_shrink_ratio": round(vol_shrink, 2) if vol_shrink is not None else None,
+        "confidence": min(100, score),
+        "position": position,
+        "position_pct": round(pos_pct, 1),
+        "advice_class": advice_class,
+        "latest_close": latest,
+        "level_method": level_method,
+        "raw_top": max(highs),
+        "raw_bottom": min(lows),
+    }
+
+
+def detect_box_consolidation(code: str) -> dict | None:
+    """
+    多窗口（20/30/40/60 日）箱体震荡检测。
+    主窗口默认 30 日，若其他窗口置信度显著更高则切换。
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        db_code = _resolve_db_code(conn, code)
+        if not db_code:
+            conn.close()
+            return None
+        ohlc = _load_recent_daily_ohlc(conn, db_code, 60)
+        conn.close()
+    except Exception as e:
+        logger.error("detect_box_consolidation failed code=%s %s", code, e)
+        return None
+
+    if len(ohlc) < 15:
+        return {"error": "历史K线不足15日", "data_points": len(ohlc)}
+
+    decimals = _price_decimals(code)
+    analyses: dict[int, dict] = {}
+    for w in (20, 30, 40, 60):
+        if len(ohlc) >= w:
+            item = _analyze_box_window(ohlc[-w:])
+            if item:
+                analyses[w] = item
+
+    if not analyses:
+        return None
+
+    if 30 in analyses:
+        best_w, best = 30, analyses[30]
+        for w, item in analyses.items():
+            if item["confidence"] > best["confidence"] + 15:
+                best_w, best = w, item
+    else:
+        best_w = max(analyses, key=lambda k: analyses[k]["confidence"])
+        best = analyses[best_w]
+
+    consistency_bonus = 0
+    if len(analyses) >= 2:
+        tops = [analyses[w]["box_top"] for w in analyses]
+        bots = [analyses[w]["box_bottom"] for w in analyses]
+        avg_top = sum(tops) / len(tops)
+        avg_bot = sum(bots) / len(bots)
+        if avg_top > 0 and avg_bot > 0:
+            top_spread = (max(tops) - min(tops)) / avg_top * 100
+            bot_spread = (max(bots) - min(bots)) / avg_bot * 100
+            if top_spread < 5 and bot_spread < 5:
+                consistency_bonus = 10
+
+    confidence = min(100, best["confidence"] + consistency_bonus)
+    is_box = (
+        confidence >= 55
+        and best["top_touches"] >= 2
+        and best["bottom_touches"] >= 2
+    )
+
+    if is_box:
+        label = (
+            f"箱体震荡（{best_w}日窄区间）"
+            if best["box_height_pct"] <= 15
+            else f"箱体震荡（{best_w}日平台整理）"
+        )
+    elif confidence >= 40:
+        label = "疑似箱体（趋势未尽，仅供参考）"
+    else:
+        label = "非箱体（趋势或宽震荡）"
+
+    window_refs = {}
+    for w, item in sorted(analyses.items()):
+        window_refs[f"n{w}"] = {
+            "high": round(item["box_top"], decimals),
+            "low": round(item["box_bottom"], decimals),
+            "height_pct": item["box_height_pct"],
+            "confidence": item["confidence"],
+        }
+
+    return {
+        "is_box": is_box,
+        "confidence": confidence,
+        "label": label,
+        "window_days": best_w,
+        "box_top": round(best["box_top"], decimals),
+        "box_bottom": round(best["box_bottom"], decimals),
+        "box_height_pct": best["box_height_pct"],
+        "top_touches": best["top_touches"],
+        "bottom_touches": best["bottom_touches"],
+        "ma_spread_pct": best["ma_spread_pct"],
+        "boll_bw_pct": best["boll_bw_pct"],
+        "in_box_ratio": best["in_box_ratio"],
+        "position": best["position"],
+        "position_pct": best["position_pct"],
+        "advice_class": best["advice_class"] if is_box else "secondary",
+        "data_points": len(ohlc),
+        "window_refs": window_refs,
+        "multi_window_consistent": consistency_bonus > 0,
+        "level_method": best.get("level_method", "cluster_median"),
+    }
 
 
 def analyze_rousu_lines(records: list, n: int = 10, label: str = "日K") -> list:

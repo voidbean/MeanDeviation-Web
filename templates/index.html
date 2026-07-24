@@ -284,6 +284,69 @@
                             </div>
                             {% endif %}
 
+                            <!-- 箱体震荡检测 -->
+                            {% if result.box and not result.box.error %}
+                            {% set box = result.box %}
+                            <h6 class="border-bottom pb-2 mb-2">箱体震荡检测（多窗口 20/30/40/60 日）</h6>
+                            {% if box.level_method %}
+                            <p class="text-muted mb-2" style="font-size:0.75rem;">
+                                箱顶/箱底：摆动高/低点聚类后取中位数（±2% 容差），孤立尖刺自动降权
+                            </p>
+                            {% endif %}
+                            <ul class="list-group list-group-flush mb-2">
+                                <li class="list-group-item d-flex justify-content-between align-items-center bg-danger-subtle py-1"
+                                    data-bs-toggle="tooltip" data-bs-placement="left"
+                                    title="主导阻力簇的中位数：多次相近摆动高点的代表价位，非单日极值。">
+                                    <small>箱顶（压力）</small>
+                                    <span class="fw-bold price-up">{{ box.box_top }}</span>
+                                </li>
+                                <li class="list-group-item d-flex justify-content-between align-items-center bg-success-subtle py-1"
+                                    data-bs-toggle="tooltip" data-bs-placement="left"
+                                    title="主导支撑簇的中位数：多次相近摆动低点的代表价位，非单日极值。">
+                                    <small>箱底（支撑）</small>
+                                    <span class="fw-bold price-down">{{ box.box_bottom }}</span>
+                                </li>
+                            </ul>
+                            <div class="alert alert-{{ box.advice_class }} py-1 px-2 mb-2"
+                                 style="font-size:0.8rem; cursor:help;"
+                                 data-bs-toggle="tooltip" data-bs-placement="bottom"
+                                 title="置信度由区间宽度、触顶触底次数（聚类）、均线粘合、BOLL收窄、量能萎缩等综合评分。≥55且上下各≥2次触及判为箱体。">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <span>
+                                        {% if box.is_box %}📦{% else %}📊{% endif %}
+                                        <strong>{{ box.label }}</strong>
+                                    </span>
+                                    <span class="badge bg-{{ box.advice_class if box.is_box else 'secondary' }}">
+                                        置信度 {{ box.confidence }}%
+                                    </span>
+                                </div>
+                                <div class="text-muted mt-1" style="font-size:0.75rem;">
+                                    {{ box.window_days }}日窗口 · 高度 {{ box.box_height_pct }}% ·
+                                    触顶/底 {{ box.top_touches }}/{{ box.bottom_touches }} ·
+                                    {{ box.position }}
+                                    {% if box.multi_window_consistent %} · 多周期一致{% endif %}
+                                </div>
+                            </div>
+                            {% if box.window_refs %}
+                            <div class="mb-3" style="font-size:0.75rem;">
+                                <small class="text-muted d-block mb-1">各窗口区间参考：</small>
+                                <div class="d-flex gap-2 flex-wrap">
+                                    {% for key, ref in box.window_refs.items() %}
+                                    <span class="badge text-bg-light border">
+                                        {{ key | replace('n', '') }}日
+                                        <span class="text-danger">↑{{ ref.high }}</span>/
+                                        <span class="text-success">↓{{ ref.low }}</span>
+                                        <span class="text-muted">({{ ref.confidence }}%)</span>
+                                    </span>
+                                    {% endfor %}
+                                </div>
+                            </div>
+                            {% endif %}
+                            {% elif result.box and result.box.error %}
+                            <h6 class="border-bottom pb-2 mb-2">箱体震荡检测</h6>
+                            <p class="text-muted mb-3" style="font-size:0.75rem;">{{ result.box.error }}</p>
+                            {% endif %}
+
                             <!-- MACD 指标 -->
                             {% if result.macd %}
                             {% set macd = result.macd %}
@@ -473,6 +536,15 @@
                                             <small class="text-muted me-2">📊 区间参考（点击填入，需手动保存）</small>
                                         </div>
                                         <div class="d-flex gap-2 flex-wrap">
+                                            {% if result.box and result.box.is_box %}
+                                            <button type="button" class="btn btn-outline-primary btn-sm"
+                                                    onclick="fillStage({{ result.box.box_top }}, {{ result.box.box_bottom }})">
+                                                箱体&nbsp;
+                                                <span class="text-danger">↑{{ result.box.box_top }}</span>
+                                                &nbsp;/&nbsp;
+                                                <span class="text-success">↓{{ result.box.box_bottom }}</span>
+                                            </button>
+                                            {% endif %}
                                             {% if result.n20_high %}
                                             <button type="button" class="btn btn-outline-secondary btn-sm"
                                                     onclick="fillStage({{ result.n20_high }}, {{ result.n20_low }})">
@@ -480,6 +552,15 @@
                                                 <span class="text-danger">↑{{ result.n20_high }}</span>
                                                 &nbsp;/&nbsp;
                                                 <span class="text-success">↓{{ result.n20_low }}</span>
+                                            </button>
+                                            {% endif %}
+                                            {% if result.n40_high %}
+                                            <button type="button" class="btn btn-outline-secondary btn-sm"
+                                                    onclick="fillStage({{ result.n40_high }}, {{ result.n40_low }})">
+                                                40日&nbsp;
+                                                <span class="text-danger">↑{{ result.n40_high }}</span>
+                                                &nbsp;/&nbsp;
+                                                <span class="text-success">↓{{ result.n40_low }}</span>
                                             </button>
                                             {% endif %}
                                             {% if result.n60_high %}
