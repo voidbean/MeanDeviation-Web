@@ -19,6 +19,43 @@ _app = None
 _templates = None
 
 
+def _period_return(records: list[dict], days: int) -> float | None:
+    """计算按日期倒序的行情记录在给定窗口内的累计涨跌幅。"""
+    if len(records) < 2:
+        return None
+    window = records[:min(days, len(records))]
+    latest_close = window[0].get("close", 0) or 0
+    base_close = window[-1].get("close", 0) or 0
+    if not latest_close or not base_close:
+        return None
+    return round((latest_close / base_close - 1) * 100, 2)
+
+
+def _summarize_index_records(records: list[dict]) -> dict:
+    """将较长指数历史压缩为可审计的趋势/量能画像，避免模型仅凭 5 日 K 线判浪。"""
+    if not records:
+        return {}
+    latest = records[0]
+    recent20 = records[:20]
+    highs = [r.get("high", 0) or 0 for r in recent20]
+    lows = [r.get("low", 0) or 0 for r in recent20]
+    amounts_5 = [r.get("amount_yi", 0) or 0 for r in records[:5]]
+    amounts_prev20 = [r.get("amount_yi", 0) or 0 for r in records[5:25]]
+    avg5 = sum(amounts_5) / len(amounts_5) if amounts_5 else 0
+    avg_prev20 = sum(amounts_prev20) / len(amounts_prev20) if amounts_prev20 else 0
+    amount_change = round((avg5 / avg_prev20 - 1) * 100, 1) if avg_prev20 else None
+    return {
+        "sample_days": len(records),
+        "latest_close": latest.get("close", 0),
+        "return_5d": _period_return(records, 5),
+        "return_20d": _period_return(records, 20),
+        "return_60d": _period_return(records, 60),
+        "high_20d": round(max(highs), 2) if highs else None,
+        "low_20d": round(min(lows), 2) if lows else None,
+        "amount_5d_vs_prev20_pct": amount_change,
+    }
+
+
 def register(app, templates):
     global _app, _templates
     _app = app
@@ -67,6 +104,13 @@ def _register_routes(app, templates):
             "  - get_futures_positions：获取期指多空持仓，辅助判断大盘方向\n"
             "  - get_moneyflow（指定某只风向标个股）：确认龙头资金健康度\n"
             "请在分析前主动调用 get_sector_flow，其余工具按需调用。\n\n"
+            "【方法论使用边界】技能库中的具体日期、行业主线、个股、轮动顺序和浪型结论均为历史案例，"
+            "不得迁移为当前市场事实。当前结论必须由本次提供的行情、资金和工具数据支持；"
+            "数据与历史案例冲突时，以本次数据为准。\n"
+            "【浪型纪律】不得默认当前处于 3 浪，更不得在证据不足时编造 3-3/3-5。"
+            "先在五浪上行、ABC 调整、箱体震荡和下跌趋势之间比较；"
+            "只有一级浪型证据充分时，才继续判断子浪。无法可靠判浪时必须明确写“无法可靠判浪”，"
+            "并改用趋势、量能和轮动强度给出条件化策略。\n\n"
             "以下是阿狼投资体系的技能库（已裁剪为板块分析相关章节）：\n\n"
             + skills_text
         )
@@ -112,7 +156,9 @@ def build_sector_prompt_data() -> dict:
         return result
 
     today = datetime.today()
-    start_date = (today - timedelta(days=15)).strftime("%Y%m%d")
+    # 一级浪型至少需要覆盖数周的趋势，而不是只看最近 5 个交易日。
+    # 90 个自然日通常可取得约 60 个交易日，也为 20/60 日强弱比较留出样本。
+    start_date = (today - timedelta(days=90)).strftime("%Y%m%d")
     end_date = today.strftime("%Y%m%d")
 
     sector_list = []
@@ -156,21 +202,20 @@ def build_sector_prompt_data() -> dict:
     for ts_code, records in sector_daily.items():
         records_sorted = sorted(records, key=lambda x: x["trade_date"], reverse=True)
         pct_1d = records_sorted[0]["pct_change"] if records_sorted else 0
-        pct_5d = 0.0
-        if len(records_sorted) >= 2:
-            cum = 1.0
-            for r in records_sorted[:5]:
-                cum *= (1 + r["pct_change"] / 100)
-            pct_5d = round((cum - 1) * 100, 2)
+        pct_5d = _period_return(records_sorted, 5) or 0.0
         perf_list.append({
             "ts_code":       ts_code,
             "name":          sector_code_to_name.get(ts_code, ts_code),
             "pct_change_1d": round(pct_1d, 2),
             "pct_change_5d": pct_5d,
+            "pct_change_20d": _period_return(records_sorted, 20),
+            "pct_change_60d": _period_return(records_sorted, 60),
             "days_data":     len(records_sorted),
         })
 
     perf_list.sort(key=lambda x: x["pct_change_5d"], reverse=True)
+    # 保留全量用于弱势板块和扩散度判断；页面仍只展示前 20，保持原有 UI 简洁。
+    result["sector_perf_all"] = perf_list
     result["sector_perf"] = perf_list[:20]
     logger.info("build_sector_prompt_data: sector_perf built, top=%s",
                 result["sector_perf"][0]["name"] if result["sector_perf"] else "N/A")
@@ -244,17 +289,27 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
     """将 build_sector_prompt_data() 的结果组装成 AI 分析 prompt。"""
     today_str = time.strftime("%Y-%m-%d")
 
-    index_data = get_index_market_data(days=10)
+    # 读 60 日历史用于一级浪型/趋势判断；保留最近 5 日明细以便复核。
+    index_data = get_index_market_data(days=60)
     index_sections = []
     for ts_code, idata in index_data.items():
         name = idata.get("name", ts_code)
         records = idata.get("records", [])
         if records:
+            summary = _summarize_index_records(records)
             lines = "\n".join(
                 f"  {r['date']}: 收{r['close']} 高{r['high']} 低{r['low']} 成交额{r['amount_yi']}亿"
                 for r in records[:5]
             )
-            index_sections.append(f"{name}（{ts_code}）近5日：\n{lines}")
+            index_sections.append(
+                f"{name}（{ts_code}，样本{summary['sample_days']}日）："
+                f"5日{summary['return_5d'] if summary['return_5d'] is not None else 'N/A'}%，"
+                f"20日{summary['return_20d'] if summary['return_20d'] is not None else 'N/A'}%，"
+                f"60日{summary['return_60d'] if summary['return_60d'] is not None else 'N/A'}%；"
+                f"近20日高/低 {summary['high_20d']}/{summary['low_20d']}；"
+                f"近5日成交额相对前20日 {summary['amount_5d_vs_prev20_pct'] if summary['amount_5d_vs_prev20_pct'] is not None else 'N/A'}%\n"
+                f"最近5日明细：\n{lines}"
+            )
         else:
             index_sections.append(f"{name}（{ts_code}）：暂无数据")
     index_text = "\n\n".join(index_sections) if index_sections else "暂无大盘数据"
@@ -270,12 +325,18 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
     if data["sector_perf"]:
         top5d = data["sector_perf"][:10]
         perf_lines_5d = "\n".join(
-            f"  {i+1}. {s['name']}（{s['ts_code']}）: 近5日{s['pct_change_5d']:+.2f}%  今日{s['pct_change_1d']:+.2f}%"
+            f"  {i+1}. {s['name']}（{s['ts_code']}）: 近5日{s['pct_change_5d']:+.2f}% "
+            f"近20日{(s['pct_change_20d'] if s['pct_change_20d'] is not None else 0):+.2f}% "
+            f"今日{s['pct_change_1d']:+.2f}%（样本{s['days_data']}日）"
             for i, s in enumerate(top5d)
         )
-        bottom5d = sorted(data["sector_perf"], key=lambda x: x["pct_change_5d"])[:5]
+        # 弱势板块必须从全量行业中选取，不能从“涨幅前 20”里倒排。
+        all_sector_perf = data.get("sector_perf_all") or data["sector_perf"]
+        bottom5d = sorted(all_sector_perf, key=lambda x: x["pct_change_5d"])[:5]
         perf_lines_bottom = "\n".join(
-            f"  {s['name']}（{s['ts_code']}）: 近5日{s['pct_change_5d']:+.2f}%  今日{s['pct_change_1d']:+.2f}%"
+            f"  {s['name']}（{s['ts_code']}）: 近5日{s['pct_change_5d']:+.2f}% "
+            f"近20日{(s['pct_change_20d'] if s['pct_change_20d'] is not None else 0):+.2f}% "
+            f"今日{s['pct_change_1d']:+.2f}%（样本{s['days_data']}日）"
             for s in bottom5d
         )
         sector_text = f"近5日涨幅前10：\n{perf_lines_5d}\n\n近5日跌幅前5（弱势板块）：\n{perf_lines_bottom}"
@@ -315,7 +376,7 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
 
     return f"""【分析日期】{today_str}
 
-【大盘风向标（近5日，按日期倒序）】
+【大盘风向标（60日趋势摘要 + 最近5日，按日期倒序）】
 {index_text}
 
 【北向资金（沪深港通，近5日）】
@@ -338,13 +399,15 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
 
 ---
 
-1. **大盘阶段判断**（Skill 01 的 3-X 框架）
-   - 当前处于哪个阶段（3-1/3-2/3-3/3-4/3-5）？若处于 3-4 请进一步判断子形态（绞肉机/机构自救/B反/弱C/强C）；若处于 3-5 请判断 A浪/B反/C杀位置
-   - 量能水平（与 8000亿增量底线 / 3000亿缩量离场线 对比）
-   - 阶段判断对当前操作的影响（满仓轮动 / 降仓等待 / 提现避让）
+1. **市场结构与浪型情景**（先判一级，后判子级）
+   - 先在“五浪上行（1/2/3/4/5）”“ABC 调整（A/B/C）”“箱体震荡”“下跌趋势”四类中选择主判断；不得预设为 3 浪。
+   - 给出一个主判断和最多一个备选判断，各自标注置信度（高/中/低 + 百分比）。每项必须列出至少 2 条本次数据证据和 1 条反证/不确定点。
+   - 仅当一级判断为五浪或 ABC 且置信度 ≥60% 时，才继续给出子浪：五浪可写 1-1～5-5（4 浪须说明整理形态），ABC 可写 A 浪、B 反或 C 浪。否则明确写“无法可靠判浪”，禁止用猜测补全浪型。
+   - 写清主判断的确认条件与失效条件：分别说明出现什么量能、指数位置、板块扩散或资金流变化后确认/推翻。量能阈值须结合本次实际数据，不可机械套用 skill 的历史数值。
+   - 基于以上结论给出仓位倾向（进攻 / 均衡 / 防守 / 等待），但用“当出现 X 做 X，不出现 X 不做 X”的条件句表达。
 
 2. **主线板块确认**（Skill 04）
-   - 结合 get_sector_flow 返回的资金净流入，当前哪 1-2 个板块是真正的主线（持续净流入 + 换手活跃）？
+   - 结合 get_sector_flow 返回的资金净流入、1/5/20 日相对强弱，当前哪 1-2 个板块是真正的主线（持续净流入 + 强度延续 + 换手活跃）？若证据不足，结论应为“暂无可确认主线”。
    - 机构行情 vs 柚子情绪行情的判断：当前哪种主导？依据是什么？
    - 是否已进入"发散到不正宗票"阶段？（参考上方换手率最高个股，判断是否偏离核心）
 
@@ -354,6 +417,7 @@ def build_sector_ai_prompt(data: dict, user_hint: str = "") -> str:
    - 风向标龙头健康度：结合涨跌幅和换手数据，各板块龙头是否仍在正常运作？
 
 4. **个股推荐**（每板块 1-2 只，从候选个股中选或根据你的知识补充）
+   - 只有主线置信度 ≥60% 时才给出推荐；否则只给“观察池 + 触发条件”，不得硬性推荐。
    - 代码 + 名称
    - 类型（A/B/C/D/E类，参考 Skill 11）
    - 选择理由（≤3句，说明为什么是这只而非其他；换手率高≠推荐理由）

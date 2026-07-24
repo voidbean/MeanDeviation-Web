@@ -310,7 +310,7 @@
                             <div class="alert alert-{{ box.advice_class }} py-1 px-2 mb-2"
                                  style="font-size:0.8rem; cursor:help;"
                                  data-bs-toggle="tooltip" data-bs-placement="bottom"
-                                 title="置信度由区间宽度、触顶触底次数（聚类）、均线粘合、BOLL收窄、量能萎缩等综合评分。≥55且上下各≥2次触及判为箱体。">
+                                 title="置信度由区间宽度、触顶触底次数（聚类）、均线粘合、BOLL收窄、量能萎缩等综合评分。判定还要求：高度5%~25%、至少75%收盘在箱内、上下各至少2次有效触及，且不是明显单边趋势。">
                                 <div class="d-flex justify-content-between align-items-center">
                                     <span>
                                         {% if box.is_box %}📦{% else %}📊{% endif %}

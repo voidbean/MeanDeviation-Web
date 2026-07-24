@@ -363,21 +363,36 @@ def _sma(closes: list[float], period: int) -> float | None:
     return sum(closes[-period:]) / period
 
 
-def _swing_points(values: list[float], lookback: int = 2, kind: str = "high") -> list[float]:
-    """提取局部摆动高/低点（左右各 lookback 根 K 线内的极值）。"""
+def _swing_points(
+    values: list[float],
+    lookback: int = 2,
+    kind: str = "high",
+    min_separation: int = 3,
+) -> list[float]:
+    """提取局部摆动高/低点，并合并同一轮波动中的重复极值。"""
     n = len(values)
     if n < 2 * lookback + 1:
         return list(values)
-    swings: list[float] = []
+    swings: list[tuple[int, float]] = []
     for i in range(lookback, n - lookback):
         window = values[i - lookback: i + lookback + 1]
-        if kind == "high":
-            if values[i] >= max(window) - 1e-9:
-                swings.append(values[i])
+        is_swing = (
+            values[i] >= max(window) - 1e-9
+            if kind == "high" else values[i] <= min(window) + 1e-9
+        )
+        if not is_swing:
+            continue
+
+        # 平台或相邻 K 线可能同时满足局部极值条件；它们只是一轮触达，
+        # 不能被计为多次测试箱顶/箱底。
+        if swings and i - swings[-1][0] < min_separation:
+            prev_i, prev_value = swings[-1]
+            is_more_extreme = values[i] > prev_value if kind == "high" else values[i] < prev_value
+            if is_more_extreme:
+                swings[-1] = (i, values[i])
         else:
-            if values[i] <= min(window) + 1e-9:
-                swings.append(values[i])
-    return swings
+            swings.append((i, values[i]))
+    return [value for _, value in swings]
 
 
 def _cluster_price_level(
@@ -459,6 +474,35 @@ def _resolve_box_levels(
     return box_top, box_bottom, top_touches, bottom_touches, method
 
 
+def _linear_trend_metrics(closes: list[float]) -> tuple[float, float]:
+    """返回收盘价线性回归的日斜率(%)及拟合优度 R²。"""
+    n = len(closes)
+    if n < 3:
+        return 0.0, 0.0
+    mean_x = (n - 1) / 2
+    mean_y = sum(closes) / n
+    if mean_y <= 0:
+        return 0.0, 0.0
+    ss_x = sum((i - mean_x) ** 2 for i in range(n))
+    slope = sum((i - mean_x) * (close - mean_y) for i, close in enumerate(closes)) / ss_x
+    fitted = [mean_y + slope * (i - mean_x) for i in range(n)]
+    ss_tot = sum((close - mean_y) ** 2 for close in closes)
+    ss_res = sum((close - fit) ** 2 for close, fit in zip(closes, fitted))
+    r_squared = 1 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
+    return slope / mean_y * 100, max(0.0, r_squared)
+
+
+def _is_valid_box(item: dict) -> bool:
+    """箱体的硬性准入条件；评分只用于排序，不可绕过这些条件。"""
+    return (
+        5 <= item["box_height_pct"] <= 25
+        and item["in_box_ratio"] >= 0.75
+        and item["top_touches"] >= 2
+        and item["bottom_touches"] >= 2
+        and not item["is_directional_trend"]
+    )
+
+
 def _analyze_box_window(ohlc_rows: list, touch_tol: float = 0.02) -> dict | None:
     """对给定 OHLC 窗口评估箱体特征，返回评分与各指标。"""
     if len(ohlc_rows) < 10:
@@ -490,6 +534,11 @@ def _analyze_box_window(ohlc_rows: list, touch_tol: float = 0.02) -> dict | None
     boll_bw_pct = (4 * std / mid) * 100 if mid > 0 else None
 
     in_box = sum(1 for c in closes if box_bottom <= c <= box_top) / len(closes)
+
+    trend_slope_pct, trend_r_squared = _linear_trend_metrics(closes)
+    # 价格每天稳定单向移动超过 0.12%，且线性趋势足够明显时，属于趋势通道
+    # 而非横向箱体。斜率小但噪声较大时仍可作为箱体候选。
+    is_directional_trend = abs(trend_slope_pct) >= 0.12 and trend_r_squared >= 0.35
 
     vol_shrink = None
     if len(amounts) >= 10 and any(amounts):
@@ -539,8 +588,13 @@ def _analyze_box_window(ohlc_rows: list, touch_tol: float = 0.02) -> dict | None
     latest = closes[-1]
     box_range = box_top - box_bottom
     pos_pct = (latest - box_bottom) / box_range * 100 if box_range > 0 else 50.0
+    breakout_buffer_pct = max(0.5, min(2.0, box_height_pct * 0.08))
 
-    if pos_pct >= 80:
+    if latest > box_top * (1 + breakout_buffer_pct / 100):
+        position, advice_class = "向上突破箱顶（待量能确认）", "warning"
+    elif latest < box_bottom * (1 - breakout_buffer_pct / 100):
+        position, advice_class = "向下跌破箱底（注意风险）", "danger"
+    elif pos_pct >= 80:
         position, advice_class = "接近箱顶（注意压力）", "warning"
     elif pos_pct <= 20:
         position, advice_class = "接近箱底（关注支撑）", "success"
@@ -557,6 +611,10 @@ def _analyze_box_window(ohlc_rows: list, touch_tol: float = 0.02) -> dict | None
         "ma_spread_pct": round(ma_spread_pct, 2) if ma_spread_pct is not None else None,
         "boll_bw_pct": round(boll_bw_pct, 2) if boll_bw_pct is not None else None,
         "in_box_ratio": round(in_box, 2),
+        "trend_slope_pct": round(trend_slope_pct, 3),
+        "trend_r_squared": round(trend_r_squared, 3),
+        "is_directional_trend": is_directional_trend,
+        "breakout_buffer_pct": round(breakout_buffer_pct, 2),
         "vol_shrink_ratio": round(vol_shrink, 2) if vol_shrink is not None else None,
         "confidence": min(100, score),
         "position": position,
@@ -622,11 +680,7 @@ def detect_box_consolidation(code: str) -> dict | None:
                 consistency_bonus = 10
 
     confidence = min(100, best["confidence"] + consistency_bonus)
-    is_box = (
-        confidence >= 55
-        and best["top_touches"] >= 2
-        and best["bottom_touches"] >= 2
-    )
+    is_box = confidence >= 55 and _is_valid_box(best)
 
     if is_box:
         label = (
@@ -634,8 +688,10 @@ def detect_box_consolidation(code: str) -> dict | None:
             if best["box_height_pct"] <= 15
             else f"箱体震荡（{best_w}日平台整理）"
         )
+    elif best["is_directional_trend"]:
+        label = "非箱体（单边趋势）"
     elif confidence >= 40:
-        label = "疑似箱体（趋势未尽，仅供参考）"
+        label = "疑似箱体（未满足有效区间条件）"
     else:
         label = "非箱体（趋势或宽震荡）"
 
@@ -661,6 +717,10 @@ def detect_box_consolidation(code: str) -> dict | None:
         "ma_spread_pct": best["ma_spread_pct"],
         "boll_bw_pct": best["boll_bw_pct"],
         "in_box_ratio": best["in_box_ratio"],
+        "trend_slope_pct": best["trend_slope_pct"],
+        "trend_r_squared": best["trend_r_squared"],
+        "is_directional_trend": best["is_directional_trend"],
+        "breakout_buffer_pct": best["breakout_buffer_pct"],
         "position": best["position"],
         "position_pct": best["position_pct"],
         "advice_class": best["advice_class"] if is_box else "secondary",
