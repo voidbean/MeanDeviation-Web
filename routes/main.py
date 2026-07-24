@@ -25,7 +25,7 @@ from core.db import (
 )
 from core.strategy import (
     calculate_8848, calculate_8848_history, calculate_strategy,
-    get_stock_volume_chart_data, build_ai_prompt, load_skills, to_ts_code,
+    get_stock_volume_chart_data, build_ai_prompt, build_ai_system_prompt, to_ts_code,
 )
 from services.indicators import analyze_rousu_lines, analyze_rousu_lines_intraday
 from services.ai import (
@@ -457,20 +457,8 @@ def _register_routes(app, templates):
         except Exception as e:
             logger.warning("ai_analyze: failed to load history for %s: %s", stock_code, e)
 
-        skills_text = load_skills()
-        system_prompt = (
-            "你是基于阿狼投资体系的 A 股分析助手。\n"
-            "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
-            "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
-            "在给出买卖建议时必须严格遵守此规则，不得建议投资者当日买入后同日卖出。\n"
-            "【盘口资金读法】分析时请主动调用以下工具获取实时数据：\n"
-            "  - get_index_intraday：获取大盘白/黄线 + vol_ratio，判断当前是黄线在上（大资金主导）还是白线在上（个股情绪）\n"
-            "  - get_intraday_lines：获取个股白/黄线 + vol_ratio，识别放量智障/缩量/顶级诱多等形态\n"
-            "  - get_moneyflow：获取近5日超大单/大单净流入，判断主力资金方向\n"
-            "盘中分析必须先调用 get_index_intraday 确认大盘黄白线状态，再做个股判断。\n\n"
-            "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
-            + skills_text
-        )
+        holding = result["cost_price"] > 0
+        system_prompt = build_ai_system_prompt(ai_mode, holding)
         index_data = get_index_market_data(days=20)
 
         stock_daily_rousu = analyze_rousu_lines(history, n=10, label="日K")
@@ -545,20 +533,8 @@ def _register_routes(app, templates):
             yield "event: progress\ndata: 构建分析 Prompt…\n\n"
 
             def _build_prompts():
-                skills_text = load_skills()
-                system_prompt = (
-                    "你是基于阿狼投资体系的 A 股分析助手。\n"
-                    "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
-                    "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
-                    "在给出买卖建议时必须严格遵守此规则，不得建议投资者当日买入后同日卖出。\n"
-                    "【盘口资金读法】分析时请主动调用以下工具获取实时数据：\n"
-                    "  - get_index_intraday：获取大盘白/黄线 + vol_ratio，判断当前是黄线在上（大资金主导）还是白线在上（个股情绪）\n"
-                    "  - get_intraday_lines：获取个股白/黄线 + vol_ratio，识别放量智障/缩量/顶级诱多等形态\n"
-                    "  - get_moneyflow：获取近5日超大单/大单净流入，判断主力资金方向\n"
-                    "盘中分析必须先调用 get_index_intraday 确认大盘黄白线状态，再做个股判断。\n\n"
-                    "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
-                    + skills_text
-                )
+                holding = result["cost_price"] > 0
+                system_prompt = build_ai_system_prompt(ai_mode, holding)
                 index_data = get_index_market_data(days=20)
                 stock_daily_rousu = analyze_rousu_lines(history, n=10, label="日K")
                 stock_intraday_rousu = analyze_rousu_lines_intraday(stock_code)
@@ -661,20 +637,9 @@ def _register_routes(app, templates):
             conv_messages.append({"role": "user", "content": user_message})
 
             def _load_sys():
-                skills_text = load_skills()
-                return (
-                    "你是基于阿狼投资体系的 A 股分析助手。\n"
-                    "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
-                    "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
-                    "在给出买卖建议时必须严格遵守此规则，不得建议投资者当日买入后同日卖出。\n"
-                    "【盘口资金读法】分析时请主动调用以下工具获取实时数据：\n"
-                    "  - get_index_intraday：获取大盘白/黄线 + vol_ratio，判断当前是黄线在上（大资金主导）还是白线在上（个股情绪）\n"
-                    "  - get_intraday_lines：获取个股白/黄线 + vol_ratio，识别放量智障/缩量/顶级诱多等形态\n"
-                    "  - get_moneyflow：获取近5日超大单/大单净流入，判断主力资金方向\n"
-                    "盘中分析必须先调用 get_index_intraday 确认大盘黄白线状态，再做个股判断。\n\n"
-                    "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
-                    + skills_text
-                )
+                portfolio = get_portfolio(stock_code) if stock_code else {}
+                holding = (portfolio.get("cost_price") or 0) > 0
+                return build_ai_system_prompt("intraday", holding)
             system_prompt = await loop.run_in_executor(None, _load_sys)
 
             full_text = ""

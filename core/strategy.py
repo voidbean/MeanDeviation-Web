@@ -2,7 +2,9 @@
 core/strategy.py — 核心业务逻辑
 包含：8848 策略计算、斐波那契信号、AI prompt 构建、技能库加载等。
 """
+import re
 import sqlite3
+from functools import lru_cache
 
 import tushare as ts
 
@@ -39,16 +41,71 @@ def to_ts_code(code: str) -> str:
     return ""
 
 
-def load_skills(subset: list = None) -> str:
+_SKILLS_SKIP = frozenset({"README.md", "agent_prompt_template.md"})
+_SKILL_FILE_RE = re.compile(r"^\d{2}_")
+
+# 各场景 skill 子集（仅编号技能 01–11；personal/ 始终全量）
+_SKILLS_CORE = ("01", "03", "05", "07", "11")
+_SKILLS_INTRADAY = ("06", "08")
+_SKILLS_EOD = ("02", "04", "08")
+_SKILLS_HOLDING = ("02", "09")
+_SKILLS_REVIEW = ("01", "02", "03", "05", "06", "07", "10")
+
+_AI_SYSTEM_PREFIX = (
+    "你是基于阿狼投资体系的 A 股分析助手。\n"
+    "【重要规则】A 股实行 T+1 交易制度：当日买入的股票必须等到次日才能卖出；"
+    "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
+    "在给出买卖建议时必须严格遵守此规则，不得建议投资者当日买入后同日卖出。\n"
+    "【盘口资金读法】分析时请主动调用以下工具获取实时数据：\n"
+    "  - get_index_intraday：获取大盘白/黄线 + vol_ratio，判断当前是黄线在上（大资金主导）还是白线在上（个股情绪）\n"
+    "  - get_intraday_lines：获取个股白/黄线 + vol_ratio，识别放量智障/缩量/顶级诱多等形态\n"
+    "  - get_moneyflow：获取近5日超大单/大单净流入，判断主力资金方向\n"
+    "盘中分析必须先调用 get_index_intraday 确认大盘黄白线状态，再做个股判断。\n\n"
+    "以下是阿狼投资体系的技能库，请在分析中主要参考它，但也可以结合你自己的知识库进行补充和对比分析，以提供更全面的见解：\n\n"
+)
+
+
+def skills_subset_for_analysis(mode: str = "intraday", holding: bool = False) -> tuple[str, ...]:
+    """按分析场景返回应加载的 skill 编号前缀。"""
+    prefixes = set(_SKILLS_CORE)
+    if mode == "eod":
+        prefixes.update(_SKILLS_EOD)
+    else:
+        prefixes.update(_SKILLS_INTRADAY)
+    if holding:
+        prefixes.update(_SKILLS_HOLDING)
+    return tuple(sorted(prefixes))
+
+
+def skills_subset_for_review() -> tuple[str, ...]:
+    return _SKILLS_REVIEW
+
+
+def build_ai_system_prompt(mode: str = "intraday", holding: bool = False) -> str:
+    """构建个股 AI 分析的 system prompt（含按需加载的 skill 子集）。"""
+    subset = skills_subset_for_analysis(mode, holding)
+    skills_text = load_skills(subset=subset)
+    return _AI_SYSTEM_PREFIX + skills_text
+
+
+def load_skills(subset: list | tuple | None = None) -> str:
     """读取 skills/*.md 和 skills/personal/*.md，拼接为字符串。
 
-    subset: 文件名前缀列表，如 ["01", "04", "05", "08"]，None 表示加载全部。
-    personal/ 目录下的文件始终全量加载（个人交易画像）。
+    subset: 文件名前缀列表，如 ["01", "04", "05", "08"]，None 表示加载全部编号技能。
+    自动跳过 README.md、agent_prompt_template.md；personal/ 始终全量加载。
     """
+    key = tuple(sorted(subset)) if subset else None
+    return _load_skills_cached(key)
+
+
+@lru_cache(maxsize=32)
+def _load_skills_cached(subset: tuple[str, ...] | None) -> str:
     if not SKILLS_DIR.exists():
         return ""
     parts = []
     for f in sorted(SKILLS_DIR.glob("*.md")):
+        if f.name in _SKILLS_SKIP or not _SKILL_FILE_RE.match(f.name):
+            continue
         if subset is not None and not any(f.name.startswith(p) for p in subset):
             continue
         parts.append(f"## {f.name}\n\n" + f.read_text(encoding="utf-8"))
@@ -59,7 +116,14 @@ def load_skills(subset: list = None) -> str:
             parts.append("## 个人交易画像（优先参考）")
             for f in personal_files:
                 parts.append(f.read_text(encoding="utf-8"))
-    return "\n\n---\n\n".join(parts)
+    result = "\n\n---\n\n".join(parts)
+    logger.info(
+        "load_skills subset=%s skill_files=%d chars=%d",
+        subset or "all",
+        len(parts),
+        len(result),
+    )
+    return result
 
 
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
@@ -370,7 +434,7 @@ def get_stock_volume_chart_data(history_results: list) -> dict | None:
 
 def build_review_prompt(trade: dict, stock_klines: list, index_klines: list) -> tuple:
     """构建单笔复盘的 system_prompt 和 user_prompt。"""
-    skills_text = load_skills()
+    skills_text = load_skills(subset=skills_subset_for_review())
 
     system_prompt = (
         "你是一位严格的交易复盘导师，使用阿狼交易体系标准进行复盘分析。\n"

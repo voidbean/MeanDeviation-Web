@@ -178,8 +178,10 @@ def _register_routes(app, templates):
             trade_date = t["trade_time"][:10]
             klines_map[t["id"]] = get_klines_brief(t["code"], trade_date, before_n=5)
 
-        from core.strategy import load_skills
-        system_prompt, user_prompt = build_stage_review_prompt(trades, klines_map, load_skills())
+        from core.strategy import load_skills, skills_subset_for_review
+        system_prompt, user_prompt = build_stage_review_prompt(
+            trades, klines_map, load_skills(subset=skills_subset_for_review()),
+        )
 
         logger.info("stage_analyze: start=%s end=%s count=%d", start_date, end_date, len(trades))
         try:
