@@ -117,6 +117,75 @@
                                 </div>
                                 {% endif %}
                             </div>
+                            {% if result.val_anchor and not result.val_anchor.get('error') %}
+                            {% set va = result.val_anchor %}
+                            <div class="mb-3">
+                                <h6 class="border-bottom pb-1 mb-2">估值锚（{{ va.metric }} · {{ va.window_label }}）
+                                    <small class="text-muted fw-normal ms-1" style="font-size:0.72rem;">{{ va.samples }}个交易日样本</small>
+                                </h6>
+                                <div class="d-flex justify-content-between align-items-center mb-1" style="font-size:0.85rem;">
+                                    <span class="text-muted">当前 {{ va.metric }}: <strong class="text-body">{{ va.current }}</strong></span>
+                                    <span class="text-muted">历史分位: <strong class="text-body">{{ va.percentile }}%</strong></span>
+                                </div>
+                                <div class="progress mb-2" style="height:8px;" title="当前估值在近3年历史中的位置，越低越便宜">
+                                    <div class="progress-bar bg-{{ va.advice_class }}" style="width:{{ va.percentile }}%"></div>
+                                </div>
+                                <div class="d-flex justify-content-between text-muted mb-2" style="font-size:0.78rem;">
+                                    <span>便宜</span>
+                                    <span>P25={{ va.p25 }} · 中位={{ va.p50 }} · P75={{ va.p75 }}</span>
+                                    <span>偏贵</span>
+                                </div>
+                                <ul class="list-group list-group-flush mb-2">
+                                    <li class="list-group-item d-flex justify-content-between align-items-center py-1"
+                                        style="font-size:0.82rem;">
+                                        <small class="text-muted">按中位{{ va.metric }}推算合理价</small>
+                                        <span>
+                                            <span class="text-muted">{{ va.fair_price_low }}</span>
+                                            <strong class="mx-1">{{ va.fair_price_mid }}</strong>
+                                            <span class="text-muted">{{ va.fair_price_high }}</span>
+                                        </span>
+                                    </li>
+                                    {% if va.discount_pct is not none %}
+                                    <li class="list-group-item d-flex justify-content-between align-items-center py-1"
+                                        style="font-size:0.82rem;">
+                                        <small class="text-muted">相对中位估值</small>
+                                        <strong class="{{ 'price-down' if va.discount_pct < 0 else 'price-up' if va.discount_pct > 0 else '' }}">
+                                            {{ '折价' if va.discount_pct < 0 else '溢价' if va.discount_pct > 0 else '持平' }}
+                                            {{ va.discount_pct | abs }}%
+                                        </strong>
+                                    </li>
+                                    {% endif %}
+                                </ul>
+                                {% set val_tips = {
+                                    "历史偏低（估值支撑）": "PE处于近3年低位。技术面出现买点时可提高仓位信心，但不单独构成买入信号。",
+                                    "偏低区间": "估值低于历史中位。可适度关注，仍需技术面确认时机。",
+                                    "合理区间": "估值处于历史中性区间。买卖决策以技术面为主。",
+                                    "偏高区间": "估值高于历史中位。追涨需控制仓位，止盈可更积极。",
+                                    "历史偏高（注意泡沫）": "PE处于近3年高位。即使技术突破也不宜重仓，注意估值回归风险。"
+                                } %}
+                                <div class="alert alert-{{ va.advice_class }} py-1 px-2 mb-0 d-flex justify-content-between align-items-center"
+                                     style="font-size:0.8rem; cursor:help;"
+                                     data-bs-toggle="tooltip" data-bs-placement="bottom"
+                                     title="{{ val_tips.get(va.position, '') }}">
+                                    <span>📊 当前位置：<strong>{{ va.position }}</strong></span>
+                                    <small class="text-muted ms-2" style="font-size:0.72rem;">hover 查看建议</small>
+                                </div>
+                            </div>
+                            {% elif result.val_anchor and result.val_anchor.get('error') %}
+                            <div class="text-center text-muted py-1 mb-3" style="font-size:0.8rem;">
+                                估值锚：{{ result.val_anchor.position }}
+                            </div>
+                            {% elif result.pe_ttm is not none or result.pe is not none or result.pb is not none %}
+                            <div class="d-flex justify-content-center gap-4 mb-3 text-muted" style="font-size:0.85rem;">
+                                {% set pe_show = result.pe_ttm if result.pe_ttm is not none else result.pe %}
+                                {% if pe_show is not none %}
+                                <span>PE{% if result.pe_ttm is not none %}(TTM){% endif %}: <strong class="text-body">{{ pe_show }}</strong></span>
+                                {% endif %}
+                                {% if result.pb is not none %}
+                                <span>PB: <strong class="text-body">{{ result.pb }}</strong></span>
+                                {% endif %}
+                            </div>
+                            {% endif %}
 
                             <!-- 分时图 / K线图切换 Tab -->
                             {% if result.intraday_points %}

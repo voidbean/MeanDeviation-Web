@@ -584,6 +584,29 @@ def get_all_holdings() -> list:
         return []
 
 
+def get_latest_valuation(code: str) -> dict:
+    """从 daily_records 取最新 pe/pb（由 fetch_history.py 的 stk_factor_pro 写入）。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT pe, pb FROM daily_records WHERE code = ? "
+            "AND (pe IS NOT NULL OR pb IS NOT NULL) ORDER BY date DESC LIMIT 1",
+            (code,),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return {}
+        result = {}
+        if row[0] is not None:
+            result["pe"] = round(float(row[0]), 1)
+        if row[1] is not None:
+            result["pb"] = round(float(row[1]), 1)
+        return result
+    except Exception as e:
+        logger.error("get_latest_valuation failed for %s: %s", code, e)
+        return {}
+
+
 def get_prev_close(code: str) -> float | None:
     """从 daily_records 取最近一个交易日的收盘价（即昨收）。"""
     try:

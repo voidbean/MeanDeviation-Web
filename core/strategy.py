@@ -4,6 +4,7 @@ core/strategy.py — 核心业务逻辑
 """
 import re
 import sqlite3
+import statistics
 from functools import lru_cache
 
 import tushare as ts
@@ -13,7 +14,7 @@ from core.config import logger, DB_PATH, SKILLS_DIR, pro
 from core.db import (
     get_cached_name, set_cached_name,
     save_daily_record, get_portfolio, save_portfolio,
-    get_n_day_stats, calc_atr,
+    get_n_day_stats, calc_atr, get_latest_valuation,
 )
 from services.indicators import (
     analyze_rousu_lines, analyze_rousu_lines_intraday,
@@ -125,6 +126,181 @@ def _load_skills_cached(subset: tuple[str, ...] | None) -> str:
         len(result),
     )
     return result
+
+
+_ANCHOR_HIST_LIMIT = 750   # 约 3 年交易日
+_ANCHOR_MIN_SAMPLES = 60   # 至少约 3 个月样本才计算分位
+
+
+def _is_etf_ts_code(ts_code: str) -> bool:
+    parts = ts_code.upper().split(".")
+    if len(parts) != 2:
+        return False
+    num, market = parts[0], parts[1]
+    return (market == "SH" and num.startswith("5")) or (market == "SZ" and num.startswith("1"))
+
+
+def _price_decimals(code: str) -> int:
+    short = code.split(".")[0] if "." in code else code
+    return 3 if short.startswith(("51", "15", "16", "18")) else 2
+
+
+def _percentile_rank(value: float, series: list[float]) -> float:
+    below = sum(1 for v in series if v < value)
+    equal = sum(1 for v in series if v == value)
+    return round((below + equal * 0.5) / len(series) * 100, 1)
+
+
+def _linear_percentile(sorted_vals: list[float], p: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    k = (len(sorted_vals) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    if f == c:
+        return sorted_vals[f]
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
+
+
+def _valuation_position(pct: float | None) -> tuple[str, str]:
+    if pct is None:
+        return "数据不足", "secondary"
+    if pct <= 20:
+        return "历史偏低（估值支撑）", "success"
+    if pct <= 40:
+        return "偏低区间", "info"
+    if pct <= 60:
+        return "合理区间", "secondary"
+    if pct <= 80:
+        return "偏高区间", "warning"
+    return "历史偏高（注意泡沫）", "danger"
+
+
+def _fetch_daily_basic_series(code: str) -> dict | None:
+    """单次 daily_basic 拉取：最新 pe/pe_ttm/pb + 近3年历史序列。"""
+    ts_code = to_ts_code(code)
+    if not pro or not ts_code or _is_etf_ts_code(ts_code):
+        return None
+    try:
+        df = pro.daily_basic(
+            ts_code=ts_code,
+            fields="trade_date,pe,pe_ttm,pb",
+            limit=_ANCHOR_HIST_LIMIT,
+        )
+    except Exception as e:
+        logger.warning("_fetch_daily_basic_series failed for %s: %s", code, e)
+        return None
+    if df is None or df.empty:
+        return None
+
+    current: dict[str, float] = {}
+    row0 = df.iloc[0]
+    for field in ("pe", "pe_ttm", "pb"):
+        raw = row0.get(field)
+        if raw is not None and raw == raw:
+            current[field] = round(float(raw), 1)
+
+    pe_hist: list[float] = []
+    pb_hist: list[float] = []
+    for _, row in df.iterrows():
+        for field, bucket in (("pe_ttm", pe_hist), ("pb", pb_hist)):
+            raw = row.get(field)
+            if raw is not None and raw == raw and float(raw) > 0:
+                bucket.append(float(raw))
+
+    return {"current": current, "pe_ttm_hist": pe_hist, "pb_hist": pb_hist}
+
+
+def _calc_valuation_anchor(
+    code: str,
+    current_price: float,
+    valuation: dict,
+    series: dict,
+) -> dict | None:
+    """基于已拉取的 daily_basic 序列计算估值锚（历史分位 + 合理价区间）。"""
+    if current_price <= 0:
+        return None
+
+    pe_ttm = valuation.get("pe_ttm")
+    pb = valuation.get("pb")
+    use_pb = pe_ttm is None or pe_ttm <= 0
+    metric = "PB" if use_pb else "PE(TTM)"
+    current_metric = pb if use_pb else pe_ttm
+    hist = series["pb_hist"] if use_pb else series["pe_ttm_hist"]
+
+    if current_metric is None or current_metric <= 0:
+        if not use_pb and pb and pb > 0:
+            use_pb = True
+            metric = "PB"
+            current_metric = pb
+            hist = series["pb_hist"]
+        else:
+            return {
+                "error": "亏损股，PE失效",
+                "position": "亏损股（PE失效）",
+                "advice_class": "secondary",
+                "is_loss": True,
+            }
+
+    if len(hist) < _ANCHOR_MIN_SAMPLES:
+        return {
+            "error": "历史数据不足",
+            "position": "数据不足",
+            "advice_class": "secondary",
+            "samples": len(hist),
+        }
+
+    hist_sorted = sorted(hist)
+    pct = _percentile_rank(current_metric, hist)
+    p25 = _linear_percentile(hist_sorted, 25)
+    p50 = statistics.median(hist_sorted)
+    p75 = _linear_percentile(hist_sorted, 75)
+    position, advice_class = _valuation_position(pct)
+
+    dec = _price_decimals(code)
+    eps = current_price / current_metric
+    fair_low = round(eps * p25, dec)
+    fair_mid = round(eps * p50, dec)
+    fair_high = round(eps * p75, dec)
+    discount_pct = round((current_price - fair_mid) / fair_mid * 100, 1) if fair_mid > 0 else None
+
+    return {
+        "metric": metric,
+        "current": round(current_metric, 1),
+        "percentile": pct,
+        "p25": round(p25, 1),
+        "p50": round(p50, 1),
+        "p75": round(p75, 1),
+        "fair_price_low": fair_low,
+        "fair_price_mid": fair_mid,
+        "fair_price_high": fair_high,
+        "discount_pct": discount_pct,
+        "position": position,
+        "advice_class": advice_class,
+        "window_label": "近3年",
+        "samples": len(hist),
+    }
+
+
+def _get_valuation(code: str, series: dict | None = None) -> dict:
+    """获取 pe / pe_ttm / pb：API 序列优先，否则本地 daily_records 回退。"""
+    valuation = get_latest_valuation(code)
+    if series and series.get("current"):
+        valuation.update(series["current"])
+        return valuation
+    ts_code = to_ts_code(code)
+    if pro and ts_code:
+        try:
+            df = pro.daily_basic(ts_code=ts_code, limit=1)
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                for field in ("pe", "pe_ttm", "pb"):
+                    raw = row.get(field)
+                    if raw is not None and raw == raw:
+                        valuation[field] = round(float(raw), 1)
+        except Exception as e:
+            logger.warning("_get_valuation daily_basic failed for %s: %s", code, e)
+    return valuation
 
 
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
@@ -286,6 +462,12 @@ def calculate_8848(code: str):
         _daily_recs = _get_daily_records_for_rousu(code, n=15)
         _vol_stats = get_volatility_stats(code)
         _box = detect_box_consolidation(code)
+        _basic_series = _fetch_daily_basic_series(code)
+        _valuation = _get_valuation(code, _basic_series)
+        _val_anchor = (
+            _calc_valuation_anchor(code, price, _valuation, _basic_series)
+            if _basic_series else None
+        )
 
         return {
             "code": code,
@@ -328,6 +510,10 @@ def calculate_8848(code: str):
             "ddp_lower": ddp_lower,
             "ddp_f618": ddp_f618,
             "vol_stats": _vol_stats,
+            "pe": _valuation.get("pe"),
+            "pe_ttm": _valuation.get("pe_ttm"),
+            "pb": _valuation.get("pb"),
+            "val_anchor": _val_anchor,
         }
     except Exception as e:
         return {"error": str(e)}
