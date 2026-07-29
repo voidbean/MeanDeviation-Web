@@ -15,6 +15,8 @@ from core.db import (
     get_cached_name, set_cached_name,
     save_daily_record, get_portfolio, save_portfolio,
     get_n_day_stats, calc_atr, get_latest_valuation,
+    get_valuation_history_series, upsert_valuation_history,
+    is_valuation_cache_fresh, VALUATION_HIST_LIMIT,
 )
 from services.indicators import (
     analyze_rousu_lines, analyze_rousu_lines_intraday,
@@ -128,8 +130,9 @@ def _load_skills_cached(subset: tuple[str, ...] | None) -> str:
     return result
 
 
-_ANCHOR_HIST_LIMIT = 750   # 约 3 年交易日
+_ANCHOR_HIST_LIMIT = VALUATION_HIST_LIMIT
 _ANCHOR_MIN_SAMPLES = 60   # 至少约 3 个月样本才计算分位
+_VALUATION_INCREMENTAL_LIMIT = 10  # 缓存过期时只增量拉最近 N 天
 
 
 def _is_etf_ts_code(ts_code: str) -> bool:
@@ -176,23 +179,7 @@ def _valuation_position(pct: float | None) -> tuple[str, str]:
     return "历史偏高（注意泡沫）", "danger"
 
 
-def _fetch_daily_basic_series(code: str) -> dict | None:
-    """单次 daily_basic 拉取：最新 pe/pe_ttm/pb + 近3年历史序列。"""
-    ts_code = to_ts_code(code)
-    if not pro or not ts_code or _is_etf_ts_code(ts_code):
-        return None
-    try:
-        df = pro.daily_basic(
-            ts_code=ts_code,
-            fields="trade_date,pe,pe_ttm,pb",
-            limit=_ANCHOR_HIST_LIMIT,
-        )
-    except Exception as e:
-        logger.warning("_fetch_daily_basic_series failed for %s: %s", code, e)
-        return None
-    if df is None or df.empty:
-        return None
-
+def _daily_basic_df_to_series(df) -> dict:
     current: dict[str, float] = {}
     row0 = df.iloc[0]
     for field in ("pe", "pe_ttm", "pb"):
@@ -209,6 +196,62 @@ def _fetch_daily_basic_series(code: str) -> dict | None:
                 bucket.append(float(raw))
 
     return {"current": current, "pe_ttm_hist": pe_hist, "pb_hist": pb_hist}
+
+
+def _daily_basic_df_to_records(df, code: str) -> list[tuple]:
+    records = []
+    for _, row in df.iterrows():
+        trade_date = str(row["trade_date"])
+        date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+        pe_raw = row.get("pe_ttm")
+        pb_raw = row.get("pb")
+        pe_ttm = float(pe_raw) if pe_raw is not None and pe_raw == pe_raw else None
+        pb = float(pb_raw) if pb_raw is not None and pb_raw == pb_raw else None
+        records.append((date, code, pe_ttm, pb))
+    return records
+
+
+def _fetch_daily_basic_series(code: str) -> dict | None:
+    """获取估值序列：优先读本地 valuation_history，过期则增量/全量拉取并落库。"""
+    ts_code = to_ts_code(code)
+    if not pro or not ts_code or _is_etf_ts_code(ts_code):
+        return None
+
+    local = get_valuation_history_series(code, limit=_ANCHOR_HIST_LIMIT)
+    if local and local.get("count", 0) >= _ANCHOR_MIN_SAMPLES and is_valuation_cache_fresh(code):
+        logger.info("_fetch_daily_basic_series: cache hit %s (%d rows)", code, local["count"])
+        return local
+
+    fetch_limit = _ANCHOR_HIST_LIMIT
+    if local and local.get("count", 0) >= _ANCHOR_MIN_SAMPLES:
+        fetch_limit = _VALUATION_INCREMENTAL_LIMIT
+        logger.info("_fetch_daily_basic_series: incremental refresh %s (limit=%d)", code, fetch_limit)
+    else:
+        logger.info("_fetch_daily_basic_series: full backfill %s (limit=%d)", code, fetch_limit)
+
+    try:
+        df = pro.daily_basic(
+            ts_code=ts_code,
+            fields="trade_date,pe,pe_ttm,pb",
+            limit=fetch_limit,
+        )
+    except Exception as e:
+        logger.warning("_fetch_daily_basic_series API failed for %s: %s", code, e)
+        return local
+
+    if df is None or df.empty:
+        return local
+
+    upsert_valuation_history(_daily_basic_df_to_records(df, code))
+
+    refreshed = get_valuation_history_series(code, limit=_ANCHOR_HIST_LIMIT)
+    if refreshed and refreshed.get("count", 0) >= _ANCHOR_MIN_SAMPLES:
+        return refreshed
+
+    series = _daily_basic_df_to_series(df)
+    if local and local.get("count", 0) > len(series.get("pe_ttm_hist", [])):
+        return local
+    return series
 
 
 def _calc_valuation_anchor(

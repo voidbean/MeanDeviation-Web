@@ -28,6 +28,8 @@ from datetime import datetime
 import tushare as ts
 from dotenv import load_dotenv
 
+from core.db import upsert_valuation_history, VALUATION_HIST_LIMIT
+
 # ── 日志配置 ────────────────────────────────────────────────────────────────
 LOG_PATH = os.path.join(os.path.dirname(__file__), "fetch_history.log")
 logging.basicConfig(
@@ -98,6 +100,17 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
             code       TEXT PRIMARY KEY,
             name       TEXT,
             updated_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS valuation_history (
+            date   TEXT NOT NULL,
+            code   TEXT NOT NULL,
+            pe_ttm REAL,
+            pb     REAL,
+            PRIMARY KEY (date, code)
         )
         """
     )
@@ -241,6 +254,44 @@ def fetch_factors_one(pro, conn: sqlite3.Connection, code: str, limit: int = FET
 
     conn.commit()
     logger.info("fetch_factors: %s 更新 %d 条技术指标", ts_code, count)
+    return count
+
+
+def fetch_valuation_one(pro, code: str, limit: int = 10) -> int:
+    """
+    拉取 pe_ttm / pb 估值数据写入 valuation_history。
+    常规模式增量拉最近 10 天；--backfill 拉 3 年用于首次初始化。
+    """
+    ts_code = to_ts_code(code)
+    if is_etf(ts_code):
+        logger.info("fetch_valuation: %s 为 ETF，跳过", ts_code)
+        return 0
+
+    logger.info("fetch_valuation: 拉取 %s 估值数据，limit=%d", ts_code, limit)
+    try:
+        df = pro.daily_basic(
+            ts_code=ts_code,
+            fields="trade_date,pe_ttm,pb",
+            limit=limit,
+        )
+    except Exception as e:
+        logger.error("fetch_valuation: %s API 失败：%s", ts_code, e)
+        raise
+
+    if df is None or df.empty:
+        logger.warning("fetch_valuation: %s 返回空数据", ts_code)
+        return 0
+
+    records = []
+    for _, row in df.iterrows():
+        pe_raw = row.get("pe_ttm")
+        pb_raw = row.get("pb")
+        pe_ttm = float(pe_raw) if pe_raw is not None and str(pe_raw) not in ("", "nan") else None
+        pb = float(pb_raw) if pb_raw is not None and str(pb_raw) not in ("", "nan") else None
+        records.append((fmt_date(str(row["trade_date"])), code, pe_ttm, pb))
+
+    count = upsert_valuation_history(records)
+    logger.info("fetch_valuation: %s 写入 %d 条", ts_code, count)
     return count
 
 
@@ -487,6 +538,27 @@ def main() -> None:
         fac_summary = f"技术指标完成：成功 {fac_success} 只，失败 {fac_failed} 只"
         logger.info("=== %s ===", fac_summary)
         print(f"\n{fac_summary}")
+
+        # ── 拉取估值历史（daily_basic，pe_ttm/pb）────────────────────────────
+        val_limit = VALUATION_HIST_LIMIT if args.backfill else 10
+        val_label = f"回填 {val_limit} 日" if args.backfill else f"增量 {val_limit} 日"
+        print(f"\n── 拉取估值历史（daily_basic · {val_label}）──")
+        logger.info("=== 开始拉取估值历史，共 %d 只，limit=%d ===", len(codes), val_limit)
+        val_success, val_failed = 0, 0
+        for code in codes:
+            try:
+                n = fetch_valuation_one(pro, code, limit=val_limit)
+                val_success += 1
+                print(f"  ✓ {code}  写入 {n} 条估值")
+            except Exception as e:
+                val_failed += 1
+                logger.error("估值 %s 失败：%s", code, e)
+                print(f"  ✗ {code}  估值失败：{e}")
+            time.sleep(0.3)
+
+        val_summary = f"估值历史完成：成功 {val_success} 只，失败 {val_failed} 只"
+        logger.info("=== %s ===", val_summary)
+        print(f"\n{val_summary}")
 
         # ── 拉取三大指数数据（大盘风向标）────────────────────────────────────
         # 使用 pro.index_daily 接口，amount 单位与 pro.daily 个股一致（千元）

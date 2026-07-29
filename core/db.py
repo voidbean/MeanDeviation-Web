@@ -4,6 +4,8 @@ import json
 
 from core.config import DB_PATH, STOCK_NAME_CACHE, logger
 
+VALUATION_HIST_LIMIT = 750  # 估值锚历史窗口（约 3 年交易日）
+
 # 三大指数代码与名称
 INDEX_CODES = [
     ("000001.SH", "上证指数"),
@@ -123,6 +125,16 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS stock_tags (
                     code TEXT PRIMARY KEY,
                     tag  TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            conn.commit()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS valuation_history (
+                    date   TEXT NOT NULL,
+                    code   TEXT NOT NULL,
+                    pe_ttm REAL,
+                    pb     REAL,
+                    PRIMARY KEY (date, code)
                 )
             """)
             conn.commit()
@@ -585,26 +597,121 @@ def get_all_holdings() -> list:
 
 
 def get_latest_valuation(code: str) -> dict:
-    """从 daily_records 取最新 pe/pb（由 fetch_history.py 的 stk_factor_pro 写入）。"""
+    """从 valuation_history 或 daily_records 取最新 pe/pb。"""
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
-            "SELECT pe, pb FROM daily_records WHERE code = ? "
-            "AND (pe IS NOT NULL OR pb IS NOT NULL) ORDER BY date DESC LIMIT 1",
+            "SELECT pe_ttm, pb FROM valuation_history WHERE code = ? "
+            "ORDER BY date DESC LIMIT 1",
             (code,),
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT pe, pb FROM daily_records WHERE code = ? "
+                "AND (pe IS NOT NULL OR pb IS NOT NULL) ORDER BY date DESC LIMIT 1",
+                (code,),
+            ).fetchone()
         conn.close()
         if not row:
             return {}
         result = {}
         if row[0] is not None:
-            result["pe"] = round(float(row[0]), 1)
+            result["pe_ttm"] = round(float(row[0]), 1)
         if row[1] is not None:
             result["pb"] = round(float(row[1]), 1)
         return result
     except Exception as e:
         logger.error("get_latest_valuation failed for %s: %s", code, e)
         return {}
+
+
+def upsert_valuation_history(records: list[tuple]) -> int:
+    """批量写入估值历史。records: [(date, code, pe_ttm, pb), ...]"""
+    if not records:
+        return 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.executemany(
+            """
+            INSERT INTO valuation_history(date, code, pe_ttm, pb)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(date, code) DO UPDATE SET
+                pe_ttm = excluded.pe_ttm,
+                pb     = excluded.pb
+            """,
+            records,
+        )
+        conn.commit()
+        conn.close()
+        return len(records)
+    except Exception as e:
+        logger.error("upsert_valuation_history failed: %s", e)
+        return 0
+
+
+def get_valuation_history_series(code: str, limit: int = VALUATION_HIST_LIMIT) -> dict | None:
+    """读取本地估值历史序列，供估值锚计算使用。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT date, pe_ttm, pb FROM valuation_history "
+            "WHERE code = ? ORDER BY date DESC LIMIT ?",
+            (code, limit),
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return None
+
+        current: dict[str, float] = {}
+        pe_hist: list[float] = []
+        pb_hist: list[float] = []
+        for i, (_, pe_ttm, pb) in enumerate(rows):
+            if i == 0:
+                if pe_ttm is not None and pe_ttm > 0:
+                    current["pe_ttm"] = round(float(pe_ttm), 1)
+                if pb is not None and pb > 0:
+                    current["pb"] = round(float(pb), 1)
+            if pe_ttm is not None and pe_ttm > 0:
+                pe_hist.append(float(pe_ttm))
+            if pb is not None and pb > 0:
+                pb_hist.append(float(pb))
+
+        return {
+            "current": current,
+            "pe_ttm_hist": pe_hist,
+            "pb_hist": pb_hist,
+            "count": len(rows),
+            "last_date": rows[0][0],
+        }
+    except Exception as e:
+        logger.error("get_valuation_history_series failed for %s: %s", code, e)
+        return None
+
+
+def is_valuation_cache_fresh(code: str) -> bool:
+    """本地估值缓存是否足够新（与最新日线日期对齐，或 3 自然日内）。"""
+    try:
+        from datetime import date
+
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            """
+            SELECT
+                (SELECT MAX(date) FROM valuation_history WHERE code = ?) AS val_date,
+                (SELECT MAX(date) FROM daily_records WHERE code = ? AND close > 0) AS daily_date
+            """,
+            (code, code),
+        ).fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return False
+        val_date, daily_date = row[0], row[1]
+        if daily_date:
+            return val_date >= daily_date
+        return (date.today() - date.fromisoformat(val_date)).days <= 3
+    except Exception as e:
+        logger.error("is_valuation_cache_fresh failed for %s: %s", code, e)
+        return False
 
 
 def get_prev_close(code: str) -> float | None:
