@@ -138,6 +138,72 @@ def init_db():
                 )
             """)
             conn.commit()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS financial_indicators (
+                    code               TEXT NOT NULL,
+                    end_date           TEXT NOT NULL,
+                    ann_date           TEXT,
+                    dt_netprofit_yoy   REAL,
+                    netprofit_yoy      REAL,
+                    q_netprofit_yoy    REAL,
+                    q_sales_yoy        REAL,
+                    basic_eps_yoy      REAL,
+                    fetched_at         INTEGER NOT NULL,
+                    PRIMARY KEY (code, end_date)
+                )
+            """)
+            conn.commit()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS stock_watchlist (
+                    code       TEXT PRIMARY KEY,
+                    enabled    INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_plans (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code        TEXT NOT NULL,
+                    name        TEXT NOT NULL DEFAULT '',
+                    trade_date  TEXT NOT NULL,
+                    bias        TEXT NOT NULL DEFAULT '',
+                    summary     TEXT NOT NULL DEFAULT '',
+                    status      TEXT NOT NULL DEFAULT 'draft',
+                    source      TEXT NOT NULL DEFAULT 'ai',
+                    raw_json    TEXT NOT NULL DEFAULT '{}',
+                    created_at  INTEGER NOT NULL,
+                    UNIQUE(code, trade_date)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_rules (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id              INTEGER NOT NULL,
+                    rule_type            TEXT NOT NULL,
+                    threshold            REAL NOT NULL,
+                    confirmation_minutes INTEGER NOT NULL DEFAULT 1,
+                    priority             TEXT NOT NULL DEFAULT 'observe',
+                    message              TEXT NOT NULL DEFAULT '',
+                    state                TEXT NOT NULL DEFAULT 'waiting',
+                    consecutive_hits     INTEGER NOT NULL DEFAULT 0,
+                    triggered_at         TEXT,
+                    FOREIGN KEY(plan_id) REFERENCES watch_plans(id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_events (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_id      INTEGER NOT NULL,
+                    code         TEXT NOT NULL,
+                    name         TEXT NOT NULL DEFAULT '',
+                    event_type   TEXT NOT NULL,
+                    priority     TEXT NOT NULL,
+                    price        REAL NOT NULL,
+                    message      TEXT NOT NULL,
+                    triggered_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
         finally:
             conn.close()
     except Exception as e:
@@ -714,6 +780,59 @@ def is_valuation_cache_fresh(code: str) -> bool:
         return False
 
 
+def upsert_financial_indicators(records: list[tuple]) -> int:
+    """缓存财务指标。records 与 financial_indicators 除主键外字段顺序一致。"""
+    if not records:
+        return 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.executemany(
+            """
+            INSERT INTO financial_indicators(
+                code, end_date, ann_date, dt_netprofit_yoy, netprofit_yoy,
+                q_netprofit_yoy, q_sales_yoy, basic_eps_yoy, fetched_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code, end_date) DO UPDATE SET
+                ann_date         = excluded.ann_date,
+                dt_netprofit_yoy = excluded.dt_netprofit_yoy,
+                netprofit_yoy    = excluded.netprofit_yoy,
+                q_netprofit_yoy  = excluded.q_netprofit_yoy,
+                q_sales_yoy      = excluded.q_sales_yoy,
+                basic_eps_yoy    = excluded.basic_eps_yoy,
+                fetched_at       = excluded.fetched_at
+            """,
+            records,
+        )
+        conn.commit()
+        conn.close()
+        return len(records)
+    except Exception as e:
+        logger.error("upsert_financial_indicators failed: %s", e)
+        return 0
+
+
+def get_financial_indicators(code: str, limit: int = 4) -> list[dict]:
+    """按报告期倒序读取最近财务指标。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            """
+            SELECT end_date, ann_date, dt_netprofit_yoy, netprofit_yoy,
+                   q_netprofit_yoy, q_sales_yoy, basic_eps_yoy, fetched_at
+            FROM financial_indicators WHERE code = ?
+            ORDER BY end_date DESC LIMIT ?
+            """,
+            (code, limit),
+        ).fetchall()
+        conn.close()
+        keys = ("end_date", "ann_date", "dt_netprofit_yoy", "netprofit_yoy",
+                "q_netprofit_yoy", "q_sales_yoy", "basic_eps_yoy", "fetched_at")
+        return [dict(zip(keys, row)) for row in rows]
+    except Exception as e:
+        logger.error("get_financial_indicators failed for %s: %s", code, e)
+        return []
+
+
 def get_prev_close(code: str) -> float | None:
     """从 daily_records 取最近一个交易日的收盘价（即昨收）。"""
     try:
@@ -728,6 +847,134 @@ def get_prev_close(code: str) -> float | None:
     except Exception as e:
         logger.error("get_prev_close failed for %s: %s", code, e)
         return None
+
+
+# ── 次日盯盘 ────────────────────────────────────────────────────────────────
+
+def set_watch_enabled(code: str, enabled: bool) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO stock_watchlist(code, enabled, updated_at) VALUES(?, ?, ?) "
+        "ON CONFLICT(code) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at",
+        (code, int(enabled), int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_watch_enabled_map(codes: list[str] | None = None) -> dict[str, bool]:
+    conn = sqlite3.connect(DB_PATH)
+    if codes:
+        marks = ",".join("?" for _ in codes)
+        rows = conn.execute(f"SELECT code, enabled FROM stock_watchlist WHERE code IN ({marks})", codes).fetchall()
+    else:
+        rows = conn.execute("SELECT code, enabled FROM stock_watchlist").fetchall()
+    conn.close()
+    return {code: bool(enabled) for code, enabled in rows}
+
+
+def save_watch_plans(plans: list[dict], trade_date: str) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    count = 0
+    try:
+        for plan in plans:
+            code = str(plan.get("code", "")).strip()
+            rules = plan.get("rules") or []
+            if not code or not rules:
+                continue
+            now = int(time.time())
+            conn.execute(
+                """INSERT INTO watch_plans(code,name,trade_date,bias,summary,status,source,raw_json,created_at)
+                   VALUES(?,?,?,?,?,'draft','ai',?,?)
+                   ON CONFLICT(code,trade_date) DO UPDATE SET name=excluded.name,bias=excluded.bias,
+                   summary=excluded.summary,status='draft',raw_json=excluded.raw_json,created_at=excluded.created_at""",
+                (code, str(plan.get("name", "")), trade_date, str(plan.get("bias", "")),
+                 str(plan.get("summary", "")), json.dumps(plan, ensure_ascii=False), now),
+            )
+            plan_id = conn.execute(
+                "SELECT id FROM watch_plans WHERE code=? AND trade_date=?", (code, trade_date)
+            ).fetchone()[0]
+            conn.execute("DELETE FROM watch_rules WHERE plan_id=?", (plan_id,))
+            for rule in rules:
+                kind = str(rule.get("type", ""))
+                try:
+                    threshold = float(rule.get("price"))
+                    confirmation = max(1, min(5, int(rule.get("confirmation_minutes", 1))))
+                except (TypeError, ValueError):
+                    continue
+                if kind not in {"breakout", "breakdown", "near"} or threshold <= 0:
+                    continue
+                priority = str(rule.get("priority", "observe"))
+                if priority not in {"risk", "opportunity", "observe"}:
+                    priority = "observe"
+                conn.execute(
+                    "INSERT INTO watch_rules(plan_id,rule_type,threshold,confirmation_minutes,priority,message) VALUES(?,?,?,?,?,?)",
+                    (plan_id, kind, threshold, confirmation, priority, str(rule.get("message", ""))),
+                )
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count
+
+
+def get_watch_plans(trade_date: str | None = None) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    sql = "SELECT id,code,name,trade_date,bias,summary,status FROM watch_plans"
+    args = []
+    if trade_date:
+        sql += " WHERE trade_date=?"
+        args.append(trade_date)
+    sql += " ORDER BY code"
+    rows = conn.execute(sql, args).fetchall()
+    plans = []
+    for row in rows:
+        rules = conn.execute(
+            "SELECT id,rule_type,threshold,confirmation_minutes,priority,message,state,triggered_at FROM watch_rules WHERE plan_id=? ORDER BY id",
+            (row[0],),
+        ).fetchall()
+        plans.append({"id": row[0], "code": row[1], "name": row[2], "trade_date": row[3],
+                      "bias": row[4], "summary": row[5], "status": row[6],
+                      "rules": [{"id": r[0], "type": r[1], "price": r[2], "confirmation_minutes": r[3],
+                                 "priority": r[4], "message": r[5], "state": r[6], "triggered_at": r[7]} for r in rules]})
+    conn.close()
+    return plans
+
+
+def activate_watch_plans(trade_date: str) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("UPDATE watch_plans SET status='active' WHERE trade_date=? AND status='draft'", (trade_date,))
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    return count
+
+
+def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int) -> bool:
+    if threshold <= 0:
+        return False
+    confirmation_minutes = max(1, min(5, int(confirmation_minutes)))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        """UPDATE watch_rules SET threshold=?, confirmation_minutes=?, state='waiting',
+           consecutive_hits=0, triggered_at=NULL WHERE id=?""",
+        (threshold, confirmation_minutes, rule_id),
+    )
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
+
+
+def get_recent_watch_events(limit: int = 50) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id,code,name,event_type,priority,price,message,triggered_at FROM watch_events ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    keys = ("id", "code", "name", "event_type", "priority", "price", "message", "triggered_at")
+    return [dict(zip(keys, row)) for row in rows]
 
 
 def load_ai_conversation(session_id: str) -> list:

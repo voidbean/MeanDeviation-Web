@@ -143,6 +143,11 @@ def _intraday_bg_loop() -> None:
         if _is_trading_time():
             logger.info("intraday_bg_loop: 开始抓取分时快照")
             _fetch_and_save_intraday_snapshots()
+            try:
+                from services.monitor import evaluate_watch_rules
+                evaluate_watch_rules()
+            except Exception:
+                logger.exception("intraday_bg_loop: 盯盘规则执行失败")
         time.sleep(60)
 
 

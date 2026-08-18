@@ -40,6 +40,9 @@
             <form action="/analyze_batch" method="post" class="ms-auto">
                 <button type="submit" class="btn btn-outline-primary btn-sm">刷新信号</button>
             </form>
+            <form action="/watch_plans/generate" method="post">
+                <button type="submit" class="btn btn-primary btn-sm">AI生成次日计划</button>
+            </form>
         </div>
     </div>
 
@@ -54,6 +57,9 @@
         </div>
     </div>
     {% else %}
+
+    {% if plan_message %}<div class="alert alert-success py-2">{{ plan_message }}</div>{% endif %}
+    {% if plan_error %}<div class="alert alert-danger py-2">{{ plan_error }}</div>{% endif %}
 
     <!-- 信号过滤 -->
     <div class="row mb-2">
@@ -75,6 +81,7 @@
                         <table class="table table-hover table-sm mb-0" id="batch-table">
                             <thead class="table-light">
                             <tr>
+                                <th>盯盘</th>
                                 <th class="sortable" onclick="sortTable('name')">名称 <span class="sort-icon" id="sort-name">↕</span></th>
                                 <th class="sortable" onclick="sortTable('code')">代码 <span class="sort-icon" id="sort-code">↕</span></th>
                                 <th class="sortable" onclick="sortTable('current_price')">现价 <span class="sort-icon" id="sort-current_price">↕</span></th>
@@ -102,6 +109,12 @@
                                 data-upper_line="{{ r.upper_line }}"
                                 data-lower_line="{{ r.lower_line }}"
                                 data-signal-order="{{ {'danger':0,'warning':1,'primary':2,'info':3,'secondary':4}.get(r.advice_class, 5) }}">
+                                <td>
+                                    <div class="form-check form-switch mb-0">
+                                        <input class="form-check-input watch-toggle" type="checkbox"
+                                               data-code="{{ r.code }}" {% if watch_map.get(r.code, false) %}checked{% endif %}>
+                                    </div>
+                                </td>
                                 <td>
                                     <a href="javascript:void(0)"
                                        onclick="analyzeStock('{{ r.code }}')"
@@ -143,6 +156,51 @@
             </div>
         </div>
     </div>
+
+    {% if watch_plans %}
+    <div class="card shadow-sm mt-3">
+        <div class="card-header d-flex align-items-center">
+            <strong>{{ plan_date }} 次日盯盘计划</strong>
+            {% if watch_plans | selectattr('status', 'equalto', 'draft') | list %}
+            <form action="/watch_plans/activate" method="post" class="ms-auto">
+                <button class="btn btn-success btn-sm" type="submit">确认并启用全部草稿</button>
+            </form>
+            {% endif %}
+        </div>
+        <div class="card-body">
+            {% for plan in watch_plans %}
+            <div class="border rounded p-2 mb-2">
+                <div><strong>{{ plan.name or plan.code }}</strong> <span class="text-muted">{{ plan.code }}</span>
+                    <span class="badge bg-{{ 'success' if plan.status == 'active' else 'secondary' }}">{{ '已启用' if plan.status == 'active' else '草稿' }}</span>
+                    <span class="ms-2">{{ plan.bias }}</span>
+                </div>
+                <div class="small text-muted my-1">{{ plan.summary }}</div>
+                {% for rule in plan.rules %}
+                <div class="input-group input-group-sm mb-1" style="max-width:520px">
+                    <span class="input-group-text">{{ {'breakout':'突破','breakdown':'跌破','near':'接近'}.get(rule.type, rule.type) }}</span>
+                    <input class="form-control" type="number" step="0.001" id="rule-price-{{ rule.id }}" value="{{ rule.price }}" aria-label="关键价">
+                    <input class="form-control" type="number" min="1" max="5" id="rule-minutes-{{ rule.id }}" value="{{ rule.confirmation_minutes }}" aria-label="确认分钟">
+                    <span class="input-group-text">分钟</span>
+                    <button class="btn btn-outline-secondary" type="button" onclick="saveWatchRule({{ rule.id }})">保存</button>
+                </div>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if watch_events %}
+    <div class="card shadow-sm mt-3">
+        <div class="card-header"><strong>最近盯盘提醒</strong></div>
+        <div class="list-group list-group-flush">
+            {% for event in watch_events[:20] %}
+            <div class="list-group-item small"><span class="text-muted">{{ event.triggered_at }}</span>
+                {{ event.name or event.code }} · {{ event.message }}（{{ event.price }}）</div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
     {% endif %}
 
 </div>
@@ -211,6 +269,50 @@
 
     // 默认按信号优先级排序
     document.addEventListener('DOMContentLoaded', () => sortTable('signal'));
+
+    document.addEventListener('DOMContentLoaded', () => {
+        document.querySelectorAll('.watch-toggle').forEach(input => {
+            input.addEventListener('change', async () => {
+                input.disabled = true;
+                try {
+                    const resp = await fetch('/api/watch_toggle', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({code: input.dataset.code, enabled: input.checked})
+                    });
+                    if (!resp.ok) throw new Error('保存失败');
+                } catch (e) {
+                    input.checked = !input.checked;
+                    alert('盯盘开关保存失败：' + e.message);
+                } finally { input.disabled = false; }
+            });
+        });
+    });
+
+    const monitorStream = new EventSource('/monitor_stream');
+    monitorStream.onmessage = event => {
+        const item = JSON.parse(event.data);
+        const title = (item.name || item.code) + ' · ' + item.price;
+        const box = document.createElement('div');
+        box.className = 'alert alert-' + (item.priority === 'risk' ? 'danger' : item.priority === 'opportunity' ? 'primary' : 'secondary') +
+                        ' shadow position-fixed top-0 end-0 m-3';
+        box.style.zIndex = 1080;
+        const strong = document.createElement('strong');
+        strong.textContent = title;
+        box.append(strong, document.createElement('br'), document.createTextNode(item.message));
+        document.body.appendChild(box);
+        setTimeout(() => box.remove(), 12000);
+    };
+
+    async function saveWatchRule(id) {
+        const price = Number(document.getElementById('rule-price-' + id).value);
+        const minutes = Number(document.getElementById('rule-minutes-' + id).value);
+        const resp = await fetch('/api/watch_rules/' + id, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({price: price, confirmation_minutes: minutes})
+        });
+        if (!resp.ok) return alert('规则保存失败');
+        alert('规则已保存');
+    }
 
     // ── 点击名称跳回主页分析 ──────────────────────────────────────────────────
     function analyzeStock(code) {

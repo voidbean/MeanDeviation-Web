@@ -5,6 +5,7 @@ core/strategy.py — 核心业务逻辑
 import re
 import sqlite3
 import statistics
+import time
 from functools import lru_cache
 
 import tushare as ts
@@ -17,6 +18,7 @@ from core.db import (
     get_n_day_stats, calc_atr, get_latest_valuation,
     get_valuation_history_series, upsert_valuation_history,
     is_valuation_cache_fresh, VALUATION_HIST_LIMIT,
+    get_financial_indicators, upsert_financial_indicators,
 )
 from services.indicators import (
     analyze_rousu_lines, analyze_rousu_lines_intraday,
@@ -346,6 +348,106 @@ def _get_valuation(code: str, series: dict | None = None) -> dict:
     return valuation
 
 
+def _safe_float(value):
+    try:
+        result = float(value)
+        return result if result == result else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_financial_indicators(code: str) -> list[dict]:
+    """获取最近财报指标；24 小时内优先使用本地缓存。"""
+    cached = get_financial_indicators(code)
+    if cached and time.time() - int(cached[0].get("fetched_at") or 0) < 86400:
+        return cached
+
+    ts_code = to_ts_code(code)
+    if not pro or not ts_code or _is_etf_ts_code(ts_code):
+        return cached
+    fields = (
+        "ts_code,ann_date,end_date,dt_netprofit_yoy,netprofit_yoy,"
+        "q_netprofit_yoy,q_sales_yoy,basic_eps_yoy,update_flag"
+    )
+    try:
+        df = pro.fina_indicator(ts_code=ts_code, fields=fields)
+    except Exception as e:
+        logger.warning("_fetch_financial_indicators API failed for %s: %s", code, e)
+        return cached
+    if df is None or df.empty:
+        return cached
+
+    # 同一报告期可能有更正记录；公告日较新的记录优先。
+    df = df.sort_values(["end_date", "ann_date"], ascending=False).drop_duplicates("end_date")
+    fetched_at = int(time.time())
+    records = []
+    for _, row in df.head(8).iterrows():
+        end_date = str(row.get("end_date") or "")
+        if len(end_date) != 8:
+            continue
+        end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+        ann_date = str(row.get("ann_date") or "")
+        ann_fmt = f"{ann_date[:4]}-{ann_date[4:6]}-{ann_date[6:8]}" if len(ann_date) == 8 else None
+        records.append((
+            code, end_fmt, ann_fmt,
+            _safe_float(row.get("dt_netprofit_yoy")),
+            _safe_float(row.get("netprofit_yoy")),
+            _safe_float(row.get("q_netprofit_yoy")),
+            _safe_float(row.get("q_sales_yoy")),
+            _safe_float(row.get("basic_eps_yoy")), fetched_at,
+        ))
+    upsert_financial_indicators(records)
+    return get_financial_indicators(code)
+
+
+def _calc_earnings_valuation(pe_ttm: float | None, reports: list[dict]) -> dict | None:
+    """用最新已公告盈利增速校正 PE；不把异常高增长包装成精确 PEG。"""
+    if not reports:
+        return None
+    latest = reports[0]
+    growth_field = "dt_netprofit_yoy" if latest.get("dt_netprofit_yoy") is not None else "netprofit_yoy"
+    growth_label = "扣非净利润同比" if growth_field == "dt_netprofit_yoy" else "归母净利润同比"
+    growth = _safe_float(latest.get(growth_field))
+    previous_growth = None
+    for report in reports[1:]:
+        previous_growth = _safe_float(report.get(growth_field))
+        if previous_growth is not None:
+            break
+
+    result = {
+        "report_date": latest.get("end_date"),
+        "ann_date": latest.get("ann_date"),
+        "growth": round(growth, 1) if growth is not None else None,
+        "growth_label": growth_label,
+        "q_profit_growth": round(latest["q_netprofit_yoy"], 1) if latest.get("q_netprofit_yoy") is not None else None,
+        "revenue_growth": round(latest["q_sales_yoy"], 1) if latest.get("q_sales_yoy") is not None else None,
+        "previous_growth": round(previous_growth, 1) if previous_growth is not None else None,
+    }
+    if growth is not None and previous_growth is not None:
+        result["acceleration"] = round(growth - previous_growth, 1)
+
+    if pe_ttm is None or pe_ttm <= 0:
+        result.update(status="PE失效", advice_class="secondary", note="亏损或缺少有效 PE，无法计算增长校正估值")
+    elif growth is None:
+        result.update(status="数据不足", advice_class="secondary", note="最新财报缺少可用的利润同比数据")
+    elif growth <= 0:
+        result.update(status="盈利收缩", advice_class="danger", note="利润同比未增长，PEG 不适用，当前 PE 缺少增长支撑")
+    elif growth > 200:
+        result.update(status="高增长待核验", advice_class="warning", note="利润增速超过 200%，可能受低基数或一次性因素影响，不展示 PEG")
+    else:
+        peg = round(pe_ttm / growth, 2)
+        if peg <= 1:
+            status, css = "盈利支撑较强", "success"
+        elif peg <= 1.5:
+            status, css = "估值基本匹配", "info"
+        elif peg <= 2:
+            status, css = "估值略有透支", "warning"
+        else:
+            status, css = "估值偏离盈利", "danger"
+        result.update(peg=peg, status=status, advice_class=css, note="PEG 仅作增长校正参考，不替代行业和盈利质量判断")
+    return result
+
+
 def calculate_strategy(now, cost, st_high, stage_high, stage_low, stage_params_set: bool = False):
     signal = "观望"
     advice_class = "secondary"
@@ -511,6 +613,9 @@ def calculate_8848(code: str):
             _calc_valuation_anchor(code, price, _valuation, _basic_series)
             if _basic_series else None
         )
+        _earnings_valuation = _calc_earnings_valuation(
+            _valuation.get("pe_ttm"), _fetch_financial_indicators(code)
+        )
 
         return {
             "code": code,
@@ -557,6 +662,7 @@ def calculate_8848(code: str):
             "pe_ttm": _valuation.get("pe_ttm"),
             "pb": _valuation.get("pb"),
             "val_anchor": _val_anchor,
+            "earnings_valuation": _earnings_valuation,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -931,6 +1037,18 @@ def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hi
     else:
         box_line = "箱体震荡检测：暂无数据（请先运行 fetch_history.py 拉取历史K线）"
 
+    earnings = result.get("earnings_valuation")
+    if earnings:
+        earnings_line = (
+            f"盈利校正估值（{earnings.get('report_date') or '最新财报'}）："
+            f"PE(TTM)={result.get('pe_ttm', '暂无')}，"
+            f"{earnings['growth_label']}={earnings.get('growth', '暂无')}%，"
+            f"单季营收同比={earnings.get('revenue_growth', '暂无')}%，"
+            f"PEG={earnings.get('peg', '不适用')}，判断={earnings['status']}。"
+        )
+    else:
+        earnings_line = "盈利校正估值：暂无可用财报指标"
+
     return f"""{mode_context}
 
 【当前股票信息】
@@ -943,6 +1061,7 @@ VWAP均价：{result['avg_price']}
 {atr_line}
 {ddp_line + chr(10) if ddp_line else ""}{vol_stats_line}
 {box_line}
+{earnings_line}
 持仓状态：{"持仓中，成本价 " + str(result['cost_price']) if holding else "未持仓"}
 阶段高点：{result['stage_high'] if result['stage_high'] > 0 else "未设置"}
 阶段低点：{result['stage_low'] if result['stage_low'] > 0 else "未设置"}
@@ -976,7 +1095,7 @@ VWAP均价：{result['avg_price']}
 {extra_instruction}
 {condition_order_instruction}
 
-5. **风险提示**（参考 Skill 07）：当前主要风险点和需要特别注意的信号。
+5. **风险提示**（参考 Skill 07）：结合历史 PE 分位与盈利校正估值，说明当前 PE 是否得到盈利增长支撑，并列出主要风险信号。
 
 注意：分析基于当前有限数据，仅供参考，不构成投资建议。
 {"" if not user_hint else chr(10) + "【用户补充说明】" + chr(10) + user_hint.strip()}"""

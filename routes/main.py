@@ -9,6 +9,8 @@ import queue as _queue
 import sqlite3
 import threading as _threading
 import uuid
+import datetime as _dt
+import re
 
 from fastapi import Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -22,6 +24,9 @@ from core.db import (
     get_index_market_data, get_index_trend_chart_data,
     get_stock_tag, set_stock_tag, get_all_stock_tags, get_distinct_tags,
     get_all_holdings, get_prev_close,
+    set_watch_enabled, get_watch_enabled_map, save_watch_plans, get_watch_plans,
+    activate_watch_plans, get_recent_watch_events,
+    update_watch_rule,
 )
 from core.strategy import (
     calculate_8848, calculate_8848_history, calculate_strategy,
@@ -29,7 +34,7 @@ from core.strategy import (
 )
 from services.indicators import analyze_rousu_lines, analyze_rousu_lines_intraday
 from services.ai import (
-    call_ai_model_with_tools, call_ai_model_streaming,
+    call_ai_model_with_tools, call_ai_model_streaming, call_ai_model,
     _save_ai_conversation, _load_ai_conversation,
 )
 
@@ -47,6 +52,64 @@ COMMON_STOCKS = load_common_stocks()
 
 # 项目根目录的 .env（和 core/config.py 读取的是同一个文件）
 _ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+
+def _next_weekday(today: _dt.date | None = None) -> _dt.date:
+    """交易日历不可用时的保底逻辑。"""
+    day = (today or _dt.date.today()) + _dt.timedelta(days=1)
+    while day.weekday() >= 5:
+        day += _dt.timedelta(days=1)
+    return day
+
+
+_TRADE_DATE_CACHE: dict[str, _dt.date] = {}
+
+
+def _next_trade_date(today: _dt.date | None = None) -> _dt.date:
+    """通过 Tushare trade_cal 获取严格晚于 today 的下一个 A 股交易日。"""
+    today = today or _dt.date.today()
+    cache_key = today.isoformat()
+    if cache_key in _TRADE_DATE_CACHE:
+        return _TRADE_DATE_CACHE[cache_key]
+    if _cfg.pro is not None:
+        try:
+            start = today + _dt.timedelta(days=1)
+            end = today + _dt.timedelta(days=45)
+            frame = _cfg.pro.trade_cal(
+                exchange="SSE",
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                fields="cal_date,is_open",
+            )
+            records = frame.to_dict("records") if frame is not None else []
+            open_dates = sorted(
+                str(row.get("cal_date")) for row in records
+                if int(row.get("is_open") or 0) == 1 and row.get("cal_date")
+            )
+            if open_dates:
+                value = _dt.datetime.strptime(open_dates[0], "%Y%m%d").date()
+                _TRADE_DATE_CACHE[cache_key] = value
+                return value
+            logger.warning("trade_cal 未返回未来45天内的交易日，回退到工作日")
+        except Exception as exc:
+            logger.warning("trade_cal 查询失败，回退到工作日: %s", exc)
+    return _next_weekday(today)
+
+
+def _parse_json_array(text: str) -> list:
+    """兼容模型偶尔附带代码围栏或简短说明。"""
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("["), text.rfind("]")
+        if start < 0 or end <= start:
+            raise ValueError("AI 未返回 JSON 数组")
+        value = json.loads(text[start:end + 1])
+    if not isinstance(value, list):
+        raise ValueError("AI 返回的计划不是数组")
+    return value
 
 
 def _update_env_key(path: str, key: str, value: str) -> None:
@@ -78,6 +141,7 @@ def build_common_stocks_with_name():
     entries = []
     codes = [item.get("code") for item in COMMON_STOCKS if item.get("code")]
     tag_map = get_all_stock_tags(codes)
+    watch_map = get_watch_enabled_map(codes)
     for code in codes:
         name = get_cached_name(code)
         if not name:
@@ -88,7 +152,8 @@ def build_common_stocks_with_name():
                     set_cached_name(code, name)
             except Exception:
                 pass
-        entries.append({"code": code, "name": name, "tag": tag_map.get(code, "")})
+        entries.append({"code": code, "name": name, "tag": tag_map.get(code, ""),
+                        "watch_enabled": watch_map.get(code, False)})
     return entries
 
 
@@ -177,11 +242,112 @@ def _register_routes(app, templates):
     @app.get("/batch", response_class=HTMLResponse)
     async def batch_page(request: Request):
         data = load_temp_result("batch_latest", keep=True)
+        plan_date = _next_trade_date().isoformat()
         return templates.TemplateResponse("batch.html", {
             "request":       request,
             "batch_results": data.get("batch_results", []),
             "batch_time":    data.get("batch_time", ""),
+            "watch_map":     get_watch_enabled_map(),
+            "watch_plans":   get_watch_plans(plan_date),
+            "watch_events":  get_recent_watch_events(),
+            "plan_date":     plan_date,
+            "plan_message":  data.get("plan_message", ""),
+            "plan_error":    data.get("plan_error", ""),
         })
+
+    @app.post("/api/watch_toggle", response_class=JSONResponse)
+    async def watch_toggle(request: Request):
+        body = await request.json()
+        code = str(body.get("code", "")).strip()
+        if not code:
+            return JSONResponse({"ok": False, "error": "缺少股票代码"}, status_code=400)
+        enabled = bool(body.get("enabled"))
+        set_watch_enabled(code, enabled)
+        return {"ok": True, "code": code, "enabled": enabled}
+
+    @app.post("/watch_plans/generate", response_class=HTMLResponse)
+    async def generate_watch_plans():
+        data = load_temp_result("batch_latest", keep=True)
+        results = data.get("batch_results", [])
+        watch_map = get_watch_enabled_map()
+        selected = [r for r in results if watch_map.get(r.get("code"), False)]
+        if not selected:
+            data.update({"plan_error": "请先打开至少一只股票的盯盘开关。", "plan_message": ""})
+            save_temp_result("batch_latest", data)
+            return RedirectResponse(url="/batch", status_code=303)
+
+        trade_date = _next_trade_date().isoformat()
+        compact_fields = (
+            "code", "name", "current_price", "avg_price", "upper_line", "lower_line", "signal",
+            "f382", "f618", "f786", "n20_high", "n20_low", "n40_high", "n40_low",
+            "cost_price", "stage_high", "stage_low", "atr", "ddp_lower", "ddp_f618",
+        )
+        compact = [{k: r.get(k) for k in compact_fields if r.get(k) is not None} for r in selected]
+        system_prompt = build_ai_system_prompt("eod", holding=any((r.get("cost_price") or 0) > 0 for r in selected))
+        system_prompt += """
+
+你现在只负责批量生成次日盯盘计划。一次处理所有股票，不调用工具，不写长篇分析。
+只输出一个 JSON 数组，禁止 Markdown 代码块。每项必须包含 code、name、bias、summary、rules。
+rules 仅允许 type=breakout/breakdown/near；每条包含 price、confirmation_minutes(1-5)、
+priority(risk/opportunity/observe)、message。每只股票最多4条，价格必须来自输入关键位或有清晰依据。
+breakout默认确认3分钟，breakdown默认确认2分钟，near默认1分钟。避免相互矛盾或过密价位。
+"""
+        user_prompt = (
+            f"为交易日 {trade_date} 生成盯盘计划。以下是已由本系统批量计算的数据：\n" +
+            json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        )
+        try:
+            raw = await asyncio.to_thread(call_ai_model, system_prompt, user_prompt)
+            plans = _parse_json_array(raw)
+            allowed_codes = {r.get("code") for r in selected}
+            plans = [p for p in plans if isinstance(p, dict) and p.get("code") in allowed_codes]
+            saved = save_watch_plans(plans, trade_date)
+            if not saved:
+                raise ValueError("AI 返回内容中没有可用规则")
+            data.update({"plan_message": f"已生成 {saved} 只股票的 {trade_date} 盯盘草稿，请检查后启用。", "plan_error": ""})
+        except Exception as exc:
+            logger.exception("generate_watch_plans failed")
+            data.update({"plan_error": f"生成计划失败：{exc}", "plan_message": ""})
+        save_temp_result("batch_latest", data)
+        return RedirectResponse(url="/batch", status_code=303)
+
+    @app.post("/watch_plans/activate", response_class=HTMLResponse)
+    async def activate_plans():
+        trade_date = _next_trade_date().isoformat()
+        count = activate_watch_plans(trade_date)
+        data = load_temp_result("batch_latest", keep=True)
+        data.update({"plan_message": f"已启用 {count} 份 {trade_date} 盯盘计划。", "plan_error": ""})
+        save_temp_result("batch_latest", data)
+        return RedirectResponse(url="/batch", status_code=303)
+
+    @app.post("/api/watch_rules/{rule_id}", response_class=JSONResponse)
+    async def edit_watch_rule(rule_id: int, request: Request):
+        body = await request.json()
+        try:
+            threshold = float(body.get("price"))
+            confirmation = int(body.get("confirmation_minutes", 1))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "价格或确认分钟无效"}, status_code=400)
+        ok = update_watch_rule(rule_id, threshold, confirmation)
+        return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+    @app.get("/monitor_stream")
+    async def monitor_stream(request: Request):
+        from services.monitor import subscribe, unsubscribe, sse_payload
+        q = subscribe()
+
+        async def generate():
+            try:
+                while not await request.is_disconnected():
+                    try:
+                        event = await asyncio.to_thread(q.get, True, 15)
+                        yield sse_payload(event)
+                    except _queue.Empty:
+                        yield ": heartbeat\n\n"
+            finally:
+                unsubscribe(q)
+        return StreamingResponse(generate(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/api/common_stocks_status")
     async def common_stocks_status():

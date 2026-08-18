@@ -187,6 +187,48 @@
                             </div>
                             {% endif %}
 
+                            {% if result.earnings_valuation %}
+                            {% set ev = result.earnings_valuation %}
+                            <div class="mb-3">
+                                <h6 class="border-bottom pb-1 mb-2">盈利校正估值
+                                    <small class="text-muted fw-normal ms-1" style="font-size:0.72rem;">
+                                        {{ ev.report_date }} 报告期{% if ev.ann_date %} · {{ ev.ann_date }} 公告{% endif %}
+                                    </small>
+                                </h6>
+                                <div class="row g-2 mb-2 text-center" style="font-size:0.8rem;">
+                                    <div class="col-4">
+                                        <small class="text-muted d-block">{{ ev.growth_label }}</small>
+                                        <strong class="{{ 'price-up' if ev.growth is not none and ev.growth >= 0 else 'price-down' }}">
+                                            {{ ('+' if ev.growth is not none and ev.growth >= 0 else '') ~ ev.growth ~ '%' if ev.growth is not none else '—' }}
+                                        </strong>
+                                    </div>
+                                    <div class="col-4">
+                                        <small class="text-muted d-block">单季营收同比</small>
+                                        <strong class="{{ 'price-up' if ev.revenue_growth is not none and ev.revenue_growth >= 0 else 'price-down' }}">
+                                            {{ ('+' if ev.revenue_growth is not none and ev.revenue_growth >= 0 else '') ~ ev.revenue_growth ~ '%' if ev.revenue_growth is not none else '—' }}
+                                        </strong>
+                                    </div>
+                                    <div class="col-4">
+                                        <small class="text-muted d-block">PEG</small>
+                                        <strong>{{ ev.peg if ev.peg is defined else '—' }}</strong>
+                                    </div>
+                                </div>
+                                {% if ev.acceleration is defined %}
+                                <div class="text-muted mb-2" style="font-size:0.76rem;">
+                                    相比上期盈利增速：
+                                    <span class="{{ 'price-up' if ev.acceleration >= 0 else 'price-down' }}">
+                                        {{ '+' if ev.acceleration >= 0 else '' }}{{ ev.acceleration }} 个百分点
+                                    </span>
+                                </div>
+                                {% endif %}
+                                <div class="alert alert-{{ ev.advice_class }} py-1 px-2 mb-0" style="font-size:0.8rem;"
+                                     title="{{ ev.note }}" data-bs-toggle="tooltip" data-bs-placement="bottom">
+                                    盈利匹配：<strong>{{ ev.status }}</strong>
+                                    <small class="float-end text-muted">hover 查看口径</small>
+                                </div>
+                            </div>
+                            {% endif %}
+
                             <!-- 分时图 / K线图切换 Tab -->
                             {% if result.intraday_points %}
                             <div class="mb-2">
@@ -922,6 +964,7 @@
                             <table class="table table-sm table-hover mb-0">
                                 <thead>
                                 <tr>
+                                    <th scope="col">盯盘</th>
                                     <th scope="col">代码</th>
                                     <th scope="col">名称</th>
                                     <th scope="col">信号</th>
@@ -933,6 +976,13 @@
                                     <tr data-tag="{{ s.tag }}" data-code="{{ s.code }}"
                                         onclick="requery('{{ s.code }}')"
                                         style="cursor:pointer;">
+                                        <td onclick="event.stopPropagation()">
+                                            <div class="form-check form-switch mb-0">
+                                                <input class="form-check-input common-watch-toggle" type="checkbox"
+                                                       data-code="{{ s.code }}" {% if s.watch_enabled %}checked{% endif %}
+                                                       onchange="toggleWatch(this)">
+                                            </div>
+                                        </td>
                                         <td>{{ s.code }}</td>
                                         <td>
                                             {{ s.name }}
@@ -2160,6 +2210,33 @@ function saveHoldingsEditor() {
         saveBtn.textContent = '保存全部';
     });
 }
+
+function toggleWatch(input) {
+    input.disabled = true;
+    fetch('/api/watch_toggle', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({code: input.dataset.code, enabled: input.checked})
+    }).then(r => {
+        if (!r.ok) throw new Error('保存失败');
+    }).catch(e => {
+        input.checked = !input.checked;
+        alert('盯盘开关保存失败：' + e.message);
+    }).finally(() => { input.disabled = false; });
+}
+
+const _monitorStream = new EventSource('/monitor_stream');
+_monitorStream.onmessage = event => {
+    const item = JSON.parse(event.data);
+    const box = document.createElement('div');
+    box.className = 'alert alert-' + (item.priority === 'risk' ? 'danger' : item.priority === 'opportunity' ? 'primary' : 'secondary') +
+                    ' shadow position-fixed top-0 end-0 m-3';
+    box.style.zIndex = 1080;
+    const strong = document.createElement('strong');
+    strong.textContent = (item.name || item.code) + ' · ' + item.price;
+    box.append(strong, document.createElement('br'), document.createTextNode(item.message));
+    document.body.appendChild(box);
+    setTimeout(() => box.remove(), 12000);
+};
 
 document.addEventListener('DOMContentLoaded', function() {
     loadPortfolioOverview();
