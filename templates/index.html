@@ -1304,7 +1304,7 @@
         applyTagColors();
         // 首次加载即刷新信号，之后每 30 秒轮询一次
         if (document.getElementById('common-stocks-tbody')) {
-            refreshCommonStocksSignal();
+            setTimeout(refreshCommonStocksSignal, 2000);
             setInterval(refreshCommonStocksSignal, 30000);
         }
         const analyzeForm = document.getElementById('analyze-form');

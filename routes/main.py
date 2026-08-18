@@ -11,6 +11,7 @@ import threading as _threading
 import uuid
 import datetime as _dt
 import re
+import time as _time
 
 from fastapi import Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -24,6 +25,7 @@ from core.db import (
     get_index_market_data, get_index_trend_chart_data,
     get_stock_tag, set_stock_tag, get_all_stock_tags, get_distinct_tags,
     get_all_holdings, get_prev_close,
+    get_prev_closes,
     set_watch_enabled, get_watch_enabled_map, save_watch_plans, get_watch_plans,
     activate_watch_plans, get_recent_watch_events,
     update_watch_rule,
@@ -50,6 +52,14 @@ def load_common_stocks():
 
 
 COMMON_STOCKS = load_common_stocks()
+
+_PORTFOLIO_CACHE: dict = {"key": None, "expires_at": 0.0, "payload": None}
+_PORTFOLIO_CACHE_LOCK = _threading.Lock()
+
+
+def _invalidate_portfolio_cache() -> None:
+    with _PORTFOLIO_CACHE_LOCK:
+        _PORTFOLIO_CACHE.update({"key": None, "expires_at": 0.0, "payload": None})
 
 
 # 项目根目录的 .env（和 core/config.py 读取的是同一个文件）
@@ -443,6 +453,7 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
         current = get_portfolio(code)
         effective_max_price = max_price if max_price > 0 else current["max_price"]
         save_portfolio(code, cost_price, stage_high, stage_low, effective_max_price, quantity)
+        _invalidate_portfolio_cache()
 
         result = calculate_8848(code)
         if isinstance(result, dict) and result.get("status") == "success":
@@ -487,30 +498,69 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
         if not holdings:
             return JSONResponse({"stocks": [], "total_pnl_pct": None, "today_avg_pct": None})
 
-        loop = asyncio.get_event_loop()
+        cache_key = tuple((h["code"], h["cost"], h["quantity"]) for h in holdings)
+        with _PORTFOLIO_CACHE_LOCK:
+            if (_PORTFOLIO_CACHE["key"] == cache_key and _PORTFOLIO_CACHE["payload"] is not None
+                    and _PORTFOLIO_CACHE["expires_at"] > _time.monotonic()):
+                return JSONResponse(_PORTFOLIO_CACHE["payload"])
 
-        def _fetch(holding: dict) -> dict:
+        def _load_market_data() -> tuple[dict, dict]:
+            """实时行情只请求一次；失败或缺票时使用后台分钟快照。"""
             import tushare as ts
+            short_codes = [h["code"].split(".")[0] for h in holdings]
+            quotes: dict[str, dict] = {}
+            started = _time.monotonic()
+            try:
+                frame = ts.get_realtime_quotes(short_codes)
+                if frame is not None and not frame.empty:
+                    for _, row in frame.iterrows():
+                        code = str(row.get("code", "")).strip()
+                        price = float(row.get("price") or 0)
+                        if code and price > 0:
+                            quotes[code] = {"price": price, "open": float(row.get("open") or 0),
+                                            "prev_close": float(row.get("pre_close") or 0),
+                                            "name": str(row.get("name") or ""), "source": "realtime"}
+            except Exception as exc:
+                logger.warning("portfolio_overview: batch realtime quote failed: %s", exc)
+            logger.info("portfolio_overview: batch quote codes=%d found=%d elapsed=%.3fs",
+                        len(short_codes), len(quotes), _time.monotonic() - started)
+
+            missing = [code for code in short_codes if code not in quotes]
+            if missing:
+                conn = sqlite3.connect(DB_PATH)
+                marks = ",".join("?" for _ in missing)
+                today = _dt.date.today().isoformat()
+                rows = conn.execute(
+                    f"""SELECT s.code,s.price,s.open FROM intraday_snapshots s
+                        JOIN (SELECT code,MAX(time) AS max_time FROM intraday_snapshots
+                              WHERE date=? AND substr(code,1,6) IN ({marks}) GROUP BY code) x
+                        ON x.code=s.code AND x.max_time=s.time WHERE s.date=?""",
+                    [today, *missing, today],
+                ).fetchall()
+                conn.close()
+                for code, price, open_ in rows:
+                    if price:
+                        quotes[str(code).split(".")[0]] = {
+                            "price": float(price), "open": float(open_ or 0), "name": "", "source": "snapshot"
+                        }
+            prev_codes = list(dict.fromkeys([h["code"] for h in holdings] + short_codes))
+            prev = get_prev_closes(prev_codes, before_date=_dt.date.today().isoformat())
+            return quotes, prev
+
+        quotes, prev_closes = await asyncio.to_thread(_load_market_data)
+        results = []
+        for holding in holdings:
             code = holding["code"]
             cost = holding["cost"]
             name = holding["name"]
             quantity = holding["quantity"]
             short_code = code.split(".")[0] if "." in code else code
-            try:
-                df = ts.get_realtime_quotes(short_code)
-                if df is None or df.empty:
-                    raise ValueError("empty")
-                price = float(df.loc[0, "price"])
-                if price == 0:
-                    raise ValueError("zero price")
-                open_ = float(df.loc[0, "open"])
-                if not name:
-                    name = str(df.loc[0, "name"])
-            except Exception:
-                price = None
-                open_ = None
-
-            prev_close = get_prev_close(code) or get_prev_close(short_code)
+            quote = quotes.get(short_code, {})
+            price = quote.get("price")
+            open_ = quote.get("open")
+            if not name:
+                name = quote.get("name", "")
+            prev_close = quote.get("prev_close") or prev_closes.get(code) or prev_closes.get(short_code)
 
             if price is not None and cost > 0:
                 total_pnl_pct = round((price - cost) / cost * 100, 2)
@@ -519,10 +569,7 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
                 total_pnl_pct = None
                 total_pnl_abs = None
 
-            if price is not None and open_ is not None and open_ > 0:
-                today_pnl_pct = round((price - open_) / open_ * 100, 2)
-                today_pnl_abs = round((price - open_) * quantity, 2) if quantity > 0 else None
-            elif price is not None and prev_close is not None and prev_close > 0:
+            if price is not None and prev_close is not None and prev_close > 0:
                 today_pnl_pct = round((price - prev_close) / prev_close * 100, 2)
                 today_pnl_abs = round((price - prev_close) * quantity, 2) if quantity > 0 else None
             else:
@@ -531,7 +578,7 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
 
             market_value = round(price * quantity, 2) if price is not None and quantity > 0 else None
 
-            return {
+            results.append({
                 "code": short_code,
                 "name": name or short_code,
                 "cost": cost,
@@ -542,12 +589,8 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
                 "total_pnl_abs": total_pnl_abs,
                 "today_pnl_pct": today_pnl_pct,
                 "today_pnl_abs": today_pnl_abs,
-            }
-
-        results = await loop.run_in_executor(
-            None,
-            lambda: [_fetch(h) for h in holdings],
-        )
+                "quote_source": quote.get("source"),
+            })
 
         valid = [r for r in results if r["total_pnl_pct"] is not None]
         total_avg = round(sum(r["total_pnl_pct"] for r in valid) / len(valid), 2) if valid else None
@@ -560,14 +603,17 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
         today_abs = round(sum(r["today_pnl_abs"] for r in today_abs_valid), 2) if today_abs_valid else None
         total_mv = round(sum(r["market_value"] for r in results if r["market_value"] is not None), 2)
 
-        return JSONResponse({
+        payload = {
             "stocks": results,
             "total_pnl_pct": total_avg,
             "today_avg_pct": today_avg,
             "total_pnl_abs": total_abs,
             "today_pnl_abs": today_abs,
             "total_market_value": total_mv if total_mv else None,
-        })
+        }
+        with _PORTFOLIO_CACHE_LOCK:
+            _PORTFOLIO_CACHE.update({"key": cache_key, "expires_at": _time.monotonic() + 20, "payload": payload})
+        return JSONResponse(payload)
 
     @app.post("/api/holdings_batch_save", response_class=JSONResponse)
     async def holdings_batch_save(request: Request):
@@ -588,6 +634,7 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
                 current["stage_high"], current["stage_low"],
                 current["max_price"], quantity,
             )
+        _invalidate_portfolio_cache()
         return JSONResponse({"ok": True, "saved": len(items)})
 
     @app.post("/update_stock_tag", response_class=HTMLResponse)

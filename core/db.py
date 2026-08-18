@@ -894,6 +894,30 @@ def get_prev_close(code: str) -> float | None:
         return None
 
 
+def get_prev_closes(codes: list[str], before_date: str | None = None) -> dict[str, float]:
+    """一次读取多只股票的最近收盘价，避免持仓概览逐只打开 SQLite。"""
+    if not codes:
+        return {}
+    normalized = list(dict.fromkeys(str(c).strip() for c in codes if str(c).strip()))
+    marks = ",".join("?" for _ in normalized)
+    date_clause = "AND date < ?" if before_date else ""
+    params = normalized + ([before_date] if before_date else [])
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            f"""SELECT d.code,d.close FROM daily_records d
+                JOIN (SELECT code,MAX(date) AS max_date FROM daily_records
+                      WHERE code IN ({marks}) AND close>0 {date_clause} GROUP BY code) x
+                ON x.code=d.code AND x.max_date=d.date""",
+            params,
+        ).fetchall()
+        conn.close()
+        return {str(code): float(close) for code, close in rows if close is not None}
+    except Exception as e:
+        logger.error("get_prev_closes failed: %s", e)
+        return {}
+
+
 # ── 次日盯盘 ────────────────────────────────────────────────────────────────
 
 def set_watch_enabled(code: str, enabled: bool) -> None:
