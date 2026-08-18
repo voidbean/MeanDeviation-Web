@@ -177,13 +177,45 @@
                 <div class="small text-muted my-1">{{ plan.summary }}</div>
                 {% for rule in plan.rules %}
                 <div class="input-group input-group-sm mb-1" style="max-width:520px">
-                    <span class="input-group-text">{{ {'breakout':'突破','breakdown':'跌破','near':'接近'}.get(rule.type, rule.type) }}</span>
+                    <span class="input-group-text">{{ {'breakout':'突破','breakdown':'跌破','near':'接近','rapid_move_5m':'5分钟异动(%)','volume_spike':'分钟量倍数'}.get(rule.type, rule.type) }}</span>
                     <input class="form-control" type="number" step="0.001" id="rule-price-{{ rule.id }}" value="{{ rule.price }}" aria-label="关键价">
                     <input class="form-control" type="number" min="1" max="5" id="rule-minutes-{{ rule.id }}" value="{{ rule.confirmation_minutes }}" aria-label="确认分钟">
                     <span class="input-group-text">分钟</span>
                     <button class="btn btn-outline-secondary" type="button" onclick="saveWatchRule({{ rule.id }})">保存</button>
                 </div>
                 {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if today_plans %}
+    <div class="card shadow-sm mt-3 border-success">
+        <div class="card-header"><strong>今日执行中的计划</strong></div>
+        <div class="card-body py-2">
+            {% for plan in today_plans if plan.status == 'active' %}
+            <div class="small mb-1"><strong>{{ plan.name or plan.code }}</strong> · {{ plan.bias }} ·
+                {{ plan.rules | selectattr('state', 'equalto', 'triggered') | list | length }}/{{ plan.rules | length }} 条已触发 ·
+                {{ plan.rules | selectattr('paused', 'equalto', true) | list | length }} 条已暂停</div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if watch_revisions %}
+    <div class="card shadow-sm mt-3">
+        <div class="card-header"><strong>今日计划校准时间线</strong></div>
+        <div class="list-group list-group-flush">
+            {% for revision in watch_revisions %}
+            <div class="list-group-item small">
+                <span class="badge text-bg-light border">{{ revision.slot }}</span>
+                <strong>{{ revision.name or revision.code }}</strong>
+                <span class="badge bg-{{ 'secondary' if revision.decision == 'continue' else 'warning' }} text-dark">{{ revision.decision }}</span>
+                <span class="ms-1">{{ revision.reason }}</span>
+                {% if revision.applied_rules %}
+                <div class="text-muted mt-1">已应用 {{ revision.applied_rules | length }} 项规则修改</div>
+                {% endif %}
             </div>
             {% endfor %}
         </div>
@@ -288,21 +320,6 @@
         });
     });
 
-    const monitorStream = new EventSource('/monitor_stream');
-    monitorStream.onmessage = event => {
-        const item = JSON.parse(event.data);
-        const title = (item.name || item.code) + ' · ' + item.price;
-        const box = document.createElement('div');
-        box.className = 'alert alert-' + (item.priority === 'risk' ? 'danger' : item.priority === 'opportunity' ? 'primary' : 'secondary') +
-                        ' shadow position-fixed top-0 end-0 m-3';
-        box.style.zIndex = 1080;
-        const strong = document.createElement('strong');
-        strong.textContent = title;
-        box.append(strong, document.createElement('br'), document.createTextNode(item.message));
-        document.body.appendChild(box);
-        setTimeout(() => box.remove(), 12000);
-    };
-
     async function saveWatchRule(id) {
         const price = Number(document.getElementById('rule-price-' + id).value);
         const minutes = Number(document.getElementById('rule-minutes-' + id).value);
@@ -328,5 +345,6 @@
         form.submit();
     }
 </script>
+{% include '_monitor_center.html' %}
 </body>
 </html>

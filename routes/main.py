@@ -27,6 +27,8 @@ from core.db import (
     set_watch_enabled, get_watch_enabled_map, save_watch_plans, get_watch_plans,
     activate_watch_plans, get_recent_watch_events,
     update_watch_rule,
+    expire_watch_plans, mark_watch_events_read,
+    get_watch_plan_revisions,
 )
 from core.strategy import (
     calculate_8848, calculate_8848_history, calculate_strategy,
@@ -242,14 +244,18 @@ def _register_routes(app, templates):
     @app.get("/batch", response_class=HTMLResponse)
     async def batch_page(request: Request):
         data = load_temp_result("batch_latest", keep=True)
+        today = _dt.date.today().isoformat()
+        expire_watch_plans(today)
         plan_date = _next_trade_date().isoformat()
         return templates.TemplateResponse("batch.html", {
             "request":       request,
             "batch_results": data.get("batch_results", []),
             "batch_time":    data.get("batch_time", ""),
             "watch_map":     get_watch_enabled_map(),
+            "today_plans":   get_watch_plans(today),
             "watch_plans":   get_watch_plans(plan_date),
             "watch_events":  get_recent_watch_events(),
+            "watch_revisions": get_watch_plan_revisions(today),
             "plan_date":     plan_date,
             "plan_message":  data.get("plan_message", ""),
             "plan_error":    data.get("plan_error", ""),
@@ -288,9 +294,11 @@ def _register_routes(app, templates):
 
 你现在只负责批量生成次日盯盘计划。一次处理所有股票，不调用工具，不写长篇分析。
 只输出一个 JSON 数组，禁止 Markdown 代码块。每项必须包含 code、name、bias、summary、rules。
-rules 仅允许 type=breakout/breakdown/near；每条包含 price、confirmation_minutes(1-5)、
+rules 仅允许 type=breakout/breakdown/near/rapid_move_5m/volume_spike；每条包含 price、confirmation_minutes(1-5)、
 priority(risk/opportunity/observe)、message。每只股票最多4条，价格必须来自输入关键位或有清晰依据。
 breakout默认确认3分钟，breakdown默认确认2分钟，near默认1分钟。避免相互矛盾或过密价位。
+可额外使用 rapid_move_5m（price字段表示5分钟涨跌幅绝对值阈值，建议1.5）或
+volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建议3.0），每只股票最多选一种异动规则。
 """
         user_prompt = (
             f"为交易日 {trade_date} 生成盯盘计划。以下是已由本系统批量计算的数据：\n" +
@@ -301,10 +309,15 @@ breakout默认确认3分钟，breakdown默认确认2分钟，near默认1分钟�
             plans = _parse_json_array(raw)
             allowed_codes = {r.get("code") for r in selected}
             plans = [p for p in plans if isinstance(p, dict) and p.get("code") in allowed_codes]
+            current_by_code = {r.get("code"): r.get("current_price") for r in selected}
+            for plan in plans:
+                plan["_current_price"] = current_by_code.get(plan.get("code"))
             saved = save_watch_plans(plans, trade_date)
             if not saved:
                 raise ValueError("AI 返回内容中没有可用规则")
-            data.update({"plan_message": f"已生成 {saved} 只股票的 {trade_date} 盯盘草稿，请检查后启用。", "plan_error": ""})
+            missing = len(selected) - saved
+            suffix = f"；另有 {missing} 只未通过规则校验" if missing else ""
+            data.update({"plan_message": f"已生成 {saved} 只股票的 {trade_date} 盯盘草稿{suffix}，请检查后启用。", "plan_error": ""})
         except Exception as exc:
             logger.exception("generate_watch_plans failed")
             data.update({"plan_error": f"生成计划失败：{exc}", "plan_message": ""})
@@ -348,6 +361,20 @@ breakout默认确认3分钟，breakdown默认确认2分钟，near默认1分钟�
                 unsubscribe(q)
         return StreamingResponse(generate(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.get("/api/watch_events", response_class=JSONResponse)
+    async def watch_events(after_id: int = 0, limit: int = 50):
+        from services.monitor import get_monitor_health
+        events = get_recent_watch_events(max(1, min(limit, 100)), max(0, after_id))
+        events.reverse()
+        return {"ok": True, "events": events, "health": get_monitor_health()}
+
+    @app.post("/api/watch_events/read", response_class=JSONResponse)
+    async def read_watch_events(request: Request):
+        body = await request.json()
+        up_to_id = body.get("up_to_id")
+        count = mark_watch_events_read(int(up_to_id) if up_to_id is not None else None)
+        return {"ok": True, "count": count}
 
     @app.get("/api/common_stocks_status")
     async def common_stocks_status():

@@ -204,6 +204,51 @@ def init_db():
                 )
             """)
             conn.commit()
+            for stmt, label in [
+                ("ALTER TABLE watch_events ADD COLUMN read_at TEXT", "watch_events.read_at"),
+                ("ALTER TABLE watch_events ADD COLUMN max_gain_pct REAL", "watch_events.max_gain_pct"),
+                ("ALTER TABLE watch_events ADD COLUMN max_drawdown_pct REAL", "watch_events.max_drawdown_pct"),
+                ("ALTER TABLE watch_events ADD COLUMN evaluated_at TEXT", "watch_events.evaluated_at"),
+                ("ALTER TABLE watch_rules ADD COLUMN paused INTEGER NOT NULL DEFAULT 0", "watch_rules.paused"),
+                ("ALTER TABLE watch_rules ADD COLUMN original_threshold REAL", "watch_rules.original_threshold"),
+                ("ALTER TABLE watch_rules ADD COLUMN revision_reason TEXT NOT NULL DEFAULT ''", "watch_rules.revision_reason"),
+            ]:
+                try:
+                    conn.execute(stmt)
+                    conn.commit()
+                    print(f"Migration: added {label} column.")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+            conn.execute("UPDATE watch_rules SET original_threshold=threshold WHERE original_threshold IS NULL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_calibration_runs (
+                    trade_date  TEXT NOT NULL,
+                    slot        TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    started_at  TEXT NOT NULL,
+                    completed_at TEXT,
+                    error       TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(trade_date, slot)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_plan_revisions (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id             INTEGER NOT NULL,
+                    trade_date          TEXT NOT NULL,
+                    slot                TEXT NOT NULL,
+                    source              TEXT NOT NULL,
+                    decision            TEXT NOT NULL,
+                    reason              TEXT NOT NULL DEFAULT '',
+                    original_rules_json TEXT NOT NULL DEFAULT '[]',
+                    applied_rules_json  TEXT NOT NULL DEFAULT '[]',
+                    created_at          TEXT NOT NULL,
+                    UNIQUE(plan_id, slot),
+                    FOREIGN KEY(plan_id) REFERENCES watch_plans(id) ON DELETE CASCADE
+                )
+            """)
+            conn.commit()
         finally:
             conn.close()
     except Exception as e:
@@ -879,8 +924,25 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
     try:
         for plan in plans:
             code = str(plan.get("code", "")).strip()
-            rules = plan.get("rules") or []
+            rules = (plan.get("rules") or [])[:4]
             if not code or not rules:
+                continue
+            try:
+                current_price = float(plan.get("_current_price") or 0)
+            except (TypeError, ValueError):
+                current_price = 0
+            breakouts, breakdowns = [], []
+            for candidate in rules:
+                try:
+                    candidate_price = float(candidate.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if candidate.get("type") == "breakout":
+                    breakouts.append(candidate_price)
+                elif candidate.get("type") == "breakdown":
+                    breakdowns.append(candidate_price)
+            if breakouts and breakdowns and min(breakouts) <= max(breakdowns):
+                logger.warning("skip inconsistent watch plan code=%s breakout<=breakdown", code)
                 continue
             now = int(time.time())
             conn.execute(
@@ -895,6 +957,7 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
                 "SELECT id FROM watch_plans WHERE code=? AND trade_date=?", (code, trade_date)
             ).fetchone()[0]
             conn.execute("DELETE FROM watch_rules WHERE plan_id=?", (plan_id,))
+            inserted_rules = 0
             for rule in rules:
                 kind = str(rule.get("type", ""))
                 try:
@@ -902,16 +965,28 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
                     confirmation = max(1, min(5, int(rule.get("confirmation_minutes", 1))))
                 except (TypeError, ValueError):
                     continue
-                if kind not in {"breakout", "breakdown", "near"} or threshold <= 0:
+                if kind not in {"breakout", "breakdown", "near", "rapid_move_5m", "volume_spike"} or threshold <= 0:
+                    continue
+                if kind in {"breakout", "breakdown", "near"} and current_price > 0:
+                    if abs(threshold - current_price) / current_price > 0.15:
+                        continue
+                if kind == "rapid_move_5m" and not 0.3 <= threshold <= 10:
+                    continue
+                if kind == "volume_spike" and not 1.2 <= threshold <= 20:
                     continue
                 priority = str(rule.get("priority", "observe"))
                 if priority not in {"risk", "opportunity", "observe"}:
                     priority = "observe"
                 conn.execute(
-                    "INSERT INTO watch_rules(plan_id,rule_type,threshold,confirmation_minutes,priority,message) VALUES(?,?,?,?,?,?)",
-                    (plan_id, kind, threshold, confirmation, priority, str(rule.get("message", ""))),
+                    """INSERT INTO watch_rules(plan_id,rule_type,threshold,original_threshold,
+                       confirmation_minutes,priority,message) VALUES(?,?,?,?,?,?,?)""",
+                    (plan_id, kind, threshold, threshold, confirmation, priority, str(rule.get("message", ""))),
                 )
-            count += 1
+                inserted_rules += 1
+            if inserted_rules:
+                count += 1
+            else:
+                conn.execute("DELETE FROM watch_plans WHERE id=?", (plan_id,))
         conn.commit()
     finally:
         conn.close()
@@ -930,13 +1005,16 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
     plans = []
     for row in rows:
         rules = conn.execute(
-            "SELECT id,rule_type,threshold,confirmation_minutes,priority,message,state,triggered_at FROM watch_rules WHERE plan_id=? ORDER BY id",
+            """SELECT id,rule_type,threshold,confirmation_minutes,priority,message,state,triggered_at,
+                      paused,original_threshold,revision_reason
+               FROM watch_rules WHERE plan_id=? ORDER BY id""",
             (row[0],),
         ).fetchall()
         plans.append({"id": row[0], "code": row[1], "name": row[2], "trade_date": row[3],
                       "bias": row[4], "summary": row[5], "status": row[6],
                       "rules": [{"id": r[0], "type": r[1], "price": r[2], "confirmation_minutes": r[3],
-                                 "priority": r[4], "message": r[5], "state": r[6], "triggered_at": r[7]} for r in rules]})
+                                 "priority": r[4], "message": r[5], "state": r[6], "triggered_at": r[7],
+                                 "paused": bool(r[8]), "original_threshold": r[9], "revision_reason": r[10]} for r in rules]})
     conn.close()
     return plans
 
@@ -950,6 +1028,18 @@ def activate_watch_plans(trade_date: str) -> int:
     return count
 
 
+def expire_watch_plans(before_date: str) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "UPDATE watch_plans SET status='expired' WHERE trade_date < ? AND status IN ('draft','active')",
+        (before_date,),
+    )
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    return count
+
+
 def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int) -> bool:
     if threshold <= 0:
         return False
@@ -957,7 +1047,7 @@ def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
         """UPDATE watch_rules SET threshold=?, confirmation_minutes=?, state='waiting',
-           consecutive_hits=0, triggered_at=NULL WHERE id=?""",
+           consecutive_hits=0, triggered_at=NULL,paused=0,revision_reason='用户手动修改' WHERE id=?""",
         (threshold, confirmation_minutes, rule_id),
     )
     conn.commit()
@@ -966,15 +1056,54 @@ def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int)
     return changed
 
 
-def get_recent_watch_events(limit: int = 50) -> list[dict]:
+def get_recent_watch_events(limit: int = 50, after_id: int = 0) -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id,code,name,event_type,priority,price,message,triggered_at FROM watch_events ORDER BY id DESC LIMIT ?",
-        (limit,),
+        """SELECT id,code,name,event_type,priority,price,message,triggered_at,read_at,
+                  max_gain_pct,max_drawdown_pct,evaluated_at
+           FROM watch_events WHERE id > ? ORDER BY id DESC LIMIT ?""",
+        (after_id, limit),
     ).fetchall()
     conn.close()
-    keys = ("id", "code", "name", "event_type", "priority", "price", "message", "triggered_at")
+    keys = ("id", "code", "name", "event_type", "priority", "price", "message", "triggered_at",
+            "read_at", "max_gain_pct", "max_drawdown_pct", "evaluated_at")
     return [dict(zip(keys, row)) for row in rows]
+
+
+def mark_watch_events_read(up_to_id: int | None = None) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    if up_to_id is None:
+        cur = conn.execute("UPDATE watch_events SET read_at=? WHERE read_at IS NULL", (now,))
+    else:
+        cur = conn.execute("UPDATE watch_events SET read_at=? WHERE read_at IS NULL AND id<=?", (now, up_to_id))
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    return count
+
+
+def get_watch_plan_revisions(trade_date: str) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT x.id,x.plan_id,p.code,p.name,x.slot,x.source,x.decision,x.reason,
+                  x.applied_rules_json,x.created_at
+           FROM watch_plan_revisions x JOIN watch_plans p ON p.id=x.plan_id
+           WHERE x.trade_date=? ORDER BY x.created_at,x.id""",
+        (trade_date,),
+    ).fetchall()
+    conn.close()
+    keys = ("id", "plan_id", "code", "name", "slot", "source", "decision", "reason",
+            "applied_rules_json", "created_at")
+    result = []
+    for row in rows:
+        item = dict(zip(keys, row))
+        try:
+            item["applied_rules"] = json.loads(item.pop("applied_rules_json"))
+        except Exception:
+            item["applied_rules"] = []
+        result.append(item)
+    return result
 
 
 def load_ai_conversation(session_id: str) -> list:

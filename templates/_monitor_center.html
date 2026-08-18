@@ -1,0 +1,90 @@
+<button type="button" class="btn btn-dark position-fixed bottom-0 end-0 m-3 shadow"
+        style="z-index:1070" data-bs-toggle="offcanvas" data-bs-target="#monitor-center" onclick="markMonitorRead()">
+    🔔 盯盘 <span id="monitor-unread" class="badge bg-danger d-none">0</span>
+</button>
+<div class="offcanvas offcanvas-end" tabindex="-1" id="monitor-center">
+    <div class="offcanvas-header">
+        <div><h5 class="offcanvas-title mb-0">盯盘通知</h5><small id="monitor-health" class="text-muted">检查行情中…</small></div>
+        <button type="button" class="btn-close" data-bs-dismiss="offcanvas"></button>
+    </div>
+    <div class="offcanvas-body p-0"><div id="monitor-event-list" class="list-group list-group-flush"></div></div>
+</div>
+<script>
+(() => {
+    let lastId = 0;
+    let unread = 0;
+    const seen = new Set();
+
+    function renderHealth(health) {
+        const el = document.getElementById('monitor-health');
+        if (health.market_state === 'closed') {
+            el.textContent = '当前休市' + (health.latest_time ? ' · 最后 ' + health.latest_time : ''); el.className = 'text-muted';
+        } else if (!health.latest_time) {
+            el.textContent = '今日暂无盯盘行情'; el.className = 'text-muted';
+        } else if (health.delayed) {
+            el.textContent = '行情延迟 · 最后 ' + health.latest_time; el.className = 'text-danger';
+        } else {
+            el.textContent = '行情正常 · 最后 ' + health.latest_time; el.className = 'text-success';
+        }
+    }
+
+    function updateBadge() {
+        const badge = document.getElementById('monitor-unread');
+        badge.textContent = unread;
+        badge.classList.toggle('d-none', unread === 0);
+    }
+
+    function addEvent(item, popup) {
+        if (seen.has(item.id)) return;
+        seen.add(item.id); lastId = Math.max(lastId, item.id || 0);
+        if (!item.read_at) unread++;
+        const row = document.createElement('a');
+        row.className = 'list-group-item list-group-item-action';
+        row.href = '#';
+        row.addEventListener('click', event => {
+            event.preventDefault();
+            const form = document.createElement('form'); form.method = 'post'; form.action = '/analyze';
+            const input = document.createElement('input'); input.type = 'hidden'; input.name = 'stock_code'; input.value = item.code;
+            form.appendChild(input); document.body.appendChild(form); form.submit();
+        });
+        const title = document.createElement('div');
+        title.className = 'fw-semibold';
+        title.textContent = (item.name || item.code) + ' · ' + item.price;
+        const msg = document.createElement('div'); msg.className = 'small'; msg.textContent = item.message;
+        const meta = document.createElement('small'); meta.className = 'text-muted';
+        meta.textContent = item.triggered_at + (item.max_gain_pct != null ? ` · 后续最高 ${item.max_gain_pct}% / 最大回撤 ${item.max_drawdown_pct}%` : '');
+        row.append(title, msg, meta);
+        document.getElementById('monitor-event-list').prepend(row);
+        updateBadge();
+        if (popup) {
+            const box = document.createElement('div');
+            box.className = 'alert alert-' + (item.priority === 'risk' ? 'danger' : item.priority === 'opportunity' ? 'primary' : 'secondary') +
+                            ' shadow position-fixed top-0 end-0 m-3';
+            box.style.zIndex = 1090;
+            const strong = document.createElement('strong'); strong.textContent = title.textContent;
+            box.append(strong, document.createElement('br'), document.createTextNode(item.message));
+            document.body.appendChild(box); setTimeout(() => box.remove(), 12000);
+        }
+    }
+
+    async function catchUp() {
+        const response = await fetch('/api/watch_events?after_id=' + lastId + '&limit=50');
+        if (!response.ok) return;
+        const data = await response.json();
+        data.events.forEach(item => addEvent(item, false));
+        renderHealth(data.health);
+    }
+
+    window.markMonitorRead = async function() {
+        unread = 0; updateBadge();
+        await fetch('/api/watch_events/read', {method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({up_to_id:lastId})});
+    };
+
+    catchUp();
+    setInterval(catchUp, 60000);
+    const stream = new EventSource('/monitor_stream');
+    stream.onopen = catchUp;
+    stream.onmessage = event => addEvent(JSON.parse(event.data), true);
+})();
+</script>

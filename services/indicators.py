@@ -145,9 +145,20 @@ def _intraday_bg_loop() -> None:
             _fetch_and_save_intraday_snapshots()
             try:
                 from services.monitor import evaluate_watch_rules
+                from core.db import expire_watch_plans
+                expire_watch_plans(_today_str())
                 evaluate_watch_rules()
             except Exception:
                 logger.exception("intraday_bg_loop: 盯盘规则执行失败")
+        else:
+            import datetime as _dt
+            now = _dt.datetime.now()
+            if now.weekday() < 5 and now.time() >= _dt.time(15, 1):
+                try:
+                    from services.monitor import finalize_watch_event_outcomes
+                    finalize_watch_event_outcomes()
+                except Exception:
+                    logger.exception("intraday_bg_loop: 盯盘效果统计失败")
         time.sleep(60)
 
 

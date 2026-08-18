@@ -2224,20 +2224,6 @@ function toggleWatch(input) {
     }).finally(() => { input.disabled = false; });
 }
 
-const _monitorStream = new EventSource('/monitor_stream');
-_monitorStream.onmessage = event => {
-    const item = JSON.parse(event.data);
-    const box = document.createElement('div');
-    box.className = 'alert alert-' + (item.priority === 'risk' ? 'danger' : item.priority === 'opportunity' ? 'primary' : 'secondary') +
-                    ' shadow position-fixed top-0 end-0 m-3';
-    box.style.zIndex = 1080;
-    const strong = document.createElement('strong');
-    strong.textContent = (item.name || item.code) + ' · ' + item.price;
-    box.append(strong, document.createElement('br'), document.createTextNode(item.message));
-    document.body.appendChild(box);
-    setTimeout(() => box.remove(), 12000);
-};
-
 document.addEventListener('DOMContentLoaded', function() {
     loadPortfolioOverview();
     const chatInput = document.getElementById('ai-chat-input');
@@ -2248,5 +2234,6 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 </script>
+{% include '_monitor_center.html' %}
 </body>
 </html>
