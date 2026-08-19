@@ -30,8 +30,8 @@ class PortfolioOverviewTest(unittest.TestCase):
         with patch.object(main, "get_all_holdings", return_value=holdings), \
              patch.object(main, "get_prev_closes", return_value={}), \
              patch.object(ts, "get_realtime_quotes", return_value=frame) as quote:
-            first = json.loads(asyncio.run(self.endpoint()).body)
-            second = json.loads(asyncio.run(self.endpoint()).body)
+            first = json.loads(asyncio.run(type(self).endpoint()).body)
+            second = json.loads(asyncio.run(type(self).endpoint()).body)
 
         quote.assert_called_once_with(["000001", "600519"])
         self.assertEqual(first, second)
