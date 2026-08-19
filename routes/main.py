@@ -299,10 +299,10 @@ def _register_routes(app, templates):
             "cost_price", "stage_high", "stage_low", "atr", "ddp_lower", "ddp_f618",
         )
         compact = [{k: r.get(k) for k in compact_fields if r.get(k) is not None} for r in selected]
-        system_prompt = build_ai_system_prompt("eod", holding=any((r.get("cost_price") or 0) > 0 for r in selected))
-        system_prompt += """
-
-你现在只负责批量生成次日盯盘计划。一次处理所有股票，不调用工具，不写长篇分析。
+        # 该任务只需要把已计算的关键位整理成规则。不要加载完整 skills 提示，
+        # 否则推理模型可能把输出额度耗在长篇分析上，来不及生成最终 JSON。
+        system_prompt = """你是 A 股次日盯盘计划生成器。输入数据已由系统计算完成，无需重新推导指标。
+一次处理所有股票，不调用工具，不展示推理过程，不写长篇分析。
 只输出一个 JSON 数组，禁止 Markdown 代码块。每项必须包含 code、name、bias、summary、rules。
 rules 仅允许 type=breakout/breakdown/near/rapid_move_5m/volume_spike；每条包含 price、confirmation_minutes(1-5)、
 priority(risk/opportunity/observe)、message。每只股票最多4条，价格必须来自输入关键位或有清晰依据。

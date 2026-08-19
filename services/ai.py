@@ -461,7 +461,7 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
         client = _make_openai_client(timeout=120.0)
         resp = client.chat.completions.create(
             model=_cfg.OPENAI_MODEL,
-            max_tokens=_MAX_TOKENS,
+            max_tokens=_cfg.OPENAI_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
@@ -479,6 +479,10 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
             len(reasoning_content or ""),
             (content or "")[:1000],
         )
+        if choice.finish_reason == "length" and not content:
+            raise RuntimeError(
+                "AI 推理达到输出上限且未生成正文，请调大 OPENAI_MAX_TOKENS 或改用非推理模型"
+            )
         return content
 
     elif provider == "gemini":
