@@ -467,7 +467,19 @@ def call_ai_model(system_prompt: str, user_prompt: str) -> str:
                 {"role": "user",   "content": user_prompt},
             ],
         )
-        return resp.choices[0].message.content
+        choice = resp.choices[0]
+        content = choice.message.content
+        reasoning_content = getattr(choice.message, "reasoning_content", None)
+        logger.info(
+            "openai simple response model=%s finish_reason=%s content_len=%d "
+            "reasoning_content_len=%d content_preview=%r",
+            _cfg.OPENAI_MODEL,
+            choice.finish_reason,
+            len(content or ""),
+            len(reasoning_content or ""),
+            (content or "")[:1000],
+        )
+        return content
 
     elif provider == "gemini":
         import google.generativeai as genai

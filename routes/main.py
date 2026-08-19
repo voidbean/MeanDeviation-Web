@@ -316,6 +316,13 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
         )
         try:
             raw = await asyncio.to_thread(call_ai_model, system_prompt, user_prompt)
+            logger.info(
+                "watch plan AI response provider=%s raw_type=%s raw_len=%d raw_preview=%r",
+                _cfg.AI_PROVIDER,
+                type(raw).__name__,
+                len(raw or ""),
+                (raw or "")[:2000],
+            )
             plans = _parse_json_array(raw)
             allowed_codes = {r.get("code") for r in selected}
             plans = [p for p in plans if isinstance(p, dict) and p.get("code") in allowed_codes]
