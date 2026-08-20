@@ -271,6 +271,7 @@ def _register_routes(app, templates):
             "batch_time":    data.get("batch_time", ""),
             "watch_map":     get_watch_enabled_map(),
             "today_plans":   get_watch_plans(today),
+            "today_date":    today,
             "watch_plans":   get_watch_plans(plan_date),
             "watch_events":  get_recent_watch_events(),
             "watch_revisions": get_watch_plan_revisions(today),

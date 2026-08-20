@@ -37,7 +37,10 @@
             {% if batch_time %}
             <span class="text-muted small">分析时间：{{ batch_time }}</span>
             {% endif %}
-            <a href="#watch-plan-history-card" class="btn btn-outline-secondary btn-sm ms-auto">
+            <a href="#today-watch-plans-card" class="btn btn-outline-success btn-sm ms-auto">
+                今日计划{% if today_plans %}（{{ today_plans | length }}）{% endif %}
+            </a>
+            <a href="#watch-plan-history-card" class="btn btn-outline-secondary btn-sm">
                 历史计划{% if history_plan_groups %}（{{ history_plan_groups | length }}日）{% endif %}
             </a>
             <form action="/analyze_batch" method="post">
@@ -194,19 +197,6 @@
     </div>
     {% endif %}
 
-    {% if today_plans %}
-    <div class="card shadow-sm mt-3 border-success">
-        <div class="card-header"><strong>今日执行中的计划</strong></div>
-        <div class="card-body py-2">
-            {% for plan in today_plans if plan.status == 'active' %}
-            <div class="small mb-1"><strong>{{ plan.name or plan.code }}</strong> · {{ plan.bias }} ·
-                {{ plan.rules | selectattr('state', 'equalto', 'triggered') | list | length }}/{{ plan.rules | length }} 条已触发 ·
-                {{ plan.rules | selectattr('paused', 'equalto', true) | list | length }} 条已暂停</div>
-            {% endfor %}
-        </div>
-    </div>
-    {% endif %}
-
     {% if watch_revisions %}
     <div class="card shadow-sm mt-3">
         <div class="card-header"><strong>今日计划校准时间线</strong></div>
@@ -238,6 +228,45 @@
     </div>
     {% endif %}
     {% endif %}
+
+    <div class="card shadow-sm mt-3 border-success" id="today-watch-plans-card">
+        <div class="card-header"><strong>{{ today_date }} 今日盯盘计划</strong></div>
+        {% if today_plans %}
+        <div class="card-body py-2">
+            {% for plan in today_plans %}
+            <div class="border rounded p-2 mb-2">
+                <div>
+                    <strong>{{ plan.name or plan.code }}</strong>
+                    <span class="text-muted">{{ plan.code }}</span>
+                    <span class="badge bg-{{ 'success' if plan.status == 'active' else 'warning' }} text-{{ 'white' if plan.status == 'active' else 'dark' }}">
+                        {{ '执行中' if plan.status == 'active' else ('草稿未启用' if plan.status == 'draft' else plan.status) }}
+                    </span>
+                    <span class="ms-1">{{ plan.bias }}</span>
+                </div>
+                {% if plan.summary %}<div class="small text-muted my-1">{{ plan.summary }}</div>{% endif %}
+                {% for rule in plan.rules %}
+                <div class="small mt-1 d-flex flex-wrap gap-1 align-items-center">
+                    <span class="badge text-bg-light border">
+                        {{ {'breakout':'突破','breakdown':'跌破','near':'接近','rapid_move_5m':'5分钟异动','volume_spike':'分钟放量'}.get(rule.type, rule.type) }} {{ rule.price }}
+                    </span>
+                    <span>{{ rule.message }}</span>
+                    {% if rule.triggered_at %}
+                    <span class="badge bg-warning text-dark">已触发 {{ rule.triggered_at }}</span>
+                    {% elif rule.paused %}
+                    <span class="badge bg-secondary">已暂停</span>
+                    {% else %}
+                    <span class="badge bg-light text-dark border">等待中</span>
+                    {% endif %}
+                    <span class="text-muted">确认 {{ rule.confirmation_minutes }} 分钟</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="card-body text-center text-muted small py-3">今天没有盯盘计划。</div>
+        {% endif %}
+    </div>
 
     <div class="card shadow-sm mt-3" id="watch-plan-history-card">
         <div class="card-header"><strong>历史盯盘计划</strong></div>
