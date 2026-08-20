@@ -43,6 +43,7 @@
             <form action="/watch_plans/generate" method="post">
                 <button type="submit" class="btn btn-primary btn-sm">AI生成次日计划</button>
             </form>
+            <span class="badge text-bg-light border">可用现金：{{ '%.2f'|format(available_cash) }}</span>
         </div>
     </div>
 
@@ -216,6 +217,46 @@
                 {% if revision.applied_rules %}
                 <div class="text-muted mt-1">已应用 {{ revision.applied_rules | length }} 项规则修改</div>
                 {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if history_plan_groups %}
+    <div class="card shadow-sm mt-3">
+        <div class="card-header"><strong>历史盯盘计划</strong></div>
+        <div class="accordion accordion-flush" id="watch-plan-history">
+            {% for group in history_plan_groups %}
+            <div class="accordion-item">
+                <h2 class="accordion-header">
+                    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse"
+                            data-bs-target="#watch-history-{{ loop.index }}">
+                        {{ group.trade_date }}（{{ group.plans | length }} 只）
+                    </button>
+                </h2>
+                <div id="watch-history-{{ loop.index }}" class="accordion-collapse collapse"
+                     data-bs-parent="#watch-plan-history">
+                    <div class="accordion-body py-2">
+                        {% for plan in group.plans %}
+                        <div class="border-bottom py-2">
+                            <div><strong>{{ plan.name or plan.code }}</strong>
+                                <span class="text-muted">{{ plan.code }}</span>
+                                <span class="badge text-bg-light border">{{ plan.status }}</span>
+                                <span class="ms-1">{{ plan.bias }}</span>
+                            </div>
+                            {% if plan.summary %}<div class="small text-muted">{{ plan.summary }}</div>{% endif %}
+                            {% for rule in plan.rules %}
+                            <div class="small mt-1">
+                                {{ {'breakout':'突破','breakdown':'跌破','near':'接近','rapid_move_5m':'5分钟异动','volume_spike':'分钟放量'}.get(rule.type, rule.type) }}
+                                {{ rule.price }} · {{ rule.message }}
+                                {% if rule.triggered_at %}<span class="badge bg-warning text-dark">已触发 {{ rule.triggered_at }}</span>{% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
             </div>
             {% endfor %}
         </div>

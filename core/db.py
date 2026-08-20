@@ -161,6 +161,13 @@ def init_db():
                 )
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS account_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    value       REAL NOT NULL DEFAULT 0,
+                    updated_at  INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS watch_plans (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     code        TEXT NOT NULL,
@@ -359,6 +366,35 @@ def save_portfolio(code: str, cost: float, high: float, low: float, max_price: f
         conn.close()
     except Exception as e:
         logger.error(f"Failed to save portfolio for {code}: {e}")
+
+
+def get_available_cash() -> float:
+    """读取账户可用现金；未设置时返回 0。"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT value FROM account_settings WHERE setting_key='available_cash'"
+        ).fetchone()
+        conn.close()
+        return max(0.0, float(row[0])) if row else 0.0
+    except Exception as e:
+        logger.error("get_available_cash failed: %s", e)
+        return 0.0
+
+
+def save_available_cash(amount: float) -> None:
+    """保存账户可用现金。"""
+    amount = max(0.0, float(amount))
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO account_settings(setting_key,value,updated_at)
+           VALUES('available_cash',?,?)
+           ON CONFLICT(setting_key) DO UPDATE SET
+             value=excluded.value,updated_at=excluded.updated_at""",
+        (amount, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
 
 
 def save_query_history(code: str, name: str) -> None:
@@ -1041,6 +1077,19 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
                                  "paused": bool(r[8]), "original_threshold": r[9], "revision_reason": r[10]} for r in rules]})
     conn.close()
     return plans
+
+
+def get_recent_watch_plan_dates(before_date: str, limit: int = 10) -> list[str]:
+    """返回指定日期之前最近的计划日期，供页面展示已过期历史计划。"""
+    limit = max(1, min(int(limit), 60))
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT DISTINCT trade_date FROM watch_plans
+           WHERE trade_date < ? ORDER BY trade_date DESC LIMIT ?""",
+        (before_date, limit),
+    ).fetchall()
+    conn.close()
+    return [str(row[0]) for row in rows]
 
 
 def activate_watch_plans(trade_date: str) -> int:

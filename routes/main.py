@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 import core.config as _cfg
 from core.config import logger, DB_PATH
 from core.db import (
-    get_portfolio, save_portfolio,
+    get_portfolio, save_portfolio, get_available_cash, save_available_cash,
     save_query_history, get_query_history,
     save_temp_result, load_temp_result,
     get_index_market_data, get_index_trend_chart_data,
@@ -30,7 +30,7 @@ from core.db import (
     activate_watch_plans, get_recent_watch_events,
     update_watch_rule,
     expire_watch_plans, mark_watch_events_read,
-    get_watch_plan_revisions,
+    get_watch_plan_revisions, get_recent_watch_plan_dates,
 )
 from core.strategy import (
     calculate_8848, calculate_8848_history, calculate_strategy,
@@ -257,6 +257,14 @@ def _register_routes(app, templates):
         today = _dt.date.today().isoformat()
         expire_watch_plans(today)
         plan_date = _next_trade_date().isoformat()
+        history_dates = get_recent_watch_plan_dates(today)
+        available_cash = get_available_cash()
+        history_plans = []
+        for history_date in history_dates:
+            history_plans.append({
+                "trade_date": history_date,
+                "plans": get_watch_plans(history_date),
+            })
         return templates.TemplateResponse("batch.html", {
             "request":       request,
             "batch_results": data.get("batch_results", []),
@@ -266,6 +274,8 @@ def _register_routes(app, templates):
             "watch_plans":   get_watch_plans(plan_date),
             "watch_events":  get_recent_watch_events(),
             "watch_revisions": get_watch_plan_revisions(today),
+            "history_plan_groups": history_plans,
+            "available_cash": available_cash,
             "plan_date":     plan_date,
             "plan_message":  data.get("plan_message", ""),
             "plan_error":    data.get("plan_error", ""),
@@ -296,9 +306,27 @@ def _register_routes(app, templates):
         compact_fields = (
             "code", "name", "current_price", "avg_price", "upper_line", "lower_line", "signal",
             "f382", "f618", "f786", "n20_high", "n20_low", "n40_high", "n40_low",
-            "cost_price", "stage_high", "stage_low", "atr", "ddp_lower", "ddp_f618",
+            "cost_price", "quantity", "stage_high", "stage_low", "atr", "ddp_lower", "ddp_f618",
         )
-        compact = [{k: r.get(k) for k in compact_fields if r.get(k) is not None} for r in selected]
+        compact = []
+        available_cash = get_available_cash()
+        for result in selected:
+            item = {k: result.get(k) for k in compact_fields if result.get(k) is not None}
+            portfolio = get_portfolio(str(result.get("code", "")))
+            quantity = int(portfolio.get("quantity") or 0)
+            cost = float(portfolio.get("cost") or result.get("cost_price") or 0)
+            item.update({
+                # 兼容旧数据：早期只录入了成本价、尚未填写持仓数量。
+                "holding": quantity > 0 or cost > 0,
+                "quantity": quantity,
+                "cost_price": cost,
+                "available_cash": available_cash,
+            })
+            current_price = float(result.get("current_price") or 0)
+            item["max_buy_lots_at_current_price"] = (
+                int(available_cash // (current_price * 100)) if current_price > 0 else 0
+            )
+            compact.append(item)
         # 该任务只需要把已计算的关键位整理成规则。不要加载完整 skills 提示，
         # 否则推理模型可能把输出额度耗在长篇分析上，来不及生成最终 JSON。
         system_prompt = """你是 A 股次日盯盘计划生成器。输入数据已由系统计算完成，无需重新推导指标。
@@ -309,6 +337,11 @@ priority(risk/opportunity/observe)、message。每只股票最多4条，价格�
 breakout默认确认3分钟，breakdown默认确认2分钟，near默认1分钟。避免相互矛盾或过密价位。
 可额外使用 rapid_move_5m（price字段表示5分钟涨跌幅绝对值阈值，建议1.5）或
 volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建议3.0），每只股票最多选一种异动规则。
+必须按 holding 区分计划：未持仓只寻找入场机会与放弃买入/风险条件；已持仓同时考虑回落补仓机会、
+冲高减仓/止盈点和跌破风控点。message 必须写清动作（观察买入、补仓、减仓、止盈或止损），
+不能把未持仓股票写成卖出，也不能在没有风险退出规则时只给已持仓股票补仓规则。
+available_cash 是整个账户共享的可用现金，不得对每只股票重复分配；资金不足一手时只允许观察，
+message 中不得建议实际买入。涉及买入或补仓时，应结合候选价格说明最多可买手数（1手=100股），并保留手续费余量。
 """
         user_prompt = (
             f"为交易日 {trade_date} 生成盯盘计划。以下是已由本系统批量计算的数据：\n" +
@@ -502,10 +535,12 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
     @app.get("/api/portfolio_overview", response_class=JSONResponse)
     async def portfolio_overview():
         holdings = get_all_holdings()
+        available_cash = get_available_cash()
         if not holdings:
-            return JSONResponse({"stocks": [], "total_pnl_pct": None, "today_avg_pct": None})
+            return JSONResponse({"stocks": [], "total_pnl_pct": None, "today_avg_pct": None,
+                                 "available_cash": available_cash, "account_equity": available_cash})
 
-        cache_key = tuple((h["code"], h["cost"], h["quantity"]) for h in holdings)
+        cache_key = (available_cash, tuple((h["code"], h["cost"], h["quantity"]) for h in holdings))
         with _PORTFOLIO_CACHE_LOCK:
             if (_PORTFOLIO_CACHE["key"] == cache_key and _PORTFOLIO_CACHE["payload"] is not None
                     and _PORTFOLIO_CACHE["expires_at"] > _time.monotonic()):
@@ -617,10 +652,25 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
             "total_pnl_abs": total_abs,
             "today_pnl_abs": today_abs,
             "total_market_value": total_mv if total_mv else None,
+            "available_cash": available_cash,
+            "account_equity": round(available_cash + total_mv, 2),
         }
         with _PORTFOLIO_CACHE_LOCK:
             _PORTFOLIO_CACHE.update({"key": cache_key, "expires_at": _time.monotonic() + 20, "payload": payload})
         return JSONResponse(payload)
+
+    @app.post("/api/available_cash", response_class=JSONResponse)
+    async def update_available_cash(request: Request):
+        try:
+            body = await request.json()
+            amount = float(body.get("amount"))
+        except (TypeError, ValueError, AttributeError):
+            return JSONResponse({"ok": False, "error": "可用现金格式无效"}, status_code=400)
+        if amount < 0 or amount > 1_000_000_000_000:
+            return JSONResponse({"ok": False, "error": "可用现金必须为非负数"}, status_code=400)
+        save_available_cash(round(amount, 2))
+        _invalidate_portfolio_cache()
+        return JSONResponse({"ok": True, "available_cash": round(amount, 2)})
 
     @app.post("/api/holdings_batch_save", response_class=JSONResponse)
     async def holdings_batch_save(request: Request):

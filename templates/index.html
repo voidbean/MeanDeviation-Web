@@ -929,6 +929,15 @@
                         <button type="button" class="btn btn-link btn-sm p-0 text-muted" onclick="loadPortfolioOverview()" title="刷新">↺</button>
                     </div>
                 </div>
+                <div class="px-2 pt-2">
+                    <div class="input-group input-group-sm">
+                        <span class="input-group-text">可用现金</span>
+                        <input type="number" class="form-control" id="available-cash-input"
+                               min="0" step="0.01" placeholder="0.00">
+                        <button class="btn btn-outline-primary" type="button" onclick="saveAvailableCash()">保存</button>
+                    </div>
+                    <div class="form-text" id="available-cash-feedback">用于判断计划是否具备买入或补仓能力</div>
+                </div>
                 <div class="card-body p-2" id="portfolio-overview-body">
                     <div class="text-center text-muted small py-2">加载中…</div>
                 </div>
@@ -2070,8 +2079,10 @@ function loadPortfolioOverview() {
     fetch('/api/portfolio_overview')
         .then(r => r.json())
         .then(data => {
+            const cashInput = document.getElementById('available-cash-input');
+            if (cashInput) cashInput.value = Number(data.available_cash || 0).toFixed(2);
             if (!data.stocks || data.stocks.length === 0) {
-                body.innerHTML = '<div class="text-center text-muted small py-2">暂无持仓（成本价未设置）</div>';
+                body.innerHTML = `<div class="text-center text-muted small py-2">暂无持仓 · 账户资产 ${Number(data.account_equity || 0).toLocaleString()}</div>`;
                 return;
             }
             const fmtPct = (v, bold) => {
@@ -2089,8 +2100,10 @@ function loadPortfolioOverview() {
             // 汇总行
             const mvStr = data.total_market_value != null
                 ? `<span class="fw-semibold">${data.total_market_value.toLocaleString()}</span> <span class="text-muted small">市值</span>` : '';
+            const cashStr = `<span class="fw-semibold">${Number(data.available_cash || 0).toLocaleString()}</span> <span class="text-muted small">现金</span>`;
             let summaryHtml = `
                 <div class="d-flex flex-wrap gap-2 align-items-center mb-2 px-1" style="font-size:0.82rem;">
+                    <div>${cashStr}</div><div class="vr"></div>
                     ${mvStr ? `<div>${mvStr}</div><div class="vr"></div>` : ''}
                     <div><span class="text-muted me-1">累计</span>${fmtPct(data.total_pnl_pct, true)}${fmtAbs(data.total_pnl_abs, true)}</div>
                     <div class="vr"></div>
@@ -2130,6 +2143,30 @@ function loadPortfolioOverview() {
         .catch(() => {
             body.innerHTML = '<div class="text-center text-danger small py-2">加载失败，请刷新重试</div>';
         });
+}
+
+function saveAvailableCash() {
+    const input = document.getElementById('available-cash-input');
+    const feedback = document.getElementById('available-cash-feedback');
+    const amount = Number(input ? input.value : NaN);
+    if (!Number.isFinite(amount) || amount < 0) {
+        feedback.className = 'form-text text-danger';
+        feedback.textContent = '请输入不小于 0 的金额';
+        return;
+    }
+    fetch('/api/available_cash', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({amount})
+    }).then(async r => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || '保存失败');
+        feedback.className = 'form-text text-success';
+        feedback.textContent = '已保存；生成新计划时会用于校验买入能力';
+        loadPortfolioOverview();
+    }).catch(err => {
+        feedback.className = 'form-text text-danger';
+        feedback.textContent = err.message;
+    });
 }
 
 function openHoldingsEditor() {
