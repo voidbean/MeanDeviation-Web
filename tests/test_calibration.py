@@ -68,6 +68,28 @@ class CalibrationTest(unittest.TestCase):
         self.assertTrue(calibration._claim_run("2026-08-19", "10:00"))
         self.assertFalse(calibration._claim_run("2026-08-19", "10:00"))
 
+    def test_close_calibration_receives_position_and_cash_context(self):
+        self._insert_market()
+        db.save_portfolio("000001", 9.8, 11, 9, 10.6, 200)
+        db.save_available_cash(2500)
+        captured = {}
+
+        def fake_call(system_prompt, user_prompt):
+            captured["system"] = system_prompt
+            captured["payload"] = __import__("json").loads(user_prompt)
+            return '[{"code":"000001","decision":"continue","reason":"持有","adjustments":[]}]'
+
+        with patch.object(calibration, "load_skills", return_value=""), \
+             patch.object(calibration, "call_ai_model", side_effect=fake_call):
+            self.assertEqual(calibration.run_ai_calibration("2026-08-19", "14:35"), 1)
+
+        item = captured["payload"][0]
+        self.assertTrue(item["position"]["holding"])
+        self.assertEqual(item["position"]["quantity"], 200)
+        self.assertEqual(item["account"]["available_cash"], 2500)
+        self.assertEqual(item["account"]["max_buy_lots_at_current_price"], 2)
+        self.assertIn("尾盘隔夜决策", captured["system"])
+
 
 if __name__ == "__main__":
     unittest.main()

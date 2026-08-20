@@ -1,14 +1,20 @@
-"""09:35 / 10:00 / 13:05 盘中计划校准。"""
+"""09:35 / 10:00 / 13:05 / 14:35 盘中计划校准。"""
 import datetime as dt
 import json
 import sqlite3
 import time
 
 from core.config import DB_PATH, logger
+from core.db import get_available_cash, get_portfolio
 from core.strategy import load_skills
 from services.ai import call_ai_model
 
-CALIBRATION_SLOTS = (("09:35", "open"), ("10:00", "morning"), ("13:05", "midday"))
+CALIBRATION_SLOTS = (
+    ("09:35", "open"),
+    ("10:00", "morning"),
+    ("13:05", "midday"),
+    ("14:35", "close"),
+)
 
 
 def _now_text() -> str:
@@ -198,25 +204,41 @@ def run_ai_calibration(trade_date: str, slot: str) -> int:
     conn.row_factory = sqlite3.Row
     plans = _active_plans(conn, trade_date)
     payload, plan_by_code = [], {}
+    available_cash = get_available_cash()
     for plan in plans:
         snap = _market_snapshot(conn, plan["code"], trade_date)
         if not snap:
             continue
         rules = _rules(conn, plan["id"])
+        portfolio = get_portfolio(plan["code"])
+        quantity = int(portfolio.get("quantity") or 0)
+        price = float(snap.get("price") or 0)
         payload.append({"code": plan["code"], "name": plan["name"], "bias": plan["bias"],
-                        "summary": plan["summary"], "market": snap, "rules": rules})
+                        "summary": plan["summary"], "market": snap, "rules": rules,
+                        "position": {"holding": quantity > 0, "quantity": quantity,
+                                     "cost_price": float(portfolio.get("cost") or 0)},
+                        "account": {"available_cash": available_cash,
+                                    "max_buy_lots_at_current_price":
+                                        int(available_cash // (price * 100)) if price > 0 else 0}})
         plan_by_code[plan["code"]] = plan
     conn.close()
     if not payload:
         return 0
 
     skills = load_skills(subset=("05", "06", "07"))
+    focus = {
+        "10:00": "判断上午主方向、突破质量与量价配合",
+        "13:05": "根据上午完整走势决定午后继续、降级或失效",
+        "14:35": ("执行尾盘隔夜决策：未持仓判断是否保留买入机会；已持仓判断持有、补仓机会或减仓风控。"
+                  "不得临时创造新买点，不得追涨。available_cash是全账户共享现金，不可对多只股票重复分配；"
+                  "不足一手（100股）时必须暂停买入/补仓机会。reason必须明确写出买入、补仓、持有、减仓或放弃机会"),
+    }.get(slot, "根据当前走势决定继续、降级或失效")
     system_prompt = f"""你是A股盘中计划校准器。以下仅注入量价、分时和风控方法论：\n{skills}\n
 只输出JSON数组，不要Markdown。每只股票输出code、decision、reason、adjustments。
 decision仅允许continue/pause_opportunity/invalidate/tighten_risk。
 adjustments每项仅允许rule_id、action(pause/update)、threshold。不得修改已触发规则；
 止损/跌破风险线只能上移，不能下调；关键价最多小幅修正1%；不要追着价格重写计划。
-{slot}校准重点：{'判断上午主方向、突破质量与量价配合' if slot == '10:00' else '根据上午完整走势决定午后继续、降级或失效'}。
+{slot}校准重点：{focus}。
 """
     raw = call_ai_model(system_prompt, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     proposals = _parse_array(raw)

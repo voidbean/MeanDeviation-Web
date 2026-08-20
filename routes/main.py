@@ -316,8 +316,7 @@ def _register_routes(app, templates):
             quantity = int(portfolio.get("quantity") or 0)
             cost = float(portfolio.get("cost") or result.get("cost_price") or 0)
             item.update({
-                # 兼容旧数据：早期只录入了成本价、尚未填写持仓数量。
-                "holding": quantity > 0 or cost > 0,
+                "holding": quantity > 0,
                 "quantity": quantity,
                 "cost_price": cost,
                 "available_cash": available_cash,
@@ -491,7 +490,13 @@ message 中不得建议实际买入。涉及买入或补仓时，应结合候选
         quantity:   int   = Form(0),
     ):
         current = get_portfolio(code)
-        effective_max_price = max_price if max_price > 0 else current["max_price"]
+        if quantity <= 0:
+            # 股数是持仓状态的权威字段。清仓时保留阶段区间，但清掉持仓数据。
+            cost_price = 0.0
+            quantity = 0
+            effective_max_price = 0.0
+        else:
+            effective_max_price = max_price if max_price > 0 else current["max_price"]
         save_portfolio(code, cost_price, stage_high, stage_low, effective_max_price, quantity)
         _invalidate_portfolio_cache()
 
@@ -686,10 +691,16 @@ message 中不得建议实际买入。涉及买入或补仓时，应结合候选
             cost = float(item.get("cost", 0) or 0)
             quantity = int(item.get("quantity", 0) or 0)
             current = get_portfolio(code)
+            if quantity <= 0:
+                cost = 0.0
+                quantity = 0
+                max_price = 0.0
+            else:
+                max_price = current["max_price"]
             save_portfolio(
                 code, cost,
                 current["stage_high"], current["stage_low"],
-                current["max_price"], quantity,
+                max_price, quantity,
             )
         _invalidate_portfolio_cache()
         return JSONResponse({"ok": True, "saved": len(items)})

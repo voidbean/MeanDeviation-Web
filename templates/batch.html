@@ -37,7 +37,10 @@
             {% if batch_time %}
             <span class="text-muted small">分析时间：{{ batch_time }}</span>
             {% endif %}
-            <form action="/analyze_batch" method="post" class="ms-auto">
+            <a href="#watch-plan-history-card" class="btn btn-outline-secondary btn-sm ms-auto">
+                历史计划{% if history_plan_groups %}（{{ history_plan_groups | length }}日）{% endif %}
+            </a>
+            <form action="/analyze_batch" method="post">
                 <button type="submit" class="btn btn-outline-primary btn-sm">刷新信号</button>
             </form>
             <form action="/watch_plans/generate" method="post">
@@ -223,9 +226,22 @@
     </div>
     {% endif %}
 
-    {% if history_plan_groups %}
+    {% if watch_events %}
     <div class="card shadow-sm mt-3">
+        <div class="card-header"><strong>最近盯盘提醒</strong></div>
+        <div class="list-group list-group-flush">
+            {% for event in watch_events[:20] %}
+            <div class="list-group-item small"><span class="text-muted">{{ event.triggered_at }}</span>
+                {{ event.name or event.code }} · {{ event.message }}（{{ event.price }}）</div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+    {% endif %}
+
+    <div class="card shadow-sm mt-3" id="watch-plan-history-card">
         <div class="card-header"><strong>历史盯盘计划</strong></div>
+        {% if history_plan_groups %}
         <div class="accordion accordion-flush" id="watch-plan-history">
             {% for group in history_plan_groups %}
             <div class="accordion-item">
@@ -260,21 +276,10 @@
             </div>
             {% endfor %}
         </div>
+        {% else %}
+        <div class="card-body text-center text-muted small py-3">暂无历史计划；计划日期过去后会自动归档到这里。</div>
+        {% endif %}
     </div>
-    {% endif %}
-
-    {% if watch_events %}
-    <div class="card shadow-sm mt-3">
-        <div class="card-header"><strong>最近盯盘提醒</strong></div>
-        <div class="list-group list-group-flush">
-            {% for event in watch_events[:20] %}
-            <div class="list-group-item small"><span class="text-muted">{{ event.triggered_at }}</span>
-                {{ event.name or event.code }} · {{ event.message }}（{{ event.price }}）</div>
-            {% endfor %}
-        </div>
-    </div>
-    {% endif %}
-    {% endif %}
 
 </div>
 

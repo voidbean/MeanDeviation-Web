@@ -335,12 +335,16 @@ def get_portfolio(code: str):
         row = cur.fetchone()
         conn.close()
         if row:
+            quantity = int(row[4]) if row[4] else 0
+            # 持股数量是持仓状态的唯一依据；避免“股数已清空但成本仍在”的幽灵持仓。
+            cost = row[0] if quantity > 0 else 0
+            max_price = (row[3] if row[3] is not None else 0.0) if quantity > 0 else 0.0
             return {
-                "cost":       row[0],
+                "cost":       cost,
                 "stage_high": row[1],
                 "stage_low":  row[2],
-                "max_price":  row[3] if row[3] is not None else 0.0,
-                "quantity":   int(row[4]) if row[4] else 0,
+                "max_price":  max_price,
+                "quantity":   quantity,
             }
     except Exception as e:
         logger.error(f"Failed to get portfolio for {code}: {e}")
@@ -720,7 +724,7 @@ def get_distinct_tags() -> list:
 
 
 def get_all_holdings() -> list:
-    """返回所有已设置成本价的持仓，含股票名称缓存。"""
+    """返回所有成本价、持股数量均有效的持仓，含股票名称缓存。"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.execute("""
@@ -729,7 +733,7 @@ def get_all_holdings() -> list:
                    COALESCE(p.quantity, 0) AS quantity
             FROM portfolio p
             LEFT JOIN stock_name_cache s ON s.code = p.code
-            WHERE p.cost_price > 0
+            WHERE p.cost_price > 0 AND COALESCE(p.quantity, 0) > 0
             ORDER BY p.updated_at DESC
         """)
         rows = cur.fetchall()
