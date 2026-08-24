@@ -33,6 +33,12 @@ def _publish(event: dict) -> None:
             pass
 
 
+def publish_events(events: list[dict]) -> None:
+    """向当前在线页面推送已持久化事件；离线页面会通过 API 回补。"""
+    for event in events:
+        _publish(event)
+
+
 def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
     """使用当分钟已保存的快照执行规则；相同规则每天最多触发一次。"""
     trade_date = trade_date or dt.date.today().isoformat()

@@ -155,7 +155,7 @@ def _parse_array(text: str) -> list:
     return value
 
 
-def _apply_ai_decision(conn, plan, proposal: dict, slot: str) -> None:
+def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: float | None = None) -> dict | None:
     original = _rules(conn, plan["id"])
     by_id = {r["id"]: r for r in original}
     decision = str(proposal.get("decision", "continue"))
@@ -197,13 +197,32 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str) -> None:
             )
             applied.append({"rule_id": rule_id, "action": "update", "from": old, "to": new_value})
     _save_revision(conn, plan, slot, "ai", decision, reason, original, applied)
+    if decision == "continue" or market_price is None:
+        return None
+    # 校准决策和价格规则触发是两类事件。非 continue 决策也必须进入通知中心，
+    # 否则页面关闭期间发生的清仓/减仓判断只能埋在审计时间线里。
+    representative = next((r for r in original if r["priority"] == "risk"), original[0] if original else None)
+    if not representative:
+        return None
+    priority = "risk" if decision in {"tighten_risk", "invalidate"} else "observe"
+    now = _now_text()
+    message = f"{slot} 校准：{reason or decision}"
+    cur = conn.execute(
+        """INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (representative["id"], plan["code"], plan["name"], "calibration", priority,
+         float(market_price), message, now),
+    )
+    return {"id": cur.lastrowid, "code": plan["code"], "name": plan["name"],
+            "event_type": "calibration", "priority": priority, "price": float(market_price),
+            "message": message, "triggered_at": now, "read_at": None}
 
 
 def run_ai_calibration(trade_date: str, slot: str) -> int:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     plans = _active_plans(conn, trade_date)
-    payload, plan_by_code = [], {}
+    payload, plan_by_code, market_price_by_code = [], {}, {}
     available_cash = get_available_cash()
     for plan in plans:
         snap = _market_snapshot(conn, plan["code"], trade_date)
@@ -221,6 +240,7 @@ def run_ai_calibration(trade_date: str, slot: str) -> int:
                                     "max_buy_lots_at_current_price":
                                         int(available_cash // (price * 100)) if price > 0 else 0}})
         plan_by_code[plan["code"]] = plan
+        market_price_by_code[plan["code"]] = price
     conn.close()
     if not payload:
         return 0
@@ -245,6 +265,7 @@ adjustments每项仅允许rule_id、action(pause/update)、threshold。不得修
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     count = 0
+    notification_events = []
     try:
         proposed_codes = set()
         for proposal in proposals:
@@ -253,7 +274,12 @@ adjustments每项仅允许rule_id、action(pause/update)、threshold。不得修
             plan = plan_by_code.get(proposal.get("code"))
             if not plan:
                 continue
-            _apply_ai_decision(conn, plan, proposal, slot)
+            event = _apply_ai_decision(
+                conn, plan, proposal, slot,
+                market_price=market_price_by_code.get(plan["code"]),
+            )
+            if event:
+                notification_events.append(event)
             proposed_codes.add(plan["code"]); count += 1
         for code, plan in plan_by_code.items():
             if code not in proposed_codes:
@@ -261,6 +287,9 @@ adjustments每项仅允许rule_id、action(pause/update)、threshold。不得修
         conn.commit()
     finally:
         conn.close()
+    if notification_events:
+        from services.monitor import publish_events
+        publish_events(notification_events)
     return count
 
 

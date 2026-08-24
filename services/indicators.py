@@ -81,8 +81,6 @@ def _fetch_and_save_intraday_snapshots() -> None:
         return
     import datetime
     today    = _today_str()
-    now_hhmm = datetime.datetime.now().strftime("%H:%M")
-
     try:
         conn = sqlite3.connect(DB_PATH)
         try:
@@ -95,46 +93,65 @@ def _fetch_and_save_intraday_snapshots() -> None:
     except Exception as e:
         logger.error("intraday_fetch: 清理旧数据失败 %s", e)
 
-    for item in _cfg.COMMON_STOCKS:
-        code = item["code"]
-        try:
-            df = ts.get_realtime_quotes(code)
-        except Exception as e:
-            logger.warning("intraday_fetch: get_realtime_quotes 失败 code=%s %s", code, e)
-            continue
-        if df is None or df.empty:
-            continue
-        try:
-            price      = float(df.loc[0, "price"])
-            high       = float(df.loc[0, "high"])
-            low        = float(df.loc[0, "low"])
-            open_      = float(df.loc[0, "open"])
-            cum_vol    = float(df.loc[0, "volume"])
-            cum_amount = float(df.loc[0, "amount"]) / 1000.0
-        except Exception as e:
-            logger.warning("intraday_fetch: 解析行情失败 code=%s %s", code, e)
-            continue
-        _save_intraday_snapshot(code, today, now_hhmm, price, open_, high, low, cum_vol, cum_amount)
+    items = [item for item in _cfg.COMMON_STOCKS if item.get("code")]
+    requested = {str(item["code"]).split(".")[0]: str(item["code"]) for item in items}
+    try:
+        # 单次批量请求，避免逐只请求把“一分钟扫描”拖成数分钟。
+        df = ts.get_realtime_quotes(list(requested))
+    except Exception as e:
+        logger.warning("intraday_fetch: 批量实时行情失败 codes=%d %s", len(requested), e)
+        df = None
+    captured_hhmm = datetime.datetime.now().strftime("%H:%M")
+    returned = set()
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            short_code = str(row.get("code", "")).strip()
+            code = requested.get(short_code)
+            if not code:
+                continue
+            returned.add(short_code)
+            try:
+                price      = float(row.get("price") or 0)
+                high       = float(row.get("high") or 0)
+                low        = float(row.get("low") or 0)
+                open_      = float(row.get("open") or 0)
+                cum_vol    = float(row.get("volume") or 0)
+                cum_amount = float(row.get("amount") or 0) / 1000.0
+            except Exception as e:
+                logger.warning("intraday_fetch: 解析行情失败 code=%s %s", code, e)
+                continue
+            _save_intraday_snapshot(code, today, captured_hhmm, price, open_, high, low, cum_vol, cum_amount)
+    missing = sorted(set(requested) - returned)
+    if missing:
+        logger.warning("intraday_fetch: 批量行情缺少 %d 只 code=%s", len(missing), ",".join(missing))
 
-    for rt_code, store_code in _INDEX_RT_CODES:
-        try:
-            df = ts.get_realtime_quotes(rt_code)
-        except Exception as e:
-            logger.warning("intraday_fetch: 指数失败 code=%s %s", rt_code, e)
-            continue
-        if df is None or df.empty:
-            continue
-        try:
-            price      = float(df.loc[0, "price"])
-            high       = float(df.loc[0, "high"])
-            low        = float(df.loc[0, "low"])
-            open_      = float(df.loc[0, "open"])
-            cum_vol    = float(df.loc[0, "volume"])
-            cum_amount = float(df.loc[0, "amount"]) / 1000.0
-        except Exception as e:
-            logger.warning("intraday_fetch: 解析指数失败 code=%s %s", rt_code, e)
-            continue
-        _save_intraday_snapshot(store_code, today, now_hhmm, price, open_, high, low, cum_vol, cum_amount)
+    # 指数同样批量拉取；其结果不参与个股规则扫描。
+    index_requests = {rt_code: store_code for rt_code, store_code in _INDEX_RT_CODES}
+    try:
+        index_df = ts.get_realtime_quotes(list(index_requests))
+    except Exception as e:
+        logger.warning("intraday_fetch: 指数批量行情失败 %s", e)
+        index_df = None
+    index_hhmm = datetime.datetime.now().strftime("%H:%M")
+    if index_df is not None and not index_df.empty:
+        for _, row in index_df.iterrows():
+            raw_code = str(row.get("code", "")).strip()
+            store_code = index_requests.get(raw_code) or next(
+                (target for source, target in _INDEX_RT_CODES if source[-6:] == raw_code), None
+            )
+            if not store_code:
+                continue
+            try:
+                price      = float(row.get("price") or 0)
+                high       = float(row.get("high") or 0)
+                low        = float(row.get("low") or 0)
+                open_      = float(row.get("open") or 0)
+                cum_vol    = float(row.get("volume") or 0)
+                cum_amount = float(row.get("amount") or 0) / 1000.0
+            except Exception as e:
+                logger.warning("intraday_fetch: 解析指数失败 code=%s %s", raw_code, e)
+                continue
+            _save_intraday_snapshot(store_code, today, index_hhmm, price, open_, high, low, cum_vol, cum_amount)
 
 
 def _intraday_bg_loop() -> None:

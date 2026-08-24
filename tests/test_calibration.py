@@ -77,7 +77,7 @@ class CalibrationTest(unittest.TestCase):
         def fake_call(system_prompt, user_prompt):
             captured["system"] = system_prompt
             captured["payload"] = __import__("json").loads(user_prompt)
-            return '[{"code":"000001","decision":"continue","reason":"持有","adjustments":[]}]'
+            return '[{"code":"000001","decision":"tighten_risk","reason":"尾盘减仓风控","adjustments":[]}]'
 
         with patch.object(calibration, "load_skills", return_value=""), \
              patch.object(calibration, "call_ai_model", side_effect=fake_call):
@@ -89,6 +89,14 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual(item["account"]["available_cash"], 2500)
         self.assertEqual(item["account"]["max_buy_lots_at_current_price"], 2)
         self.assertIn("尾盘隔夜决策", captured["system"])
+        conn = sqlite3.connect(self.path)
+        event = conn.execute(
+            "SELECT event_type,priority,message FROM watch_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(event[0], "calibration")
+        self.assertEqual(event[1], "risk")
+        self.assertIn("14:35 校准", event[2])
 
 
 if __name__ == "__main__":
