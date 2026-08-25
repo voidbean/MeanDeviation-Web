@@ -47,8 +47,15 @@
                 <button type="submit" class="btn btn-outline-primary btn-sm">刷新信号</button>
             </form>
             <form action="/watch_plans/generate" method="post">
+                <input type="hidden" name="target" value="next">
                 <button type="submit" class="btn btn-primary btn-sm">AI生成次日计划</button>
             </form>
+            {% if not today_plans %}
+            <form action="/watch_plans/generate" method="post">
+                <input type="hidden" name="target" value="today">
+                <button type="submit" class="btn btn-outline-success btn-sm">补生成今日计划</button>
+            </form>
+            {% endif %}
             <span class="badge text-bg-light border">可用现金：{{ '%.2f'|format(available_cash) }}</span>
         </div>
     </div>
@@ -170,6 +177,7 @@
             <strong>{{ plan_date }} 次日盯盘计划</strong>
             {% if watch_plans | selectattr('status', 'equalto', 'draft') | list %}
             <form action="/watch_plans/activate" method="post" class="ms-auto">
+                <input type="hidden" name="trade_date" value="{{ plan_date }}">
                 <button class="btn btn-success btn-sm" type="submit">确认并启用全部草稿</button>
             </form>
             {% endif %}
@@ -230,7 +238,15 @@
     {% endif %}
 
     <div class="card shadow-sm mt-3 border-success" id="today-watch-plans-card">
-        <div class="card-header"><strong>{{ today_date }} 今日盯盘计划</strong></div>
+        <div class="card-header d-flex align-items-center">
+            <strong>{{ today_date }} 今日盯盘计划</strong>
+            {% if today_plans | selectattr('status', 'equalto', 'draft') | list %}
+            <form action="/watch_plans/activate" method="post" class="ms-auto">
+                <input type="hidden" name="trade_date" value="{{ today_date }}">
+                <button class="btn btn-success btn-sm" type="submit">确认并启用今日草稿</button>
+            </form>
+            {% endif %}
+        </div>
         {% if today_plans %}
         <div class="card-body py-2">
             {% for plan in today_plans %}

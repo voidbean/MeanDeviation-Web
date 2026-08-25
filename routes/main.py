@@ -108,6 +108,16 @@ def _next_trade_date(today: _dt.date | None = None) -> _dt.date:
     return _next_weekday(today)
 
 
+def _watch_plan_trade_date(target: str, today: _dt.date | None = None) -> _dt.date:
+    """将页面允许的计划目标解析为受控交易日期。"""
+    today = today or _dt.date.today()
+    if target == "today":
+        return today
+    if target == "next":
+        return _next_trade_date(today)
+    raise ValueError("计划日期参数无效")
+
+
 def _parse_json_array(text: str) -> list:
     """兼容模型偶尔附带代码围栏或简短说明。"""
     text = (text or "").strip()
@@ -293,7 +303,7 @@ def _register_routes(app, templates):
         return {"ok": True, "code": code, "enabled": enabled}
 
     @app.post("/watch_plans/generate", response_class=HTMLResponse)
-    async def generate_watch_plans():
+    async def generate_watch_plans(target: str = Form("next")):
         data = load_temp_result("batch_latest", keep=True)
         results = data.get("batch_results", [])
         watch_map = get_watch_enabled_map()
@@ -303,7 +313,13 @@ def _register_routes(app, templates):
             save_temp_result("batch_latest", data)
             return RedirectResponse(url="/batch", status_code=303)
 
-        trade_date = _next_trade_date().isoformat()
+        try:
+            trade_day = _watch_plan_trade_date(target)
+        except ValueError as exc:
+            data.update({"plan_error": str(exc), "plan_message": ""})
+            save_temp_result("batch_latest", data)
+            return RedirectResponse(url="/batch", status_code=303)
+        trade_date = trade_day.isoformat()
         compact_fields = (
             "code", "name", "current_price", "avg_price", "upper_line", "lower_line", "signal",
             "f382", "f618", "f786", "n20_high", "n20_low", "n40_high", "n40_low",
@@ -329,7 +345,7 @@ def _register_routes(app, templates):
             compact.append(item)
         # 该任务只需要把已计算的关键位整理成规则。不要加载完整 skills 提示，
         # 否则推理模型可能把输出额度耗在长篇分析上，来不及生成最终 JSON。
-        system_prompt = """你是 A 股次日盯盘计划生成器。输入数据已由系统计算完成，无需重新推导指标。
+        system_prompt = """你是 A 股盯盘计划生成器。输入数据已由系统计算完成，无需重新推导指标。
 一次处理所有股票，不调用工具，不展示推理过程，不写长篇分析。
 只输出一个 JSON 数组，禁止 Markdown 代码块。每项必须包含 code、name、bias、summary、rules。
 rules 仅允许 type=breakout/breakdown/near/rapid_move_5m/volume_spike；每条包含 price、confirmation_minutes(1-5)、
@@ -343,8 +359,13 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
 available_cash 是整个账户共享的可用现金，不得对每只股票重复分配；资金不足一手时只允许观察，
 message 中不得建议实际买入。涉及买入或补仓时，应结合候选价格说明最多可买手数（1手=100股），并保留手续费余量。
 """
+        timing_note = (
+            "这是当日补录计划，请基于当前已计算的数据制定从现在起执行的规则，不要假装计划生成于开盘前。"
+            if target == "today"
+            else "这是下一交易日计划。"
+        )
         user_prompt = (
-            f"为交易日 {trade_date} 生成盯盘计划。以下是已由本系统批量计算的数据：\n" +
+            f"为交易日 {trade_date} 生成盯盘计划。{timing_note}以下是已由本系统批量计算的数据：\n" +
             json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
         )
         try:
@@ -367,7 +388,8 @@ message 中不得建议实际买入。涉及买入或补仓时，应结合候选
                 raise ValueError("AI 返回内容中没有可用规则")
             missing = len(selected) - saved
             suffix = f"；另有 {missing} 只未通过规则校验" if missing else ""
-            data.update({"plan_message": f"已生成 {saved} 只股票的 {trade_date} 盯盘草稿{suffix}，请检查后启用。", "plan_error": ""})
+            label = "今日补录" if target == "today" else "次日"
+            data.update({"plan_message": f"已生成 {saved} 只股票的 {trade_date} {label}盯盘草稿{suffix}，请检查后启用。", "plan_error": ""})
         except Exception as exc:
             logger.exception("generate_watch_plans failed")
             data.update({"plan_error": f"生成计划失败：{exc}", "plan_message": ""})
@@ -375,8 +397,14 @@ message 中不得建议实际买入。涉及买入或补仓时，应结合候选
         return RedirectResponse(url="/batch", status_code=303)
 
     @app.post("/watch_plans/activate", response_class=HTMLResponse)
-    async def activate_plans():
-        trade_date = _next_trade_date().isoformat()
+    async def activate_plans(trade_date: str = Form("")):
+        today = _dt.date.today()
+        allowed_dates = {today.isoformat(), _next_trade_date(today).isoformat()}
+        if trade_date not in allowed_dates:
+            data = load_temp_result("batch_latest", keep=True)
+            data.update({"plan_error": "只能启用今日或下一交易日的计划。", "plan_message": ""})
+            save_temp_result("batch_latest", data)
+            return RedirectResponse(url="/batch", status_code=303)
         count = activate_watch_plans(trade_date)
         data = load_temp_result("batch_latest", keep=True)
         data.update({"plan_message": f"已启用 {count} 份 {trade_date} 盯盘计划。", "plan_error": ""})

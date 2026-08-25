@@ -26,6 +26,14 @@ class _Pro:
 
 
 class TradeCalendarTest(unittest.TestCase):
+    def test_watch_plan_trade_date_supports_today_and_next(self):
+        today = dt.date(2026, 8, 21)
+        with patch.object(main, "_next_trade_date", return_value=dt.date(2026, 8, 24)):
+            self.assertEqual(main._watch_plan_trade_date("today", today), today)
+            self.assertEqual(main._watch_plan_trade_date("next", today), dt.date(2026, 8, 24))
+        with self.assertRaisesRegex(ValueError, "计划日期参数无效"):
+            main._watch_plan_trade_date("2026-08-22", today)
+
     def setUp(self):
         main._TRADE_DATE_CACHE.clear()
 
