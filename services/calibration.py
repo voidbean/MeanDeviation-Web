@@ -74,10 +74,10 @@ def _active_plans(conn: sqlite3.Connection, trade_date: str) -> list[sqlite3.Row
 def _rules(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
     rows = conn.execute(
         """SELECT id,rule_type,threshold,COALESCE(original_threshold,threshold),priority,state,
-                  COALESCE(paused,0),message FROM watch_rules WHERE plan_id=? ORDER BY id""",
+                  COALESCE(paused,0),message,COALESCE(pause_source,'') FROM watch_rules WHERE plan_id=? ORDER BY id""",
         (plan_id,),
     ).fetchall()
-    keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message")
+    keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message", "pause_source")
     return [dict(zip(keys, row)) for row in rows]
 
 
@@ -132,7 +132,8 @@ def run_open_calibration(trade_date: str) -> int:
             if decision == "pause_opportunity":
                 for rule in original:
                     if rule["priority"] == "opportunity" and rule["state"] != "triggered":
-                        conn.execute("UPDATE watch_rules SET paused=1,revision_reason=? WHERE id=?", (reason, rule["id"]))
+                        conn.execute("""UPDATE watch_rules SET paused=1,state='suspended',pause_source='open_gap',
+                                     state_changed_at=?,revision_reason=? WHERE id=?""", (_now_text(), reason, rule["id"]))
                         applied.append({"rule_id": rule["id"], "action": "pause"})
             _save_revision(conn, plan, "09:35", "system", decision, reason, original, applied)
             count += 1
@@ -163,14 +164,28 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: floa
         decision = "continue"
     reason = str(proposal.get("reason", ""))[:500]
     applied = []
+    if decision == "continue":
+        # 每个校准时点都带着最新价格、量能、持仓和市场上下文重新评估。
+        # 因市场状态而暂停的机会可恢复；用户手动暂停和 INVALID 不在此处回滚。
+        for rule in original:
+            if rule["paused"] and rule["state"] != "invalid" and rule["pause_source"] in {"open_gap", "calibration"}:
+                conn.execute("""UPDATE watch_rules SET paused=0,state='waiting',pause_source='',
+                             consecutive_hits=0,recovery_hits=0,state_changed_at=?,revision_reason=? WHERE id=?""",
+                             (_now_text(), f"{slot} 重新评估后恢复：{reason or '条件重新成立'}", rule["id"]))
+                applied.append({"rule_id": rule["id"], "action": "resume"})
     if decision in {"pause_opportunity", "invalidate"}:
         for rule in original:
             should_pause = decision == "invalidate" and rule["priority"] != "risk"
             should_pause = should_pause or (decision == "pause_opportunity" and rule["priority"] == "opportunity")
             if should_pause and rule["state"] != "triggered":
-                conn.execute("UPDATE watch_rules SET paused=1,revision_reason=? WHERE id=?", (reason, rule["id"]))
-                applied.append({"rule_id": rule["id"], "action": "pause"})
+                new_state = "invalid" if decision == "invalidate" else "suspended"
+                source = "permanent" if decision == "invalidate" else "calibration"
+                conn.execute("""UPDATE watch_rules SET paused=1,state=?,pause_source=?,state_changed_at=?,
+                             revision_reason=? WHERE id=?""", (new_state, source, _now_text(), reason, rule["id"]))
+                applied.append({"rule_id": rule["id"], "action": "invalidate" if decision == "invalidate" else "pause"})
     for change in (proposal.get("adjustments") or [])[:4]:
+        if decision == "invalidate":
+            break  # 永久失效优先级最高，单条调整不得把 INVALID 降回可恢复暂停。
         try:
             rule_id = int(change.get("rule_id")); rule = by_id[rule_id]
         except (TypeError, ValueError, KeyError):
@@ -179,7 +194,8 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: floa
             continue
         action = change.get("action")
         if action == "pause":
-            conn.execute("UPDATE watch_rules SET paused=1,revision_reason=? WHERE id=?", (reason, rule_id))
+            conn.execute("""UPDATE watch_rules SET paused=1,state='suspended',pause_source='calibration',
+                         state_changed_at=?,revision_reason=? WHERE id=?""", (_now_text(), reason, rule_id))
             applied.append({"rule_id": rule_id, "action": "pause"})
         elif action == "update" and rule["type"] in {"breakout", "breakdown", "near"}:
             try:
@@ -197,7 +213,8 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: floa
             )
             applied.append({"rule_id": rule_id, "action": "update", "from": old, "to": new_value})
     _save_revision(conn, plan, slot, "ai", decision, reason, original, applied)
-    if decision == "continue" or market_price is None:
+    state_changed = bool(applied)
+    if (decision == "continue" and not state_changed) or market_price is None:
         return None
     # 校准决策和价格规则触发是两类事件。非 continue 决策也必须进入通知中心，
     # 否则页面关闭期间发生的清仓/减仓判断只能埋在审计时间线里。
@@ -206,7 +223,10 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: floa
         return None
     priority = "risk" if decision in {"tighten_risk", "invalidate"} else "observe"
     now = _now_text()
-    message = f"{slot} 校准：{reason or decision}"
+    if decision == "continue":
+        message = f"🔄 {slot} 校准恢复：{reason or '此前暂停条件已解除，计划重新进入观察'}"
+    else:
+        message = f"{slot} 校准：{reason or decision}"
     cur = conn.execute(
         """INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at)
            VALUES(?,?,?,?,?,?,?,?)""",
@@ -255,7 +275,8 @@ def run_ai_calibration(trade_date: str, slot: str) -> int:
     }.get(slot, "根据当前走势决定继续、降级或失效")
     system_prompt = f"""你是A股盘中计划校准器。以下仅注入量价、分时和风控方法论：\n{skills}\n
 只输出JSON数组，不要Markdown。每只股票输出code、decision、reason、adjustments。
-decision仅允许continue/pause_opportunity/invalidate/tighten_risk。
+decision仅允许continue/pause_opportunity/invalidate/tighten_risk。市场状态短暂破坏应使用pause_opportunity；
+后续条件恢复应返回continue并说明恢复依据；只有时间窗口结束、结构根本破坏、明确止损/成交等不可逆情况才允许invalidate。
 adjustments每项仅允许rule_id、action(pause/update)、threshold。不得修改已触发规则；
 止损/跌破风险线只能上移，不能下调；关键价最多小幅修正1%；不要追着价格重写计划。
 {slot}校准重点：{focus}。

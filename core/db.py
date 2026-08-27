@@ -219,6 +219,9 @@ def init_db():
                 ("ALTER TABLE watch_rules ADD COLUMN paused INTEGER NOT NULL DEFAULT 0", "watch_rules.paused"),
                 ("ALTER TABLE watch_rules ADD COLUMN original_threshold REAL", "watch_rules.original_threshold"),
                 ("ALTER TABLE watch_rules ADD COLUMN revision_reason TEXT NOT NULL DEFAULT ''", "watch_rules.revision_reason"),
+                ("ALTER TABLE watch_rules ADD COLUMN recovery_hits INTEGER NOT NULL DEFAULT 0", "watch_rules.recovery_hits"),
+                ("ALTER TABLE watch_rules ADD COLUMN pause_source TEXT NOT NULL DEFAULT ''", "watch_rules.pause_source"),
+                ("ALTER TABLE watch_rules ADD COLUMN state_changed_at TEXT", "watch_rules.state_changed_at"),
             ]:
                 try:
                     conn.execute(stmt)
@@ -1070,7 +1073,7 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
     for row in rows:
         rules = conn.execute(
             """SELECT id,rule_type,threshold,confirmation_minutes,priority,message,state,triggered_at,
-                      paused,original_threshold,revision_reason
+                      paused,original_threshold,revision_reason,pause_source,state_changed_at
                FROM watch_rules WHERE plan_id=? ORDER BY id""",
             (row[0],),
         ).fetchall()
@@ -1078,7 +1081,8 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
                       "bias": row[4], "summary": row[5], "status": row[6],
                       "rules": [{"id": r[0], "type": r[1], "price": r[2], "confirmation_minutes": r[3],
                                  "priority": r[4], "message": r[5], "state": r[6], "triggered_at": r[7],
-                                 "paused": bool(r[8]), "original_threshold": r[9], "revision_reason": r[10]} for r in rules]})
+                                 "paused": bool(r[8]), "original_threshold": r[9], "revision_reason": r[10],
+                                 "pause_source": r[11], "state_changed_at": r[12]} for r in rules]})
     conn.close()
     return plans
 
@@ -1124,7 +1128,8 @@ def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
         """UPDATE watch_rules SET threshold=?, confirmation_minutes=?, state='waiting',
-           consecutive_hits=0, triggered_at=NULL,paused=0,revision_reason='用户手动修改' WHERE id=?""",
+           consecutive_hits=0,recovery_hits=0,triggered_at=NULL,paused=0,pause_source='',
+           state_changed_at=NULL,revision_reason='用户手动修改' WHERE id=?""",
         (threshold, confirmation_minutes, rule_id),
     )
     conn.commit()

@@ -64,6 +64,44 @@ class CalibrationTest(unittest.TestCase):
         conn.close()
         self.assertEqual(value, 9.5)
 
+    def test_recoverable_pause_resumes_but_invalid_is_terminal(self):
+        conn = sqlite3.connect(self.path); conn.row_factory = sqlite3.Row
+        plan = conn.execute("SELECT * FROM watch_plans").fetchone()
+        opportunity_id = conn.execute("SELECT id FROM watch_rules WHERE priority='opportunity'").fetchone()[0]
+        calibration._apply_ai_decision(conn, plan, {
+            "decision": "pause_opportunity", "reason": "板块短暂转弱", "adjustments": [],
+        }, "10:00", market_price=10)
+        conn.commit()
+        paused = conn.execute("SELECT state,paused FROM watch_rules WHERE id=?", (opportunity_id,)).fetchone()
+        self.assertEqual(tuple(paused), ("suspended", 1))
+
+        plan = conn.execute("SELECT * FROM watch_plans").fetchone()
+        event = calibration._apply_ai_decision(conn, plan, {
+            "decision": "continue", "reason": "板块重新走强", "adjustments": [],
+        }, "13:05", market_price=10.1)
+        conn.commit()
+        resumed = conn.execute("SELECT state,paused FROM watch_rules WHERE id=?", (opportunity_id,)).fetchone()
+        self.assertEqual(tuple(resumed), ("waiting", 0))
+        self.assertIn("校准恢复", event["message"])
+
+        plan = conn.execute("SELECT * FROM watch_plans").fetchone()
+        calibration._apply_ai_decision(conn, plan, {
+            "decision": "invalidate", "reason": "有效时间窗口结束",
+            "adjustments": [{"rule_id": opportunity_id, "action": "pause"}],
+        }, "14:35", market_price=10.2)
+        conn.commit()
+        invalid = conn.execute("SELECT state,paused,pause_source FROM watch_rules WHERE id=?", (opportunity_id,)).fetchone()
+        self.assertEqual(tuple(invalid), ("invalid", 1, "permanent"))
+
+        plan = conn.execute("SELECT * FROM watch_plans").fetchone()
+        calibration._apply_ai_decision(conn, plan, {
+            "decision": "continue", "reason": "价格反弹", "adjustments": [],
+        }, "14:36", market_price=10.3)
+        conn.commit()
+        still_invalid = conn.execute("SELECT state,paused FROM watch_rules WHERE id=?", (opportunity_id,)).fetchone()
+        conn.close()
+        self.assertEqual(tuple(still_invalid), ("invalid", 1))
+
     def test_calibration_slot_claim_is_idempotent(self):
         self.assertTrue(calibration._claim_run("2026-08-19", "10:00"))
         self.assertFalse(calibration._claim_run("2026-08-19", "10:00"))

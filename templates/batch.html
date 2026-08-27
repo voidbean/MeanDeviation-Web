@@ -266,10 +266,12 @@
                         {{ {'breakout':'突破','breakdown':'跌破','near':'接近','rapid_move_5m':'5分钟异动','volume_spike':'分钟放量'}.get(rule.type, rule.type) }} {{ rule.price }}
                     </span>
                     <span>{{ rule.message }}</span>
-                    {% if rule.triggered_at %}
+                    {% if rule.state == 'invalid' %}
+                    <span class="badge bg-danger">永久失效</span>
+                    {% elif rule.triggered_at %}
                     <span class="badge bg-warning text-dark">已触发 {{ rule.triggered_at }}</span>
                     {% elif rule.paused %}
-                    <span class="badge bg-secondary">已暂停</span>
+                    <span class="badge bg-secondary">暂停观察</span>
                     {% else %}
                     <span class="badge bg-light text-dark border">等待中</span>
                     {% endif %}

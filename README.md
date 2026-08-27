@@ -78,12 +78,39 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8848
 
 > 建议在收盘后生成并确认下一交易日计划。如果只勾选开关而没有生成、确认计划，次日不会执行任何规则。
 
+### 本地系统通知监听器
+
+浏览器页面关闭后仍需接收通知时，可在本地电脑的根目录 `.env` 中设置：
+
+```env
+WATCH_SERVER_URL=http://服务器IP:8848
+WATCH_NOTIFY_POLL_SECONDS=15
+```
+
+启动监听：
+
+```bash
+uv run python scripts/watch_notify.py
+```
+
+脚本通过 SSE 实时接收事件，并定时调用通知 API 补漏；游标独立保存在
+`~/.local/state/8848-watch/last_event_id`，不会替网页通知中心标记已读。首次运行默认忽略既有事件，
+需要回放时使用 `--replay`。macOS 可先运行：
+
+```bash
+uv run python scripts/watch_notify.py --test-notification
+```
+
+公网 `HTTP + IP` 会明文传输提醒内容，且当前 Web 应用本身没有访问鉴权。短期使用至少应通过防火墙限制来源 IP；长期建议改为 HTTPS、SSH 隧道或 VPN。
+
 ## 环境变量（`.env`）
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TUSHARE_TOKEN` | — | Tushare Pro token，历史数据必填 |
 | `COMMON_STOCK_CODES` | — | 自选股代码，逗号分隔，如 `600519,000001` |
+| `WATCH_SERVER_URL` | — | 本地通知监听器访问的线上服务地址 |
+| `WATCH_NOTIFY_POLL_SECONDS` | `15` | 本地监听器补漏轮询间隔（秒，最小 5） |
 | `AI_PROVIDER` | `claude` | `claude` / `openai` / `gemini` |
 | `CLAUDE_API_KEY` / `CLAUDE_MODEL` / `CLAUDE_BASE_URL` | — | Claude 配置 |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | — | OpenAI / DeepSeek / Ollama 配置 |

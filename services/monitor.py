@@ -10,6 +10,10 @@ from core.config import DB_PATH, logger
 _subscribers: set[queue.Queue] = set()
 _subscribers_lock = threading.Lock()
 
+# 价格必须离开关键位一小段距离才算真正收复/重新跌回。确认分钟负责过滤
+# 短促刺穿，滞回区间负责过滤 0.999/1.001 一类贴线抖动。
+PRICE_RECOVERY_HYSTERESIS = 0.002
+
 
 def subscribe() -> queue.Queue:
     q = queue.Queue(maxsize=100)
@@ -39,8 +43,43 @@ def publish_events(events: list[dict]) -> None:
         _publish(event)
 
 
+def _condition(kind: str, price: float, threshold: float, latest_vol: float,
+               conn: sqlite3.Connection, code: str, trade_date: str) -> bool:
+    if kind == "breakout":
+        return price >= threshold
+    if kind == "breakdown":
+        return price <= threshold
+    if kind == "near":
+        return abs(price - threshold) / threshold <= 0.005
+    if kind == "rapid_move_5m":
+        old = conn.execute(
+            "SELECT price FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 1 OFFSET 5",
+            (code, trade_date),
+        ).fetchone()
+        return bool(old and old[0] and abs((price - float(old[0])) / float(old[0]) * 100) >= threshold)
+    if kind == "volume_spike":
+        vols = conn.execute(
+            "SELECT vol FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 20 OFFSET 1",
+            (code, trade_date),
+        ).fetchall()
+        baseline = sum(float(v[0] or 0) for v in vols) / len(vols) if vols else 0
+        return baseline > 0 and latest_vol / baseline >= threshold
+    return False
+
+
+def _recovered(kind: str, price: float, threshold: float, hit: bool) -> bool:
+    if kind == "breakout":
+        return price <= threshold * (1 - PRICE_RECOVERY_HYSTERESIS)
+    if kind == "breakdown":
+        return price >= threshold * (1 + PRICE_RECOVERY_HYSTERESIS)
+    # 接近、异动和放量都是瞬态条件；明确离开触发区后即可重新布防。
+    if kind == "near":
+        return abs(price - threshold) / threshold >= 0.007
+    return not hit
+
+
 def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
-    """使用当分钟已保存的快照执行规则；相同规则每天最多触发一次。"""
+    """执行规则并持续维护触发/恢复状态；INVALID 才停止跟踪。"""
     trade_date = trade_date or dt.date.today().isoformat()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -50,7 +89,7 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             """SELECT r.*,p.code,p.name FROM watch_rules r
                JOIN watch_plans p ON p.id=r.plan_id
                JOIN stock_watchlist w ON w.code=p.code AND w.enabled=1
-               WHERE p.trade_date=? AND p.status='active' AND r.state!='triggered' AND COALESCE(r.paused,0)=0""",
+               WHERE p.trade_date=? AND p.status='active' AND r.state!='invalid' AND COALESCE(r.paused,0)=0""",
             (trade_date,),
         ).fetchall()
         for rule in rows:
@@ -67,32 +106,36 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                     continue
             threshold = float(rule["threshold"])
             kind = rule["rule_type"]
-            hit = False
-            if kind == "breakout":
-                hit = price >= threshold
-            elif kind == "breakdown":
-                hit = price <= threshold
-            elif kind == "near":
-                hit = abs(price - threshold) / threshold <= 0.005
-            elif kind == "rapid_move_5m":
-                old = conn.execute(
-                    "SELECT price FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 1 OFFSET 5",
-                    (rule["code"], trade_date),
-                ).fetchone()
-                hit = bool(old and old[0] and abs((price - float(old[0])) / float(old[0]) * 100) >= threshold)
-            elif kind == "volume_spike":
-                vols = conn.execute(
-                    "SELECT vol FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 20 OFFSET 1",
-                    (rule["code"], trade_date),
-                ).fetchall()
-                baseline = sum(float(v[0] or 0) for v in vols) / len(vols) if vols else 0
-                hit = baseline > 0 and latest_vol / baseline >= threshold
+            hit = _condition(kind, price, threshold, latest_vol, conn, rule["code"], trade_date)
+            required_hits = int(rule["confirmation_minutes"])
+            if rule["state"] == "triggered":
+                recovery_hits = int(rule["recovery_hits"] or 0) + 1 if _recovered(kind, price, threshold, hit) else 0
+                if recovery_hits < required_hits:
+                    conn.execute("UPDATE watch_rules SET recovery_hits=? WHERE id=?", (recovery_hits, rule["id"]))
+                    continue
+                now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                labels = {"breakout": "突破", "breakdown": "跌破", "near": "接近",
+                          "rapid_move_5m": "5分钟异动", "volume_spike": "分钟放量"}
+                message = (f"🔄 {rule['name'] or rule['code']} 状态恢复：此前{labels[kind]}条件已解除，"
+                           f"经 {required_hits} 分钟确认后重新进入观察；当前价 {price:g}。")
+                cur = conn.execute(
+                    "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (rule["id"], rule["code"], rule["name"], "recovered", "observe", price, message, now),
+                )
+                conn.execute(
+                    """UPDATE watch_rules SET state='waiting',consecutive_hits=0,recovery_hits=0,
+                       triggered_at=NULL,state_changed_at=? WHERE id=?""", (now, rule["id"]),
+                )
+                events.append({"id": cur.lastrowid, "code": rule["code"], "name": rule["name"],
+                               "event_type": "recovered", "priority": "observe", "price": price,
+                               "message": message, "triggered_at": now})
+                continue
             hits = int(rule["consecutive_hits"] or 0) + 1 if hit else 0
             opening_cross = snap_time <= "09:35" and open_price > 0 and (
                 (kind == "breakout" and open_price >= threshold) or
                 (kind == "breakdown" and open_price <= threshold)
             )
-            required_hits = 1 if opening_cross else int(rule["confirmation_minutes"])
+            required_hits = 1 if opening_cross else required_hits
             if hits < required_hits:
                 conn.execute("UPDATE watch_rules SET consecutive_hits=? WHERE id=?", (hits, rule["id"]))
                 continue
@@ -106,8 +149,8 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
                 (rule["id"], rule["code"], rule["name"], kind, rule["priority"], price, message, now),
             )
-            conn.execute("UPDATE watch_rules SET state='triggered',consecutive_hits=?,triggered_at=? WHERE id=?",
-                         (hits, now, rule["id"]))
+            conn.execute("""UPDATE watch_rules SET state='triggered',consecutive_hits=?,recovery_hits=0,
+                         triggered_at=?,state_changed_at=? WHERE id=?""", (hits, now, now, rule["id"]))
             event = {"id": cur.lastrowid, "code": rule["code"], "name": rule["name"], "event_type": kind,
                      "priority": rule["priority"], "price": price, "message": message, "triggered_at": now}
             events.append(event)
