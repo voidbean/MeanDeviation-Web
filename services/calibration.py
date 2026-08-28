@@ -74,10 +74,11 @@ def _active_plans(conn: sqlite3.Connection, trade_date: str) -> list[sqlite3.Row
 def _rules(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
     rows = conn.execute(
         """SELECT id,rule_type,threshold,COALESCE(original_threshold,threshold),priority,state,
-                  COALESCE(paused,0),message,COALESCE(pause_source,'') FROM watch_rules WHERE plan_id=? ORDER BY id""",
+                  COALESCE(paused,0),message,COALESCE(pause_source,''),COALESCE(indicator_label,'')
+           FROM watch_rules WHERE plan_id=? ORDER BY id""",
         (plan_id,),
     ).fetchall()
-    keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message", "pause_source")
+    keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message", "pause_source", "indicator")
     return [dict(zip(keys, row)) for row in rows]
 
 

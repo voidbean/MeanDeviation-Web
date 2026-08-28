@@ -15,6 +15,61 @@ _subscribers_lock = threading.Lock()
 PRICE_RECOVERY_HYSTERESIS = 0.002
 
 
+def _action_direction(message: str) -> str:
+    text = message or ""
+    if any(word in text for word in ("放弃买入", "暂停买入", "停止买入", "停止补仓", "不再买入")):
+        return "cancel"
+    if any(word in text for word in ("买入", "建仓", "补仓", "加仓")):
+        return "buy"
+    if any(word in text for word in ("卖出", "减仓", "止盈", "止损", "离场")):
+        return "sell"
+    return ""
+
+
+def _indicator_label(rule: sqlite3.Row) -> str:
+    explicit = str(rule["indicator_label"] or "").strip()
+    if explicit:
+        return explicit
+    message = str(rule["message"] or "")
+    known = ("分时均价", "均价", "8848上轨", "8848下轨", "MA5", "MA10", "MA20",
+             "Fibonacci 0.382", "Fibonacci 0.618", "Fibonacci 0.786", "前高", "前低")
+    return next((name for name in known if name in message), "计划关键线")
+
+
+def _intraday_avg(conn: sqlite3.Connection, code: str, trade_date: str) -> float | None:
+    row = conn.execute(
+        "SELECT vol,amount FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 1",
+        (code, trade_date),
+    ).fetchone()
+    if not row or not row[0] or not row[1]:
+        return None
+    # 快照 amount 按千元保存，vol 为股数。
+    return float(row[1]) * 1000 / float(row[0])
+
+
+def _evidence(rule: sqlite3.Row, price: float, avg: float | None) -> str:
+    label = _indicator_label(rule)
+    line_value = avg if avg and any(x in label for x in ("分时均价", "黄线")) else float(rule["threshold"])
+    parts = [f"{label} {line_value:g}", f"当前价 {price:g}"]
+    if avg and avg > 0:
+        parts.append(f"当前分时均价 {avg:.3f}")
+    return "｜".join(parts)
+
+
+def _confirmed_message(rule: sqlite3.Row, price: float, avg: float | None, minutes: int) -> str:
+    original = str(rule["message"] or "").strip()
+    direction = _action_direction(original)
+    if direction == "buy":
+        action = "建议买入/补仓" if any(x in original for x in ("补仓", "加仓")) else "建议买入"
+    elif direction == "sell":
+        action = "建议卖出/减仓" if any(x in original for x in ("减仓", "止盈")) else "建议卖出/止损"
+    elif direction == "cancel":
+        action = "建议放弃买入/停止补仓"
+    else:
+        action = "条件已确认"
+    return f"✅ 已连续 {minutes} 分钟确认，{action}。{_evidence(rule, price, avg)}。原计划：{original or '—'}"
+
+
 def subscribe() -> queue.Queue:
     q = queue.Queue(maxsize=100)
     with _subscribers_lock:
@@ -104,10 +159,42 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 captured_at = dt.datetime.strptime(f"{trade_date} {snap_time}", "%Y-%m-%d %H:%M")
                 if (dt.datetime.now() - captured_at).total_seconds() > 150:
                     continue
+            current_avg = _intraday_avg(conn, rule["code"], trade_date)
             threshold = float(rule["threshold"])
+            # “分时均价/黄线”会随成交持续变化，不能拿生成计划时的旧均价盯一整天。
+            if current_avg and any(x in _indicator_label(rule) for x in ("分时均价", "黄线")):
+                threshold = current_avg
             kind = rule["rule_type"]
             hit = _condition(kind, price, threshold, latest_vol, conn, rule["code"], trade_date)
             required_hits = int(rule["confirmation_minutes"])
+            if rule["state"] == "observing":
+                direction = _action_direction(str(rule["message"] or ""))
+                confirmed = ((direction == "buy" and price >= threshold * (1 + PRICE_RECOVERY_HYSTERESIS)) or
+                             (direction in {"sell", "cancel"} and price <= threshold * (1 - PRICE_RECOVERY_HYSTERESIS)))
+                cancelled = ((direction == "buy" and price <= threshold * (1 - PRICE_RECOVERY_HYSTERESIS)) or
+                             (direction in {"sell", "cancel"} and price >= threshold * (1 + PRICE_RECOVERY_HYSTERESIS)))
+                hits = int(rule["consecutive_hits"] or 0) + 1 if confirmed else 0
+                recovery_hits = int(rule["recovery_hits"] or 0) + 1 if cancelled else 0
+                if hits >= required_hits:
+                    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    message = _confirmed_message(rule, price, current_avg, required_hits)
+                    cur = conn.execute(
+                        "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (rule["id"], rule["code"], rule["name"], "action_confirmed", rule["priority"], price, message, now),
+                    )
+                    conn.execute("""UPDATE watch_rules SET state='triggered',consecutive_hits=?,recovery_hits=0,
+                                 triggered_at=?,state_changed_at=? WHERE id=?""", (hits, now, now, rule["id"]))
+                    events.append({"id": cur.lastrowid, "code": rule["code"], "name": rule["name"],
+                                   "event_type": "action_confirmed", "priority": rule["priority"], "price": price,
+                                   "message": message, "triggered_at": now})
+                elif recovery_hits >= required_hits:
+                    conn.execute("""UPDATE watch_rules SET state='waiting',consecutive_hits=0,recovery_hits=0,
+                                 state_changed_at=? WHERE id=?""",
+                                 (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rule["id"]))
+                else:
+                    conn.execute("UPDATE watch_rules SET consecutive_hits=?,recovery_hits=? WHERE id=?",
+                                 (hits, recovery_hits, rule["id"]))
+                continue
             if rule["state"] == "triggered":
                 recovery_hits = int(rule["recovery_hits"] or 0) + 1 if _recovered(kind, price, threshold, hit) else 0
                 if recovery_hits < required_hits:
@@ -142,15 +229,20 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             labels = {"breakout": "突破", "breakdown": "跌破", "near": "接近",
                       "rapid_move_5m": "5分钟异动", "volume_spike": "分钟放量"}
-            message = rule["message"] or f"{rule['name'] or rule['code']} {labels[kind]}关键价 {threshold:g}"
+            if kind == "near" and _action_direction(str(rule["message"] or "")):
+                message = (f"👀 已到达观察区，尚未形成操作确认；将继续检查站稳方向。"
+                           f"{_evidence(rule, price, current_avg)}。计划：{rule['message']}")
+            else:
+                message = _confirmed_message(rule, price, current_avg, required_hits)
             if opening_cross:
-                message = f"开盘直接{labels[kind]}关键价 {threshold:g}；原普通确认规则已越级触发。"
+                message = f"开盘直接{labels[kind]}，已越级确认。{_evidence(rule, price, current_avg)}。计划：{rule['message']}"
             cur = conn.execute(
                 "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
                 (rule["id"], rule["code"], rule["name"], kind, rule["priority"], price, message, now),
             )
-            conn.execute("""UPDATE watch_rules SET state='triggered',consecutive_hits=?,recovery_hits=0,
-                         triggered_at=?,state_changed_at=? WHERE id=?""", (hits, now, now, rule["id"]))
+            next_state = "observing" if kind == "near" and _action_direction(str(rule["message"] or "")) else "triggered"
+            conn.execute("""UPDATE watch_rules SET state=?,consecutive_hits=0,recovery_hits=0,
+                         triggered_at=?,state_changed_at=? WHERE id=?""", (next_state, now, now, rule["id"]))
             event = {"id": cur.lastrowid, "code": rule["code"], "name": rule["name"], "event_type": kind,
                      "priority": rule["priority"], "price": price, "message": message, "triggered_at": now}
             events.append(event)

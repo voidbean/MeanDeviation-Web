@@ -349,12 +349,14 @@ def _register_routes(app, templates):
 一次处理所有股票，不调用工具，不展示推理过程，不写长篇分析。
 只输出一个 JSON 数组，禁止 Markdown 代码块。每项必须包含 code、name、bias、summary、rules。
 rules 仅允许 type=breakout/breakdown/near/rapid_move_5m/volume_spike；每条包含 price、confirmation_minutes(1-5)、
-priority(risk/opportunity/observe)、message。每只股票最多4条，价格必须来自输入关键位或有清晰依据。
+priority(risk/opportunity/observe)、indicator、message。indicator 必须写明阈值来源，例如“分时均价”“8848下轨”
+“MA20”“Fibonacci 0.618”“前高”；禁止只写“关键位”。每只股票最多4条，价格必须来自输入关键位或有清晰依据。
 breakout默认确认3分钟，breakdown默认确认2分钟，near默认1分钟。避免相互矛盾或过密价位。
 可额外使用 rapid_move_5m（price字段表示5分钟涨跌幅绝对值阈值，建议1.5）或
 volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建议3.0），每只股票最多选一种异动规则。
 必须按 holding 区分计划：未持仓只寻找入场机会与放弃买入/风险条件；已持仓同时考虑回落补仓机会、
-冲高减仓/止盈点和跌破风控点。message 必须写清动作（观察买入、补仓、减仓、止盈或止损），
+冲高减仓/止盈点和跌破风控点。near 只代表进入观察区，不代表已经站稳；系统会在到达后继续确认方向。
+message 必须写清动作（观察买入、补仓、减仓、止盈或止损），
 不能把未持仓股票写成卖出，也不能在没有风险退出规则时只给已持仓股票补仓规则。
 available_cash 是整个账户共享的可用现金，不得对每只股票重复分配；资金不足一手时只允许观察，
 message 中不得建议实际买入。涉及买入或补仓时，应结合候选价格说明最多可买手数（1手=100股），并保留手续费余量。

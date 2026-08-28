@@ -222,6 +222,7 @@ def init_db():
                 ("ALTER TABLE watch_rules ADD COLUMN recovery_hits INTEGER NOT NULL DEFAULT 0", "watch_rules.recovery_hits"),
                 ("ALTER TABLE watch_rules ADD COLUMN pause_source TEXT NOT NULL DEFAULT ''", "watch_rules.pause_source"),
                 ("ALTER TABLE watch_rules ADD COLUMN state_changed_at TEXT", "watch_rules.state_changed_at"),
+                ("ALTER TABLE watch_rules ADD COLUMN indicator_label TEXT NOT NULL DEFAULT ''", "watch_rules.indicator_label"),
             ]:
                 try:
                     conn.execute(stmt)
@@ -1046,8 +1047,9 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
                     priority = "observe"
                 conn.execute(
                     """INSERT INTO watch_rules(plan_id,rule_type,threshold,original_threshold,
-                       confirmation_minutes,priority,message) VALUES(?,?,?,?,?,?,?)""",
-                    (plan_id, kind, threshold, threshold, confirmation, priority, str(rule.get("message", ""))),
+                       confirmation_minutes,priority,message,indicator_label) VALUES(?,?,?,?,?,?,?,?)""",
+                    (plan_id, kind, threshold, threshold, confirmation, priority, str(rule.get("message", "")),
+                     str(rule.get("indicator") or rule.get("line_name") or "")[:80]),
                 )
                 inserted_rules += 1
             if inserted_rules:
@@ -1073,7 +1075,7 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
     for row in rows:
         rules = conn.execute(
             """SELECT id,rule_type,threshold,confirmation_minutes,priority,message,state,triggered_at,
-                      paused,original_threshold,revision_reason,pause_source,state_changed_at
+                      paused,original_threshold,revision_reason,pause_source,state_changed_at,indicator_label
                FROM watch_rules WHERE plan_id=? ORDER BY id""",
             (row[0],),
         ).fetchall()
@@ -1082,7 +1084,8 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
                       "rules": [{"id": r[0], "type": r[1], "price": r[2], "confirmation_minutes": r[3],
                                  "priority": r[4], "message": r[5], "state": r[6], "triggered_at": r[7],
                                  "paused": bool(r[8]), "original_threshold": r[9], "revision_reason": r[10],
-                                 "pause_source": r[11], "state_changed_at": r[12]} for r in rules]})
+                                 "pause_source": r[11], "state_changed_at": r[12],
+                                 "indicator": r[13]} for r in rules]})
     conn.close()
     return plans
 

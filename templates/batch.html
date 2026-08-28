@@ -263,11 +263,13 @@
                 {% for rule in plan.rules %}
                 <div class="small mt-1 d-flex flex-wrap gap-1 align-items-center">
                     <span class="badge text-bg-light border">
-                        {{ {'breakout':'突破','breakdown':'跌破','near':'接近','rapid_move_5m':'5分钟异动','volume_spike':'分钟放量'}.get(rule.type, rule.type) }} {{ rule.price }}
+                        {{ rule.indicator or {'breakout':'突破线','breakdown':'跌破线','near':'观察线','rapid_move_5m':'5分钟异动','volume_spike':'分钟放量'}.get(rule.type, rule.type) }} {{ rule.price }}
                     </span>
                     <span>{{ rule.message }}</span>
                     {% if rule.state == 'invalid' %}
                     <span class="badge bg-danger">永久失效</span>
+                    {% elif rule.state == 'observing' %}
+                    <span class="badge bg-info text-dark">观察区内，等待方向确认</span>
                     {% elif rule.triggered_at %}
                     <span class="badge bg-warning text-dark">已触发 {{ rule.triggered_at }}</span>
                     {% elif rule.paused %}
