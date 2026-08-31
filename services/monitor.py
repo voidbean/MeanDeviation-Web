@@ -269,8 +269,11 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 labels = {"breakout": "突破", "breakdown": "跌破", "near": "接近",
                           "rapid_move_5m": "5分钟异动", "volume_spike": "分钟放量"}
-                message = (f"🔄 {rule['name'] or rule['code']} 状态恢复：此前{labels[kind]}条件已解除，"
-                           f"经 {required_hits} 分钟确认后重新进入观察；当前价 {price:g}。")
+                detail = (f"价格已离开目标价 {threshold:g} 元附近" if kind == "near"
+                          else f"此前的{labels[kind]}提醒条件已解除")
+                message = (f"🔄 {rule['name'] or rule['code']} 提醒解除：{detail}。"
+                           f"已按 {required_hits} 分钟行情确认，继续监测，条件再次满足时会重新提醒。"
+                           f"通知时价格 {price:g} 元。本条仅为状态通知，无需成交操作。")
                 cur = conn.execute(
                     "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
                     (rule["id"], rule["code"], rule["name"], "recovered", "observe", price, message, now),
@@ -319,7 +322,8 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             # the just-inserted persisted event rather than matching by stock code.
             rule_id = conn.execute("SELECT rule_id FROM watch_events WHERE id=?", (event["id"],)).fetchone()[0]
             evaluation, snap_time = shadow_results[rule_id]
-            event["message"] += "。" + evaluation["summary"]
+            if event["event_type"] != "recovered":
+                event["message"] = event["message"].rstrip("。") + "。" + evaluation["summary"]
             event["shadow_result"] = evaluation
             conn.execute("UPDATE watch_events SET message=? WHERE id=?", (event["message"], event["id"]))
             if event["event_type"] not in {"near", "recovered"}:

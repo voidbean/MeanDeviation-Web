@@ -11,7 +11,7 @@ import core.db as db
 import services.monitor as monitor
 import services.calibration as calibration
 from core.watch_conditions import validate_conditions
-from services.watch_features import build_watch_context, intraday_context, evaluate_conditions
+from services.watch_features import build_watch_context, intraday_context, evaluate_conditions, shadow_summary
 
 
 class WatchFeaturesTest(unittest.TestCase):
@@ -135,7 +135,7 @@ class WatchFeaturesTest(unittest.TestCase):
         row = self.conn.execute("SELECT COUNT(*),MAX(legacy_confirmed) FROM watch_shadow_checks").fetchone()
         self.assertEqual(row, (1, 1))
         self.assertEqual(db.get_watch_plans(self.day)[0]["rules"][0]["shadow_result"]["status"], "unmet")
-        self.assertIn("不拦截原规则", db.get_recent_watch_events()[0]["message"])
+        self.assertIn("不影响原提醒", db.get_recent_watch_events()[0]["message"])
 
     def test_technical_failure_does_not_block_risk_exit(self):
         self.plan(priority="risk", conditions=[], kind="breakdown")
@@ -191,6 +191,16 @@ class WatchFeaturesTest(unittest.TestCase):
         self.assertIsNotNone(payload["technical_context"]["daily"]["macd"])
         self.assertIn("conditions", ai.call_args.args[0])
 
+    def test_plain_language_extra_checks(self):
+        empty = shadow_summary({"checks": []})
+        self.assertIn("未设置额外检查", empty)
+        self.assertNotIn("原规则确认", empty)
+        for status, label in (("met", "满足"), ("unmet", "未满足"), ("unknown", "数据不足")):
+            summary = shadow_summary({"checks": [{"label": "量能", "status": status}]})
+            self.assertIn(f"量能：{label}", summary)
+            self.assertIn("不影响原提醒", summary)
+            self.assertIn("不代表买卖确认", summary)
+
     def test_migration_is_idempotent_and_template_parses(self):
         from jinja2 import Environment, FileSystemLoader
         db.init_db()
@@ -199,7 +209,8 @@ class WatchFeaturesTest(unittest.TestCase):
         template = env.get_template("batch.html")
         rendered = template.render(watch_plans=db.get_watch_plans(self.day), today_plans=db.get_watch_plans(self.day),
                                    available_cash=0, market_indices=[], monitor_health={})
-        self.assertIn("影子条件", rendered)
+        self.assertIn("额外检查", rendered)
+        self.assertNotIn("影子条件", rendered)
 
 
 if __name__ == "__main__":

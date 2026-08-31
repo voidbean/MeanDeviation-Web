@@ -102,5 +102,7 @@ def evaluate_conditions(conditions, context, price, trade_date):
 def shadow_summary(evaluation):
     labels = {"met": "满足", "unmet": "未满足", "unknown": "数据不足"}
     checks = evaluation["checks"]
-    detail = "；".join(f"{c['label']}：{labels[c['status']]}" for c in checks) if checks else "未配置附加条件，仅原规则确认"
-    return f"影子验证（不拦截原规则，不代表联合买入确认）：{detail}"
+    if not checks:
+        return "未设置额外检查，按原提醒条件监测；不代表买卖确认。"
+    detail = "；".join(f"{c['label']}：{labels[c['status']]}" for c in checks)
+    return f"额外检查：{detail}。结果仅供参考，不影响原提醒，也不代表买卖确认。"

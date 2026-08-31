@@ -63,8 +63,8 @@
         const meta = document.createElement('small'); meta.className = 'text-muted';
         meta.textContent = item.triggered_at + (item.max_gain_pct != null ? ` · 后续最高 ${item.max_gain_pct}% / 最大回撤 ${item.max_drawdown_pct}%` : '');
         const status = document.createElement('div'); status.className = 'small text-primary my-1';
-        const states = {pending:'待处理 · 执行情况未知', partial:'部分成交', completed:'动作已完成', disabled:'动作已停用'};
-        status.textContent = (states[item.execution_status] || '历史规则已不存在') +
+        const states = {pending:'尚未记录成交（不代表实际未交易）', partial:'部分成交', completed:'动作已完成', disabled:'动作已停用'};
+        status.textContent = (item.event_type === 'recovered' ? '提醒已解除 · 本条无需操作。关联计划：' : '关联计划：') + (states[item.execution_status] || '历史规则已不存在') +
             (item.target_quantity ? ` · 已成交 ${item.filled_quantity}/${item.target_quantity} 股` : '') +
             (item.snooze_until ? ` · 暂不执行至 ${item.snooze_until}` : '') +
             (item.ignore_until_recovery ? ' · 本轮已忽略，等待条件解除' : '') +
