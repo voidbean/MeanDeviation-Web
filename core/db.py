@@ -1,6 +1,8 @@
 import sqlite3
 import time
 import json
+from core.watch_conditions import validate_conditions, describe_conditions
+from core.watch_actions import ACTIONS, infer_action
 
 from core.config import DB_PATH, STOCK_NAME_CACHE, logger
 
@@ -85,6 +87,7 @@ def init_db():
                 ("ALTER TABLE portfolio ADD COLUMN quantity INTEGER DEFAULT 0",  "quantity"),
                 ("ALTER TABLE daily_records ADD COLUMN amount REAL DEFAULT 0",   "amount"),
                 ("ALTER TABLE daily_records ADD COLUMN open REAL DEFAULT 0",     "open"),
+                ("ALTER TABLE daily_records ADD COLUMN vol REAL", "daily_records.vol"),
             ]:
                 try:
                     conn.execute(stmt)
@@ -223,6 +226,17 @@ def init_db():
                 ("ALTER TABLE watch_rules ADD COLUMN pause_source TEXT NOT NULL DEFAULT ''", "watch_rules.pause_source"),
                 ("ALTER TABLE watch_rules ADD COLUMN state_changed_at TEXT", "watch_rules.state_changed_at"),
                 ("ALTER TABLE watch_rules ADD COLUMN indicator_label TEXT NOT NULL DEFAULT ''", "watch_rules.indicator_label"),
+                ("ALTER TABLE watch_rules ADD COLUMN conditions_json TEXT NOT NULL DEFAULT '[]'", "watch_rules.conditions_json"),
+                ("ALTER TABLE watch_rules ADD COLUMN shadow_result_json TEXT NOT NULL DEFAULT '{}'", "watch_rules.shadow_result_json"),
+                ("ALTER TABLE watch_rules ADD COLUMN action TEXT NOT NULL DEFAULT ''", "watch_rules.action"),
+                ("ALTER TABLE watch_rules ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'pending'", "watch_rules.execution_status"),
+                ("ALTER TABLE watch_rules ADD COLUMN target_quantity INTEGER", "watch_rules.target_quantity"),
+                ("ALTER TABLE watch_rules ADD COLUMN snooze_until TEXT", "watch_rules.snooze_until"),
+                ("ALTER TABLE watch_rules ADD COLUMN ignore_until_recovery INTEGER NOT NULL DEFAULT 0", "watch_rules.ignore_until_recovery"),
+                ("ALTER TABLE watch_rules ADD COLUMN last_snapshot_time TEXT", "watch_rules.last_snapshot_time"),
+                ("ALTER TABLE watch_rules ADD COLUMN active_event_id INTEGER", "watch_rules.active_event_id"),
+                ("ALTER TABLE watch_events ADD COLUMN updated_at TEXT", "watch_events.updated_at"),
+                ("ALTER TABLE watch_events ADD COLUMN repeat_count INTEGER NOT NULL DEFAULT 1", "watch_events.repeat_count"),
             ]:
                 try:
                     conn.execute(stmt)
@@ -232,6 +246,37 @@ def init_db():
                     if "duplicate column name" not in str(e).lower():
                         raise
             conn.execute("UPDATE watch_rules SET original_threshold=threshold WHERE original_threshold IS NULL")
+            for rule_id, message in conn.execute("SELECT id,message FROM watch_rules WHERE action=''").fetchall():
+                conn.execute("UPDATE watch_rules SET action=? WHERE id=?", (infer_action(message), rule_id))
+            conn.execute("""CREATE TABLE IF NOT EXISTS watch_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                rule_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                trade_log_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                voided_at TEXT
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS watch_executions_rule ON watch_executions(rule_id)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS watch_shadow_checks (
+                    rule_id INTEGER NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    snapshot_time TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    base_hit INTEGER NOT NULL,
+                    legacy_confirmed INTEGER NOT NULL DEFAULT 0,
+                    evaluation_json TEXT NOT NULL,
+                    rule_json TEXT NOT NULL,
+                    PRIMARY KEY(rule_id, trade_date, snapshot_time)
+                )
+            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS watch_calibration_runs (
                     trade_date  TEXT NOT NULL,
@@ -990,10 +1035,31 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
     conn = sqlite3.connect(DB_PATH)
     count = 0
     try:
+        conn.execute("BEGIN IMMEDIATE")
         for plan in plans:
             code = str(plan.get("code", "")).strip()
             rules = (plan.get("rules") or [])[:4]
             if not code or not rules:
+                continue
+            protected = conn.execute("""SELECT 1 FROM watch_rules r JOIN watch_plans p ON p.id=r.plan_id
+                WHERE p.code=? AND p.trade_date=? AND (r.execution_status!='pending' OR r.snooze_until IS NOT NULL
+                OR r.ignore_until_recovery=1 OR EXISTS(SELECT 1 FROM watch_executions x WHERE x.rule_id=r.id))""",
+                (code, trade_date)).fetchone()
+            if protected:
+                logger.warning("skip watch plan with execution feedback code=%s", code)
+                continue
+            # Reject the entire malformed plan before replacing any existing draft.
+            # Silently discarding an unsupported condition would change its meaning.
+            try:
+                for candidate in rules:
+                    candidate["conditions"] = validate_conditions(candidate.get("conditions", []))
+                    if candidate.get("priority") == "risk" and candidate["conditions"]:
+                        raise ValueError("风险规则不得附加量能/MACD条件")
+                    candidate["action"] = candidate.get("action") or infer_action(candidate.get("message", ""))
+                    if candidate["action"] not in ACTIONS:
+                        raise ValueError("无效动作")
+            except (ValueError, TypeError, AttributeError):
+                logger.warning("skip watch plan with unsupported conditions code=%s", code)
                 continue
             try:
                 current_price = float(plan.get("_current_price") or 0)
@@ -1047,9 +1113,10 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
                     priority = "observe"
                 conn.execute(
                     """INSERT INTO watch_rules(plan_id,rule_type,threshold,original_threshold,
-                       confirmation_minutes,priority,message,indicator_label) VALUES(?,?,?,?,?,?,?,?)""",
+                       confirmation_minutes,priority,message,indicator_label,conditions_json,action) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (plan_id, kind, threshold, threshold, confirmation, priority, str(rule.get("message", "")),
-                     str(rule.get("indicator") or rule.get("line_name") or "")[:80]),
+                     str(rule.get("indicator") or rule.get("line_name") or "")[:80],
+                     json.dumps(rule["conditions"], ensure_ascii=False), rule["action"]),
                 )
                 inserted_rules += 1
             if inserted_rules:
@@ -1075,7 +1142,9 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
     for row in rows:
         rules = conn.execute(
             """SELECT id,rule_type,threshold,confirmation_minutes,priority,message,state,triggered_at,
-                      paused,original_threshold,revision_reason,pause_source,state_changed_at,indicator_label
+                      paused,original_threshold,revision_reason,pause_source,state_changed_at,indicator_label,
+                      conditions_json,shadow_result_json,action,execution_status,target_quantity,snooze_until,
+                      (SELECT COALESCE(SUM(quantity),0) FROM watch_executions x WHERE x.rule_id=watch_rules.id AND x.voided_at IS NULL)
                FROM watch_rules WHERE plan_id=? ORDER BY id""",
             (row[0],),
         ).fetchall()
@@ -1085,7 +1154,10 @@ def get_watch_plans(trade_date: str | None = None) -> list[dict]:
                                  "priority": r[4], "message": r[5], "state": r[6], "triggered_at": r[7],
                                  "paused": bool(r[8]), "original_threshold": r[9], "revision_reason": r[10],
                                  "pause_source": r[11], "state_changed_at": r[12],
-                                 "indicator": r[13]} for r in rules]})
+                                 "indicator": r[13], "conditions": json.loads(r[14]),
+                                 "conditions_description": describe_conditions(json.loads(r[14])),
+                                 "shadow_result": json.loads(r[15]), "action": r[16], "execution_status": r[17],
+                                 "target_quantity": r[18], "snooze_until": r[19], "filled_quantity": r[20]} for r in rules]})
     conn.close()
     return plans
 
@@ -1132,7 +1204,7 @@ def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int)
     cur = conn.execute(
         """UPDATE watch_rules SET threshold=?, confirmation_minutes=?, state='waiting',
            consecutive_hits=0,recovery_hits=0,triggered_at=NULL,paused=0,pause_source='',
-           state_changed_at=NULL,revision_reason='用户手动修改' WHERE id=?""",
+           state_changed_at=NULL,shadow_result_json='{}',revision_reason='用户手动修改' WHERE id=?""",
         (threshold, confirmation_minutes, rule_id),
     )
     conn.commit()
@@ -1142,6 +1214,7 @@ def update_watch_rule(rule_id: int, threshold: float, confirmation_minutes: int)
 
 
 def get_recent_watch_events(limit: int = 50, after_id: int = 0) -> list[dict]:
+    from core.watch_execution import event_details
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         """SELECT id,code,name,event_type,priority,price,message,triggered_at,read_at,
@@ -1149,10 +1222,9 @@ def get_recent_watch_events(limit: int = 50, after_id: int = 0) -> list[dict]:
            FROM watch_events WHERE id > ? ORDER BY id DESC LIMIT ?""",
         (after_id, limit),
     ).fetchall()
+    result = [event_details(conn, row[0]) for row in rows]
     conn.close()
-    keys = ("id", "code", "name", "event_type", "priority", "price", "message", "triggered_at",
-            "read_at", "max_gain_pct", "max_drawdown_pct", "evaluated_at")
-    return [dict(zip(keys, row)) for row in rows]
+    return result
 
 
 def mark_watch_events_read(up_to_id: int | None = None) -> int:

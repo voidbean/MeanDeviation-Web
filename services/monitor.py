@@ -6,6 +6,10 @@ import sqlite3
 import threading
 
 from core.config import DB_PATH, logger
+from core.db import get_available_cash
+from services.watch_plan_context import render_live_rule_message
+from services.watch_features import build_watch_context, evaluate_conditions, shadow_summary
+from core.watch_execution import event_details
 
 _subscribers: set[queue.Queue] = set()
 _subscribers_lock = threading.Lock()
@@ -17,7 +21,7 @@ PRICE_RECOVERY_HYSTERESIS = 0.002
 
 def _action_direction(message: str) -> str:
     text = message or ""
-    if any(word in text for word in ("放弃买入", "暂停买入", "停止买入", "停止补仓", "不再买入")):
+    if any(word in text for word in ("放弃买入", "暂停买入", "停止买入", "停止补仓", "不再买入", "不执行买入")):
         return "cancel"
     if any(word in text for word in ("买入", "建仓", "补仓", "加仓")):
         return "buy"
@@ -38,12 +42,12 @@ def _indicator_label(rule: sqlite3.Row) -> str:
 
 def _intraday_avg(conn: sqlite3.Connection, code: str, trade_date: str) -> float | None:
     row = conn.execute(
-        "SELECT vol,amount FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 1",
+        "SELECT SUM(vol),SUM(amount) FROM intraday_snapshots WHERE code=? AND date=?",
         (code, trade_date),
     ).fetchone()
     if not row or not row[0] or not row[1]:
         return None
-    # 快照 amount 按千元保存，vol 为股数。
+    # 快照保存的是分钟增量；当日均价必须累加，不能拿最后一分钟均价代替黄线。
     return float(row[1]) * 1000 / float(row[0])
 
 
@@ -56,8 +60,12 @@ def _evidence(rule: sqlite3.Row, price: float, avg: float | None) -> str:
     return "｜".join(parts)
 
 
-def _confirmed_message(rule: sqlite3.Row, price: float, avg: float | None, minutes: int) -> str:
-    original = str(rule["message"] or "").strip()
+def _confirmed_message(rule: sqlite3.Row, price: float, avg: float | None, minutes: int,
+                       available_cash: float | None = None) -> str:
+    stored = str(rule["message"] or "").strip()
+    original = render_live_rule_message(
+        stored, get_available_cash() if available_cash is None else available_cash, price,
+    )
     direction = _action_direction(original)
     if direction == "buy":
         action = "建议买入/补仓" if any(x in original for x in ("补仓", "加仓")) else "建议买入"
@@ -139,15 +147,22 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     events = []
+    contexts, shadow_results = {}, {}
+    available_cash = get_available_cash()
     try:
+        # Serialize with fills/feedback and other evaluators. The snapshot cursor
+        # and confirmation counters must commit together.
+        conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             """SELECT r.*,p.code,p.name FROM watch_rules r
                JOIN watch_plans p ON p.id=r.plan_id
                JOIN stock_watchlist w ON w.code=p.code AND w.enabled=1
-               WHERE p.trade_date=? AND p.status='active' AND r.state!='invalid' AND COALESCE(r.paused,0)=0""",
+               WHERE p.trade_date=? AND p.status='active' AND r.state!='invalid' AND COALESCE(r.paused,0)=0
+               AND r.execution_status IN ('pending','partial')""",
             (trade_date,),
         ).fetchall()
         for rule in rows:
+            rule = dict(rule)
             snap = conn.execute(
                 "SELECT price,open,time,vol FROM intraday_snapshots WHERE code=? AND date=? ORDER BY time DESC LIMIT 1",
                 (rule["code"], trade_date),
@@ -155,10 +170,26 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             if not snap:
                 continue
             price, open_price, snap_time, latest_vol = float(snap[0]), float(snap[1] or 0), str(snap[2]), float(snap[3] or 0)
+            captured_at = dt.datetime.strptime(f"{trade_date} {snap_time}", "%Y-%m-%d %H:%M")
             if trade_date == dt.date.today().isoformat():
-                captured_at = dt.datetime.strptime(f"{trade_date} {snap_time}", "%Y-%m-%d %H:%M")
                 if (dt.datetime.now() - captured_at).total_seconds() > 150:
                     continue
+            previous = rule["last_snapshot_time"]
+            if previous and snap_time <= previous:
+                continue
+            if previous and (captured_at - dt.datetime.strptime(f"{trade_date} {previous}", "%Y-%m-%d %H:%M")).total_seconds() != 60:
+                rule["consecutive_hits"] = rule["recovery_hits"] = 0
+            conn.execute("UPDATE watch_rules SET last_snapshot_time=?,consecutive_hits=?,recovery_hits=? WHERE id=?",
+                         (snap_time, rule["consecutive_hits"], rule["recovery_hits"], rule["id"]))
+            if rule["snooze_until"] and captured_at.strftime("%Y-%m-%d %H:%M:%S") < rule["snooze_until"]:
+                continue
+            if rule["snooze_until"]:
+                conn.execute("UPDATE watch_rules SET snooze_until=NULL WHERE id=?", (rule["id"],))
+            held = conn.execute("SELECT COALESCE(quantity,0) FROM portfolio WHERE code=?", (rule["code"],)).fetchone()
+            if held and ((rule["action"] == "entry" and held[0] > 0 and rule["execution_status"] != "partial") or
+                         (rule["action"] in {"add", "reduce", "exit"} and not held[0])):
+                conn.execute("UPDATE watch_rules SET consecutive_hits=0,recovery_hits=0 WHERE id=?", (rule["id"],))
+                continue  # Known position is incompatible; never invent a fill.
             current_avg = _intraday_avg(conn, rule["code"], trade_date)
             threshold = float(rule["threshold"])
             # “分时均价/黄线”会随成交持续变化，不能拿生成计划时的旧均价盯一整天。
@@ -166,6 +197,41 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 threshold = current_avg
             kind = rule["rule_type"]
             hit = _condition(kind, price, threshold, latest_vol, conn, rule["code"], trade_date)
+            if rule["ignore_until_recovery"]:
+                recovered = int(rule["recovery_hits"] or 0) + 1 if _recovered(kind, price, threshold, hit) else 0
+                if recovered >= int(rule["confirmation_minutes"]):
+                    conn.execute("""UPDATE watch_rules SET ignore_until_recovery=0,state='waiting',
+                        consecutive_hits=0,recovery_hits=0 WHERE id=?""", (rule["id"],))
+                else:
+                    conn.execute("UPDATE watch_rules SET recovery_hits=? WHERE id=?", (recovered, rule["id"]))
+                continue
+            # Shadow checks are independent of the original state machine, including
+            # risk exits. Keep one audit row per rule/snapshot, even on repeated polls.
+            try:
+                if rule["code"] not in contexts:
+                    contexts[rule["code"]] = build_watch_context(conn, rule["code"], trade_date)
+                evaluation = evaluate_conditions(json.loads(rule["conditions_json"]),
+                                                 contexts[rule["code"]], price, trade_date)
+            except Exception:
+                # Technical-data failure must not suppress the original risk alerts.
+                logger.exception("watch shadow data unavailable code=%s", rule["code"])
+                evaluation = {"mode": "shadow", "status": "unknown", "checks": [
+                    {"label": "技术数据读取", "status": "unknown", "actual": None}]}
+            evaluation.update({"as_of": f"{trade_date} {snap_time}", "base_hit": hit})
+            evaluation["summary"] = shadow_summary(evaluation)
+            shadow_results[rule["id"]] = (evaluation, snap_time)
+            encoded = json.dumps(evaluation, ensure_ascii=False)
+            conn.execute("UPDATE watch_rules SET shadow_result_json=? WHERE id=?", (encoded, rule["id"]))
+            conn.execute(
+                """INSERT INTO watch_shadow_checks(rule_id,trade_date,snapshot_time,code,price,base_hit,
+                   evaluation_json,rule_json) VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(rule_id,trade_date,snapshot_time) DO UPDATE SET
+                   price=excluded.price,base_hit=excluded.base_hit,evaluation_json=excluded.evaluation_json,
+                   rule_json=excluded.rule_json""",
+                (rule["id"], trade_date, snap_time, rule["code"], price, int(hit), encoded,
+                 json.dumps({"type": kind, "threshold": threshold, "confirmation_minutes": rule["confirmation_minutes"],
+                             "conditions": json.loads(rule["conditions_json"]), "message": rule["message"]}, ensure_ascii=False)),
+            )
             required_hits = int(rule["confirmation_minutes"])
             if rule["state"] == "observing":
                 direction = _action_direction(str(rule["message"] or ""))
@@ -177,7 +243,7 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 recovery_hits = int(rule["recovery_hits"] or 0) + 1 if cancelled else 0
                 if hits >= required_hits:
                     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    message = _confirmed_message(rule, price, current_avg, required_hits)
+                    message = _confirmed_message(rule, price, current_avg, required_hits, available_cash)
                     cur = conn.execute(
                         "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
                         (rule["id"], rule["code"], rule["name"], "action_confirmed", rule["priority"], price, message, now),
@@ -230,12 +296,14 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             labels = {"breakout": "突破", "breakdown": "跌破", "near": "接近",
                       "rapid_move_5m": "5分钟异动", "volume_spike": "分钟放量"}
             if kind == "near" and _action_direction(str(rule["message"] or "")):
+                live_plan = render_live_rule_message(str(rule["message"] or ""), available_cash, price)
                 message = (f"👀 已到达观察区，尚未形成操作确认；将继续检查站稳方向。"
-                           f"{_evidence(rule, price, current_avg)}。计划：{rule['message']}")
+                           f"{_evidence(rule, price, current_avg)}。计划：{live_plan}")
             else:
-                message = _confirmed_message(rule, price, current_avg, required_hits)
+                message = _confirmed_message(rule, price, current_avg, required_hits, available_cash)
             if opening_cross:
-                message = f"开盘直接{labels[kind]}，已越级确认。{_evidence(rule, price, current_avg)}。计划：{rule['message']}"
+                live_plan = render_live_rule_message(str(rule["message"] or ""), available_cash, price)
+                message = f"开盘直接{labels[kind]}，已越级确认。{_evidence(rule, price, current_avg)}。计划：{live_plan}"
             cur = conn.execute(
                 "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
                 (rule["id"], rule["code"], rule["name"], kind, rule["priority"], price, message, now),
@@ -246,8 +314,34 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             event = {"id": cur.lastrowid, "code": rule["code"], "name": rule["name"], "event_type": kind,
                      "priority": rule["priority"], "price": price, "message": message, "triggered_at": now}
             events.append(event)
+        for event in events:
+            # Event dictionaries intentionally do not expose rule_id; resolve through
+            # the just-inserted persisted event rather than matching by stock code.
+            rule_id = conn.execute("SELECT rule_id FROM watch_events WHERE id=?", (event["id"],)).fetchone()[0]
+            evaluation, snap_time = shadow_results[rule_id]
+            event["message"] += "。" + evaluation["summary"]
+            event["shadow_result"] = evaluation
+            conn.execute("UPDATE watch_events SET message=? WHERE id=?", (event["message"], event["id"]))
+            if event["event_type"] not in {"near", "recovered"}:
+                conn.execute("UPDATE watch_shadow_checks SET legacy_confirmed=1 "
+                             "WHERE rule_id=? AND trade_date=? AND snapshot_time=?", (rule_id, trade_date, snap_time))
+            rule = conn.execute("SELECT active_event_id,priority FROM watch_rules WHERE id=?", (rule_id,)).fetchone()
+            prior = conn.execute("SELECT id,event_type FROM watch_events WHERE id=?", (rule[0],)).fetchone() if rule[0] else None
+            if event["event_type"] != "recovered":
+                if rule[1] != "risk" and prior and prior[1] == event["event_type"]:
+                    conn.execute("UPDATE watch_events SET message=?,updated_at=?,repeat_count=repeat_count+1 WHERE id=?",
+                                 (event["message"], event["triggered_at"], prior[0]))
+                    conn.execute("DELETE FROM watch_events WHERE id=?", (event["id"],))
+                    event["id"] = prior[0]
+                    event["silent_update"] = True
+                conn.execute("UPDATE watch_rules SET active_event_id=? WHERE id=?", (event["id"], rule_id))
+            else:
+                event["silent_update"] = True
+            event.update(event_details(conn, event["id"]))
         conn.commit()
     except Exception:
+        conn.rollback()
+        events.clear()  # Never publish events whose transaction did not commit.
         logger.exception("evaluate_watch_rules failed")
     finally:
         conn.close()

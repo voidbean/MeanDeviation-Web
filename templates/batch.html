@@ -198,6 +198,7 @@
                     <span class="input-group-text">分钟</span>
                     <button class="btn btn-outline-secondary" type="button" onclick="saveWatchRule({{ rule.id }})">保存</button>
                 </div>
+                <div class="small text-muted mb-2">影子条件（不拦截原规则）：{{ rule.conditions_description or '未配置，仅原规则确认' }}</div>
                 {% endfor %}
             </div>
             {% endfor %}
@@ -278,7 +279,14 @@
                     <span class="badge bg-light text-dark border">等待中</span>
                     {% endif %}
                     <span class="text-muted">确认 {{ rule.confirmation_minutes }} 分钟</span>
+                    <span class="badge bg-light text-dark border">执行：{{ {'pending':'待处理／未知','partial':'部分成交','completed':'已完成','disabled':'已停用'}.get(rule.execution_status, '待处理') }}{% if rule.target_quantity %} {{ rule.filled_quantity }}/{{ rule.target_quantity }}股{% endif %}</span>
                 </div>
+                <div class="small text-muted">影子条件：{{ rule.conditions_description or '未配置，仅原规则确认' }}</div>
+                {% if rule.shadow_result %}
+                <div class="small text-muted">{{ rule.shadow_result.as_of }} · {{ rule.shadow_result.summary }}</div>
+                {% else %}
+                <div class="small text-muted">影子验证尚未运行；不拦截原规则，不代表量价联合确认。</div>
+                {% endif %}
                 {% endfor %}
             </div>
             {% endfor %}

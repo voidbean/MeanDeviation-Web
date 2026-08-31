@@ -298,6 +298,9 @@ def _register_routes(app, templates):
         trade_time = trade_time.replace("T", " ")
         conn = sqlite3.connect(DB_PATH)
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM watch_executions WHERE trade_log_id=? AND voided_at IS NULL", (trade_id,)).fetchone():
+                return JSONResponse({"error": "该记录关联盯盘成交，请在盯盘通知中撤销后重新记录，避免账目不一致。"}, status_code=409)
             conn.execute(
                 "UPDATE trade_log SET trade_time=?, direction=?, price=?, volume=?, thought=?, emotion=? WHERE id=?",
                 (trade_time, direction, price, volume, thought, emotion, trade_id)
@@ -311,6 +314,9 @@ def _register_routes(app, templates):
     async def review_delete(request: Request, trade_id: int = Form(...)):
         conn = sqlite3.connect(DB_PATH)
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM watch_executions WHERE trade_log_id=? AND voided_at IS NULL", (trade_id,)).fetchone():
+                return JSONResponse({"error": "该记录关联盯盘成交，请在盯盘通知中撤销，避免账目不一致。"}, status_code=409)
             conn.execute("DELETE FROM trade_log WHERE id=?", (trade_id,))
             conn.commit()
         finally:

@@ -117,7 +117,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
     # 动态补列：amount、open 及所有技术指标列（SQLite 不支持 IF NOT EXISTS，用 try/except）
-    extra_cols = [("amount", "REAL DEFAULT 0"), ("open", "REAL DEFAULT 0")] + [(db_col, "REAL") for db_col, _ in FACTOR_FIELDS]
+    extra_cols = [("amount", "REAL DEFAULT 0"), ("open", "REAL DEFAULT 0"), ("vol", "REAL")] + [(db_col, "REAL") for db_col, _ in FACTOR_FIELDS]
     for col_name, col_def in extra_cols:
         try:
             conn.execute(f"ALTER TABLE daily_records ADD COLUMN {col_name} {col_def}")
@@ -187,12 +187,13 @@ def upsert_daily_record(
     avg_price: float,
     amount: float = 0.0,
     open: float = 0.0,
+    vol: float | None = None,
 ) -> None:
-    """写入一条日线记录，已存在则覆盖（幂等）。amount 单位：千元。"""
+    """写入一条日线记录。amount 单位千元，vol 单位股；缺失不覆盖历史量。"""
     conn.execute(
         """
-        INSERT INTO daily_records(date, code, name, close, high, low, avg_price, amount, open)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO daily_records(date, code, name, close, high, low, avg_price, amount, open, vol)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date, code) DO UPDATE SET
             close     = excluded.close,
             high      = excluded.high,
@@ -200,9 +201,10 @@ def upsert_daily_record(
             avg_price = excluded.avg_price,
             name      = excluded.name,
             amount    = excluded.amount,
-            open      = excluded.open
+            open      = excluded.open,
+            vol       = COALESCE(excluded.vol, daily_records.vol)
         """,
-        (date, code, name, close, high, low, avg_price, amount, open),
+        (date, code, name, close, high, low, avg_price, amount, open, vol),
     )
 
 
@@ -389,6 +391,7 @@ def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS)
                 avg_price=avg_price,
                 amount=round(amount, 2),
                 open=open_,
+                vol=vol * 100 if row.get("vol") is not None else None,
             )
             count += 1
         except Exception as e:

@@ -9,11 +9,26 @@
     </div>
     <div class="offcanvas-body p-0"><div id="monitor-event-list" class="list-group list-group-flush"></div></div>
 </div>
+<dialog id="watch-fill-dialog" class="border-0 rounded shadow p-4" style="width:min(94vw,460px)">
+    <form id="watch-fill-form">
+        <h5 id="watch-fill-title">记录实际成交</h5>
+        <p class="small text-muted">不是下单。提交后同步持仓、现金与交易记录；已在其他位置入账的成交请勿重复提交。</p>
+        <label class="form-label w-100">实际成交价<input name="price" type="number" min="0.0001" step="0.0001" required class="form-control"></label>
+        <label class="form-label w-100">本次成交股数<input name="quantity" type="number" min="1" step="1" required class="form-control"></label>
+        <label class="form-label w-100">本动作计划总股数（含已成交）<input name="target_quantity" type="number" min="1" step="1" required class="form-control"></label>
+        <label class="form-label w-100">本次费用合计（元）<input name="fee" type="number" min="0" step="0.01" value="0" required class="form-control"></label>
+        <label class="form-label w-100">实际成交时间<input name="trade_time" type="datetime-local" required class="form-control"></label>
+        <label class="small d-block mb-2"><input name="confirmed" type="checkbox" required> 确认本次成交尚未更新到本系统持仓／现金</label>
+        <div id="watch-fill-error" class="small text-danger" role="alert"></div>
+        <div class="d-flex gap-2 mt-3"><button type="submit" class="btn btn-primary">确认记账</button>
+        <button type="button" class="btn btn-secondary" id="watch-fill-cancel">取消</button></div>
+    </form>
+</dialog>
 <script>
 (() => {
     let lastId = 0;
     let unread = 0;
-    const seen = new Set();
+    const seen = new Map();
 
     function renderHealth(health) {
         const el = document.getElementById('monitor-health');
@@ -35,28 +50,48 @@
     }
 
     function addEvent(item, popup) {
-        if (seen.has(item.id)) return;
-        seen.add(item.id); lastId = Math.max(lastId, item.id || 0);
-        if (!item.read_at) unread++;
-        const row = document.createElement('a');
+        const previous = seen.get(item.id);
+        seen.set(item.id, item); lastId = Math.max(lastId, item.id || 0);
+        unread = [...seen.values()].filter(x => !x.read_at).length;
+        const row = document.createElement('div');
+        row.id = 'monitor-event-' + item.id;
         row.className = 'list-group-item list-group-item-action';
-        row.href = '#';
-        row.addEventListener('click', event => {
-            event.preventDefault();
-            const form = document.createElement('form'); form.method = 'post'; form.action = '/analyze';
-            const input = document.createElement('input'); input.type = 'hidden'; input.name = 'stock_code'; input.value = item.code;
-            form.appendChild(input); document.body.appendChild(form); form.submit();
-        });
         const title = document.createElement('div');
         title.className = 'fw-semibold';
         title.textContent = (item.name || item.code) + ' · ' + item.price;
         const msg = document.createElement('div'); msg.className = 'small'; msg.textContent = item.message;
         const meta = document.createElement('small'); meta.className = 'text-muted';
         meta.textContent = item.triggered_at + (item.max_gain_pct != null ? ` · 后续最高 ${item.max_gain_pct}% / 最大回撤 ${item.max_drawdown_pct}%` : '');
-        row.append(title, msg, meta);
-        document.getElementById('monitor-event-list').prepend(row);
+        const status = document.createElement('div'); status.className = 'small text-primary my-1';
+        const states = {pending:'待处理 · 执行情况未知', partial:'部分成交', completed:'动作已完成', disabled:'动作已停用'};
+        status.textContent = (states[item.execution_status] || '历史规则已不存在') +
+            (item.target_quantity ? ` · 已成交 ${item.filled_quantity}/${item.target_quantity} 股` : '') +
+            (item.snooze_until ? ` · 暂不执行至 ${item.snooze_until}` : '') +
+            (item.ignore_until_recovery ? ' · 本轮已忽略，等待条件解除' : '') +
+            (item.repeat_count > 1 ? ` · 已合并 ${item.repeat_count} 次触发，最新 ${item.updated_at}` : '');
+        row.append(title, msg, meta, status);
+        const buttons = document.createElement('div'); buttons.className = 'd-flex flex-wrap gap-1';
+        function button(label, callback) {
+            const b = document.createElement('button'); b.type = 'button'; b.className = 'btn btn-sm btn-outline-secondary';
+            b.textContent = label; b.onclick = callback; buttons.append(b);
+        }
+        const active = ['pending','partial'].includes(item.execution_status);
+        if (active && ['entry','add','reduce','exit'].includes(item.action) && !['near','recovered','calibration'].includes(item.event_type)) {
+            button('记录成交', () => openFill(item));
+        }
+        if (active) {
+            if (item.priority !== 'risk') {
+                button('暂不执行15分钟', () => feedback(item, 'snooze'));
+                button('忽略本次', () => feedback(item, 'ignore'));
+            }
+            button('今日停用', () => feedback(item, 'disable'));
+        }
+        if (item.last_execution_id) button('撤销最近成交', () => undo(item));
+        row.append(buttons);
+        const old = document.getElementById(row.id);
+        if (old) old.replaceWith(row); else document.getElementById('monitor-event-list').prepend(row);
         updateBadge();
-        if (popup) {
+        if (popup && !previous && !item.silent_update) {
             const box = document.createElement('div');
             box.className = 'alert alert-' + (item.priority === 'risk' ? 'danger' : item.priority === 'opportunity' ? 'primary' : 'secondary') +
                             ' shadow position-fixed top-0 end-0 m-3';
@@ -68,7 +103,7 @@
     }
 
     async function catchUp() {
-        const response = await fetch('/api/watch_events?after_id=' + lastId + '&limit=50');
+        const response = await fetch('/api/watch_events?after_id=0&limit=50');
         if (!response.ok) return;
         const data = await response.json();
         data.events.forEach(item => addEvent(item, false));
@@ -76,11 +111,68 @@
     }
 
     window.markMonitorRead = async function() {
+        seen.forEach(item => item.read_at = item.read_at || new Date().toISOString());
         unread = 0; updateBadge();
         await fetch('/api/watch_events/read', {method:'POST', headers:{'Content-Type':'application/json'},
             body:JSON.stringify({up_to_id:lastId})});
     };
 
+    const dialog = document.getElementById('watch-fill-dialog');
+    const fillForm = document.getElementById('watch-fill-form');
+    let fillItem = null, requestId = null, pendingPayload = null;
+    const newKey = () => crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) + '-fill';
+    function openFill(item) {
+        fillItem = item; requestId = newKey(); pendingPayload = null; fillForm.reset();
+        document.getElementById('watch-fill-error').textContent = '';
+        const direction = ['entry','add'].includes(item.action) ? '买入' : '卖出';
+        document.getElementById('watch-fill-title').textContent = (item.name || item.code) + ' · ' + direction + '成交';
+        fillForm.elements.price.value = item.price;
+        fillForm.elements.trade_time.value = item.triggered_at.replace(' ', 'T').slice(0,16);
+        fillForm.elements.target_quantity.value = item.target_quantity || '';
+        fillForm.elements.target_quantity.readOnly = !!item.target_quantity;
+        dialog.showModal();
+    }
+    document.getElementById('watch-fill-cancel').onclick = () => dialog.close();
+    fillForm.onsubmit = async event => {
+        event.preventDefault();
+        const submit = fillForm.querySelector('[type=submit]');
+        if (submit.disabled) return;
+        submit.disabled = true;
+        pendingPayload = pendingPayload || {action:'fill', request_id:requestId,
+            direction:['entry','add'].includes(fillItem.action) ? '买入' : '卖出',
+            price:Number(fillForm.elements.price.value), quantity:Number(fillForm.elements.quantity.value),
+            target_quantity:Number(fillForm.elements.target_quantity.value), fee:Number(fillForm.elements.fee.value),
+            trade_time:fillForm.elements.trade_time.value};
+        try {
+            const response = await fetch('/api/watch_events/' + fillItem.id + '/feedback', {
+                method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(pendingPayload)});
+            const data = await response.json();
+            if (!response.ok) {
+                if (response.status === 400) { pendingPayload = null; requestId = newKey(); }
+                throw new Error(data.error || '提交结果未知，请用原请求重试');
+            }
+            dialog.close(); await catchUp();
+        } catch (error) {
+            document.getElementById('watch-fill-error').textContent = error.message + (pendingPayload ? '（重试将使用同一请求，避免重复记账；请勿另开表单）' : '');
+        } finally { submit.disabled = false; }
+    };
+    async function feedback(item, action) {
+        if (action === 'disable' && !confirm('确认停用今日这条动作？风险规则也将停止提醒。')) return;
+        try {
+            const response = await fetch('/api/watch_events/' + item.id + '/feedback', {
+                method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
+            const data = await response.json(); if (!response.ok) throw new Error(data.error);
+            await catchUp();
+        } catch (error) { alert(error.message); }
+    }
+    async function undo(item) {
+        if (!confirm('撤销最近成交并回滚关联持仓、现金、交易记录？更正时请撤销后重新记录。')) return;
+        try {
+            const response = await fetch('/api/watch_executions/' + item.last_execution_id + '/undo', {method:'POST'});
+            const data = await response.json(); if (!response.ok) throw new Error(data.error);
+            await catchUp();
+        } catch (error) { alert(error.message); }
+    }
     catchUp();
     setInterval(catchUp, 60000);
     const stream = new EventSource('/monitor_stream');

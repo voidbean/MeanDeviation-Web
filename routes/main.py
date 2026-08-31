@@ -41,6 +41,8 @@ from services.ai import (
     call_ai_model_with_tools, call_ai_model_streaming, call_ai_model,
     _save_ai_conversation, _load_ai_conversation,
 )
+from services.watch_plan_context import render_live_plan_messages
+from services.watch_features import load_watch_context
 
 # ── 常用股票管理 ─────────────────────────────────────────────────────────────
 
@@ -273,16 +275,19 @@ def _register_routes(app, templates):
         for history_date in history_dates:
             history_plans.append({
                 "trade_date": history_date,
+                # 历史计划保留当时的原文，避免用今天的现金改写历史审计语义。
                 "plans": get_watch_plans(history_date),
             })
+        today_plans = render_live_plan_messages(get_watch_plans(today), available_cash)
+        next_plans = render_live_plan_messages(get_watch_plans(plan_date), available_cash)
         return templates.TemplateResponse("batch.html", {
             "request":       request,
             "batch_results": data.get("batch_results", []),
             "batch_time":    data.get("batch_time", ""),
             "watch_map":     get_watch_enabled_map(),
-            "today_plans":   get_watch_plans(today),
+            "today_plans":   today_plans,
             "today_date":    today,
-            "watch_plans":   get_watch_plans(plan_date),
+            "watch_plans":   next_plans,
             "watch_events":  get_recent_watch_events(),
             "watch_revisions": get_watch_plan_revisions(today),
             "history_plan_groups": history_plans,
@@ -342,6 +347,9 @@ def _register_routes(app, templates):
             item["max_buy_lots_at_current_price"] = (
                 int(available_cash // (current_price * 100)) if current_price > 0 else 0
             )
+            item["technical_context"] = await asyncio.to_thread(
+                load_watch_context, DB_PATH, str(result.get("code", "")), trade_date,
+            )
             compact.append(item)
         # 该任务只需要把已计算的关键位整理成规则。不要加载完整 skills 提示，
         # 否则推理模型可能把输出额度耗在长篇分析上，来不及生成最终 JSON。
@@ -358,8 +366,21 @@ volume_spike（price字段表示当前分钟量/此前20分钟均量倍数，建
 冲高减仓/止盈点和跌破风控点。near 只代表进入观察区，不代表已经站稳；系统会在到达后继续确认方向。
 message 必须写清动作（观察买入、补仓、减仓、止盈或止损），
 不能把未持仓股票写成卖出，也不能在没有风险退出规则时只给已持仓股票补仓规则。
-available_cash 是整个账户共享的可用现金，不得对每只股票重复分配；资金不足一手时只允许观察，
-message 中不得建议实际买入。涉及买入或补仓时，应结合候选价格说明最多可买手数（1手=100股），并保留手续费余量。
+available_cash 仅用于判断生成时是否存在基本执行能力，且是整个账户共享现金，不得对多只股票重复分配。
+不要在 message 中写可用现金、资金不足或“最多可买几手”等易过期信息；系统会在展示和触发时按实时现金、
+实时价格动态计算。message 只描述条件、意图和动作（1手=100股）。
+technical_context提供已收盘日K、成交量和日线MACD，以及带时间戳的分时量价；
+必须结合这些背景制定计划，缺失/null或日期陈旧时明确说明，不得臆测放量、金叉或盘中走势。
+日线MACD不是分钟MACD，也不是当日未收盘估算值，仅作背景辅助。
+每条规则必须包含conditions数组（最多3项），当前仅影子验证，不阻塞原规则，绝不声称联合确认已完成。
+条件格式为{"metric":"volume_ratio_3m_20m","op":"gte","value":1.5}；
+仅支持volume_ratio_3m_20m（近3分钟均量/此前20分钟均量，value为0.1到20）、
+price_vs_vwap（现价/当日累计均价，value为0.95到1.05）、daily_macd_hist（已收盘日线MACD柱，value只能0）。
+op仅gte/lte。突破入场可配置放量条件，回踩入场可配置缩量与均价条件，按情景选择，不必强求MACD。
+文案提及的可量化确认条件必须写入conditions；不支持的形态/金叉只写为背景或人工待核验，不得写为自动执行条件。
+风险退出conditions必须为空，不得要求量能或MACD同时满足才提示风险。
+每条规则必须包含action：entry首次建仓、add补仓、reduce减仓、exit退出、cancel放弃买入、observe观察。
+action须与message一致；首次建仓和补仓必须是独立动作，不能合并。数量由用户成交反馈明确记录。
 """
         timing_note = (
             "这是当日补录计划，请基于当前已计算的数据制定从现在起执行的规则，不要假装计划生成于开盘前。"
@@ -441,6 +462,26 @@ message 中不得建议实际买入。涉及买入或补仓时，应结合候选
                 unsubscribe(q)
         return StreamingResponse(generate(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/api/watch_events/{event_id}/feedback", response_class=JSONResponse)
+    async def watch_feedback(event_id: int, request: Request):
+        from core.watch_execution import submit_feedback
+        try:
+            result = await asyncio.to_thread(submit_feedback, DB_PATH, event_id, await request.json())
+        except (ValueError, TypeError, OverflowError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        _invalidate_portfolio_cache()
+        return result
+
+    @app.post("/api/watch_executions/{execution_id}/undo", response_class=JSONResponse)
+    async def undo_watch_execution(execution_id: int):
+        from core.watch_execution import undo_execution
+        try:
+            result = await asyncio.to_thread(undo_execution, DB_PATH, execution_id)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        _invalidate_portfolio_cache()
+        return result
 
     @app.get("/api/watch_events", response_class=JSONResponse)
     async def watch_events(after_id: int = 0, limit: int = 50):

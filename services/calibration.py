@@ -8,6 +8,7 @@ from core.config import DB_PATH, logger
 from core.db import get_available_cash, get_portfolio
 from core.strategy import load_skills
 from services.ai import call_ai_model
+from services.watch_features import build_watch_context
 
 CALIBRATION_SLOTS = (
     ("09:35", "open"),
@@ -74,12 +75,18 @@ def _active_plans(conn: sqlite3.Connection, trade_date: str) -> list[sqlite3.Row
 def _rules(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
     rows = conn.execute(
         """SELECT id,rule_type,threshold,COALESCE(original_threshold,threshold),priority,state,
-                  COALESCE(paused,0),message,COALESCE(pause_source,''),COALESCE(indicator_label,'')
-           FROM watch_rules WHERE plan_id=? ORDER BY id""",
+                  COALESCE(paused,0),message,COALESCE(pause_source,''),COALESCE(indicator_label,''),
+                  conditions_json,shadow_result_json,action,execution_status
+           FROM watch_rules WHERE plan_id=? AND execution_status IN ('pending','partial') ORDER BY id""",
         (plan_id,),
     ).fetchall()
-    keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message", "pause_source", "indicator")
-    return [dict(zip(keys, row)) for row in rows]
+    keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message", "pause_source", "indicator",
+            "conditions_json", "shadow_result_json", "action", "execution_status")
+    result = [dict(zip(keys, row)) for row in rows]
+    for rule in result:
+        rule["conditions"] = json.loads(rule.pop("conditions_json"))
+        rule["shadow_result"] = json.loads(rule.pop("shadow_result_json"))
+    return result
 
 
 def _market_snapshot(conn: sqlite3.Connection, code: str, trade_date: str) -> dict | None:
@@ -255,6 +262,7 @@ def run_ai_calibration(trade_date: str, slot: str) -> int:
         price = float(snap.get("price") or 0)
         payload.append({"code": plan["code"], "name": plan["name"], "bias": plan["bias"],
                         "summary": plan["summary"], "market": snap, "rules": rules,
+                        "technical_context": build_watch_context(conn, plan["code"], trade_date),
                         "position": {"holding": quantity > 0, "quantity": quantity,
                                      "cost_price": float(portfolio.get("cost") or 0)},
                         "account": {"available_cash": available_cash,
@@ -280,6 +288,11 @@ decision仅允许continue/pause_opportunity/invalidate/tighten_risk。市场状�
 后续条件恢复应返回continue并说明恢复依据；只有时间窗口结束、结构根本破坏、明确止损/成交等不可逆情况才允许invalidate。
 adjustments每项仅允许rule_id、action(pause/update)、threshold。不得修改已触发规则；
 止损/跌破风险线只能上移，不能下调；关键价最多小幅修正1%；不要追着价格重写计划。
+technical_context含已收盘日K、日线MACD、分钟量价序列与量能比较基准；注意as_of，null代表数据不足。
+日线MACD仅作背景，不得冒充盘中MACD。conditions/shadow_result仅影子评估，不能修改其条件，
+也不能仅因影子条件未满足或数据不足暂停机会或作废计划，以免间接把影子条件变成硬门槛。
+如依据原有风控逻辑调整，reason必须引用实际数据；不要根据累计成交量单个数字断言放量。
+不得因量能或MACD不足而暂停风险退出提醒。
 {slot}校准重点：{focus}。
 """
     raw = call_ai_model(system_prompt, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
