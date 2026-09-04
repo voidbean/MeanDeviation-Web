@@ -2,7 +2,7 @@ import sqlite3
 import time
 import json
 from core.watch_conditions import validate_conditions, describe_conditions
-from core.watch_actions import ACTIONS, infer_action
+from core.watch_actions import ACTIONS, OBSERVE_ONLY_PHRASES, infer_action
 
 from core.config import DB_PATH, STOCK_NAME_CACHE, logger
 
@@ -248,6 +248,12 @@ def init_db():
             conn.execute("UPDATE watch_rules SET original_threshold=threshold WHERE original_threshold IS NULL")
             for rule_id, message in conn.execute("SELECT id,message FROM watch_rules WHERE action=''").fetchall():
                 conn.execute("UPDATE watch_rules SET action=? WHERE id=?", (infer_action(message), rule_id))
+            # Repair previously stored rules affected by naïve positive-keyword
+            # matching (e.g. action=add with “不主动补仓” in the plan text).
+            for rule_id, action, message in conn.execute(
+                    "SELECT id,action,message FROM watch_rules WHERE action IN ('entry','add')").fetchall():
+                if any(phrase in (message or "") for phrase in OBSERVE_ONLY_PHRASES):
+                    conn.execute("UPDATE watch_rules SET action='observe' WHERE id=?", (rule_id,))
             conn.execute("""CREATE TABLE IF NOT EXISTS watch_executions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT NOT NULL UNIQUE,
@@ -1058,6 +1064,11 @@ def save_watch_plans(plans: list[dict], trade_date: str) -> int:
                     candidate["action"] = candidate.get("action") or infer_action(candidate.get("message", ""))
                     if candidate["action"] not in ACTIONS:
                         raise ValueError("无效动作")
+                    # When structured output conflicts with an explicit
+                    # observation-only sentence, prefer the safer intent.
+                    if (candidate["action"] in {"entry", "add"}
+                            and any(p in str(candidate.get("message", "")) for p in OBSERVE_ONLY_PHRASES)):
+                        candidate["action"] = "observe"
             except (ValueError, TypeError, AttributeError):
                 logger.warning("skip watch plan with unsupported conditions code=%s", code)
                 continue

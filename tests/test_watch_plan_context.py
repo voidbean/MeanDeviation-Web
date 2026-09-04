@@ -27,6 +27,11 @@ class WatchPlanContextTests(unittest.TestCase):
         message = "结构破坏，放弃买入"
         self.assertEqual(render_live_rule_message(message, 50_000, 10), message)
 
+    def test_observation_only_buy_phrase_is_not_decorated(self):
+        message = "回落至DDP 0.618位58.54附近仅观察是否止跌，不主动补仓。"
+        self.assertFalse(is_buy_action(message))
+        self.assertEqual(render_live_rule_message(message, 32_851, 58.86), message)
+
 
 if __name__ == "__main__":
     unittest.main()

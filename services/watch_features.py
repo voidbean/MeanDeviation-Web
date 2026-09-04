@@ -105,4 +105,5 @@ def shadow_summary(evaluation):
     if not checks:
         return "未设置额外检查，按原提醒条件监测；不代表买卖确认。"
     detail = "；".join(f"{c['label']}：{labels[c['status']]}" for c in checks)
-    return f"额外检查：{detail}。结果仅供参考，不影响原提醒，也不代表买卖确认。"
+    return (f"旁路检查（不参与本次触发）：{detail}。"
+            "结果仅供参考，不影响原提醒，也不代表买卖确认。")

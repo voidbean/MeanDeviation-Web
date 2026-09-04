@@ -30,6 +30,20 @@ def _action_direction(message: str) -> str:
     return ""
 
 
+def _rule_direction(rule) -> str:
+    """Use explicit operation intent; parse text only for legacy rows."""
+    action = str(rule.get("action") or "")
+    if action in {"entry", "add"}:
+        return "buy"
+    if action in {"reduce", "exit"}:
+        return "sell"
+    if action == "cancel":
+        return "cancel"
+    if action == "observe":
+        return ""
+    return _action_direction(str(rule.get("message") or ""))
+
+
 def _indicator_label(rule: sqlite3.Row) -> str:
     explicit = str(rule["indicator_label"] or "").strip()
     if explicit:
@@ -66,7 +80,7 @@ def _confirmed_message(rule: sqlite3.Row, price: float, avg: float | None, minut
     original = render_live_rule_message(
         stored, get_available_cash() if available_cash is None else available_cash, price,
     )
-    direction = _action_direction(original)
+    direction = _rule_direction(rule)
     if direction == "buy":
         action = "建议买入/补仓" if any(x in original for x in ("补仓", "加仓")) else "建议买入"
     elif direction == "sell":
@@ -234,7 +248,7 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             )
             required_hits = int(rule["confirmation_minutes"])
             if rule["state"] == "observing":
-                direction = _action_direction(str(rule["message"] or ""))
+                direction = _rule_direction(rule)
                 confirmed = ((direction == "buy" and price >= threshold * (1 + PRICE_RECOVERY_HYSTERESIS)) or
                              (direction in {"sell", "cancel"} and price <= threshold * (1 - PRICE_RECOVERY_HYSTERESIS)))
                 cancelled = ((direction == "buy" and price <= threshold * (1 - PRICE_RECOVERY_HYSTERESIS)) or
@@ -298,7 +312,7 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             labels = {"breakout": "突破", "breakdown": "跌破", "near": "接近",
                       "rapid_move_5m": "5分钟异动", "volume_spike": "分钟放量"}
-            if kind == "near" and _action_direction(str(rule["message"] or "")):
+            if kind == "near":
                 live_plan = render_live_rule_message(str(rule["message"] or ""), available_cash, price)
                 message = (f"👀 已到达观察区，尚未形成操作确认；将继续检查站稳方向。"
                            f"{_evidence(rule, price, current_avg)}。计划：{live_plan}")
@@ -311,7 +325,7 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 "INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at) VALUES(?,?,?,?,?,?,?,?)",
                 (rule["id"], rule["code"], rule["name"], kind, rule["priority"], price, message, now),
             )
-            next_state = "observing" if kind == "near" and _action_direction(str(rule["message"] or "")) else "triggered"
+            next_state = "observing" if kind == "near" and _rule_direction(rule) else "triggered"
             conn.execute("""UPDATE watch_rules SET state=?,consecutive_hits=0,recovery_hits=0,
                          triggered_at=?,state_changed_at=? WHERE id=?""", (next_state, now, now, rule["id"]))
             event = {"id": cur.lastrowid, "code": rule["code"], "name": rule["name"], "event_type": kind,

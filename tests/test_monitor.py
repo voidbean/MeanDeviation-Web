@@ -122,6 +122,35 @@ class MonitorRuleTest(unittest.TestCase):
                 self.assertEqual(confirmed[0]["event_type"], "action_confirmed")
                 self.assertIn("建议买入/补仓", confirmed[0]["message"])
 
+    def test_near_observe_never_turns_negative_buy_wording_into_add(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "monitor.db")
+            with patch.object(db, "DB_PATH", path), patch.object(monitor, "DB_PATH", path):
+                db.init_db(); db.set_watch_enabled("000001", True); db.save_available_cash(50_000)
+                db.save_watch_plans([{
+                    "code": "000001", "name": "测试股", "rules": [{
+                        "type": "near", "price": 10, "confirmation_minutes": 1,
+                        "priority": "observe", "action": "add",
+                        "message": "到支撑附近仅观察是否止跌，不主动补仓",
+                    }],
+                }], "2026-08-19")
+                db.activate_watch_plans("2026-08-19")
+                conn = sqlite3.connect(path)
+                conn.execute(
+                    "INSERT INTO intraday_snapshots(code,date,time,price,open,high,low,vol,amount) VALUES(?,?,?,?,?,?,?,?,?)",
+                    ("000001", "2026-08-19", "10:01", 10.0, 10, 10.1, 9.9, 1000, 10),
+                ); conn.commit(); conn.close()
+
+                events = monitor.evaluate_watch_rules("2026-08-19")
+                self.assertEqual(len(events), 1)
+                self.assertIn("已到达观察区", events[0]["message"])
+                self.assertNotIn("建议买入", events[0]["message"])
+                self.assertNotIn("最多可买", events[0]["message"])
+                conn = sqlite3.connect(path)
+                action, state = conn.execute("SELECT action,state FROM watch_rules").fetchone()
+                conn.close()
+                self.assertEqual((action, state), ("observe", "triggered"))
+
 
 
 if __name__ == "__main__":

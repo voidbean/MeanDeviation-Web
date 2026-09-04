@@ -7,6 +7,8 @@ only its stale cash/lot wording when it is shown or triggered.
 """
 import re
 
+from core.watch_actions import OBSERVE_ONLY_PHRASES
+
 
 _BUY_WORDS = ("买入", "建仓", "补仓", "加仓")
 _CANCEL_WORDS = ("放弃买入", "暂停买入", "停止买入", "停止补仓", "不再买入", "不执行买入")
@@ -14,7 +16,9 @@ _CANCEL_WORDS = ("放弃买入", "暂停买入", "停止买入", "停止补仓",
 
 def is_buy_action(message: str) -> bool:
     text = message or ""
-    return any(word in text for word in _BUY_WORDS) and not any(word in text for word in _CANCEL_WORDS)
+    return (any(word in text for word in _BUY_WORDS)
+            and not any(word in text for word in _CANCEL_WORDS)
+            and not any(word in text for word in OBSERVE_ONLY_PHRASES))
 
 
 def _remove_stale_affordability(message: str) -> str:
