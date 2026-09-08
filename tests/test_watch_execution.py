@@ -62,6 +62,9 @@ class WatchExecutionTest(unittest.TestCase):
         self.assertEqual(event["last_execution_id"], second["execution_id"])
         with self.assertRaises(ValueError):
             self.fill(request_id="test-request-0000003")
+        event = db.get_recent_watch_events()[0]
+        self.assertEqual(event["holding"], 200)
+        self.assertEqual(event["sellable_without_tplus1"], event["holding"] - event["today_bought"])
 
     def test_duplicate_and_concurrent_retry_are_idempotent(self):
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -70,6 +73,30 @@ class WatchExecutionTest(unittest.TestCase):
         self.assertEqual(db.get_portfolio("000001")["quantity"], 100)
         with self.assertRaises(ValueError):
             self.fill(price=11)
+
+    def test_fill_defaults_target_and_fee_when_omitted(self):
+        body = self.payload(target_quantity=None, fee=None, request_id="test-request-default-001")
+        body.pop("target_quantity", None)
+        body.pop("fee", None)
+        result = submit_feedback(self.path, self.event_id, body)
+        self.assertEqual(result["execution_status"], "completed")
+        self.assertEqual(self.sql("SELECT target_quantity FROM watch_rules")[0][0], 100)
+        self.assertEqual(db.get_portfolio("000001")["quantity"], 100)
+
+    def test_sell_restricted_by_tplus1_buybacks(self):
+        self.make_plan(rules=[{"type":"breakdown","price":8,"action":"exit","message":"止损"}])
+        db.save_portfolio("000001", 10, 0, 0, 10, 100)
+        self.sql(
+            "INSERT INTO trade_log(code,name,trade_time,direction,price,volume,thought,emotion)"
+            " VALUES(?,?,?,?,?,?,?,'冷静')",
+            ("000001", "测试", self.day + " 09:30:00", "买入", 9.5, 80, "同日买入")
+        )
+        with self.assertRaises(ValueError) as exc:
+            self.fill(direction="卖出", request_id="test-request-sell-001", target_quantity=100, quantity=30)
+        self.assertIn("T+1", str(exc.exception))
+        allowed = self.fill(direction="卖出", request_id="test-request-sell-002", target_quantity=100, quantity=20)
+        self.assertEqual(allowed["execution_status"], "partial")
+        self.assertEqual(db.get_portfolio("000001")["quantity"], 80)
 
     def test_invalid_fill_rolls_back(self):
         for changes in ({"quantity":-1}, {"quantity":1.2}, {"quantity":True}, {"price":float('nan')},

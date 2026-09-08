@@ -10,6 +10,8 @@ import sqlite3
 import time
 from decimal import Decimal, ROUND_HALF_UP
 
+from core.db import get_tplus1_position_snapshot
+
 
 def _money(value):
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
@@ -95,10 +97,17 @@ def submit_feedback(db_path, event_id, body):
         if body.get("direction") != direction:
             raise ValueError("成交方向与计划动作不一致")
         quantity = _positive_int(body.get("quantity"))
-        target = _positive_int(body.get("target_quantity"))
+        if body.get("target_quantity") in {None, "", 0}:
+            target = row["target_quantity"] if row["target_quantity"] is not None else quantity
+        else:
+            target = _positive_int(body.get("target_quantity"))
         price = _number(body.get("price"))
         fee = _number(body.get("fee", 0), zero=True)
-        trade_time = dt.datetime.fromisoformat(str(body.get("trade_time", "")))
+        raw_trade_time = body.get("trade_time")
+        if raw_trade_time:
+            trade_time = dt.datetime.fromisoformat(str(raw_trade_time))
+        else:
+            trade_time = now
         if trade_time.tzinfo is not None or trade_time > now or trade_time.date().isoformat() != row["trade_date"]:
             raise ValueError("成交时间须为计划当日的本地时间，且不能在未来")
         filled = conn.execute("SELECT COALESCE(SUM(quantity),0) FROM watch_executions WHERE rule_id=? AND voided_at IS NULL",
@@ -114,8 +123,15 @@ def submit_feedback(db_path, event_id, body):
         cash = float(cash_row[0]) if cash_row else 0
         gross = Decimal(str(price)) * quantity
         cash_delta = _money(-(gross + Decimal(str(fee))) if direction == "买入" else gross - Decimal(str(fee)))
-        if direction == "卖出" and quantity > held:
-            raise ValueError("卖出股数超过账面持仓，请先核对持仓")
+        if direction == "卖出":
+            t1_snapshot = get_tplus1_position_snapshot(row["code"], row["trade_date"])
+            sellable = t1_snapshot["sellable_without_tplus1"]
+            if quantity > sellable:
+                raise ValueError(
+                    f"不能卖出当日买入部分（T+1），本次可卖 {sellable} 股（今日已买 {t1_snapshot['today_bought']} 股）"
+                )
+            if quantity > held:
+                raise ValueError("卖出股数超过账面持仓，请先核对持仓")
         if cash + cash_delta < -0.001:
             raise ValueError("账面现金不足，请先核对可用现金；不要重复记录已手动入账的成交")
         if direction == "买入" and row["action"] == "entry" and held > 0 and filled == 0:
@@ -203,4 +219,11 @@ def event_details(conn, event_id):
         FROM watch_events e LEFT JOIN watch_rules r ON r.id=e.rule_id
         LEFT JOIN watch_plans p ON p.id=r.plan_id WHERE e.id=?""", (event_id,))
     row = cur.fetchone()
-    return dict(zip([c[0] for c in cur.description], row)) if row else None
+    if not row:
+        return None
+    data = dict(zip([c[0] for c in cur.description], row))
+    t1_snapshot = get_tplus1_position_snapshot(data["code"], data["trade_date"])
+    data["holding"] = t1_snapshot["holding"]
+    data["today_bought"] = t1_snapshot["today_bought"]
+    data["sellable_without_tplus1"] = t1_snapshot["sellable_without_tplus1"]
+    return data

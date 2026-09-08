@@ -13,12 +13,10 @@
     <form id="watch-fill-form">
         <h5 id="watch-fill-title">记录实际成交</h5>
         <p class="small text-muted">不是下单。提交后同步持仓、现金与交易记录；已在其他位置入账的成交请勿重复提交。</p>
+        <div id="watch-fill-position" class="small text-muted mb-2">当前持仓：加载中…</div>
         <label class="form-label w-100">实际成交价<input name="price" type="number" min="0.0001" step="0.0001" required class="form-control"></label>
         <label class="form-label w-100">本次成交股数<input name="quantity" type="number" min="1" step="1" required class="form-control"></label>
-        <label class="form-label w-100">本动作计划总股数（含已成交）<input name="target_quantity" type="number" min="1" step="1" required class="form-control"></label>
-        <label class="form-label w-100">本次费用合计（元）<input name="fee" type="number" min="0" step="0.01" value="0" required class="form-control"></label>
-        <label class="form-label w-100">实际成交时间<input name="trade_time" type="datetime-local" required class="form-control"></label>
-        <label class="small d-block mb-2"><input name="confirmed" type="checkbox" required> 确认本次成交尚未更新到本系统持仓／现金</label>
+        <div id="watch-fill-amount" class="small text-muted mb-2">成交额：0.00 元</div>
         <div id="watch-fill-error" class="small text-danger" role="alert"></div>
         <div class="d-flex gap-2 mt-3"><button type="submit" class="btn btn-primary">确认记账</button>
         <button type="button" class="btn btn-secondary" id="watch-fill-cancel">取消</button></div>
@@ -120,16 +118,89 @@
     const dialog = document.getElementById('watch-fill-dialog');
     const fillForm = document.getElementById('watch-fill-form');
     let fillItem = null, requestId = null, pendingPayload = null;
+    let fillDirection = '买入';
+    let sellableForFill = 0;
     const newKey = () => crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) + '-fill';
+    const amountLabel = document.getElementById('watch-fill-amount');
+    const positionLabel = document.getElementById('watch-fill-position');
+    function refreshFillAmount() {
+        const price = Number(fillForm.elements.price.value || 0);
+        const qty = Number(fillForm.elements.quantity.value || 0);
+        const amount = price * qty;
+        amountLabel.textContent = Number.isFinite(amount) ? `成交额：${amount.toFixed(2)} 元` : '成交额：0.00 元';
+    }
+    function refreshFillSubmitState() {
+        const submit = fillForm.querySelector('[type=submit]');
+        if (fillDirection === '卖出') {
+            const qty = Number(fillForm.elements.quantity.value || 0);
+            if (sellableForFill <= 0) {
+                submit.textContent = '当前无可卖仓位（T+1）';
+                submit.disabled = true;
+                return;
+            }
+            if (!Number.isFinite(qty) || qty <= 0) {
+                submit.textContent = '请选择可卖数量';
+                submit.disabled = true;
+                return;
+            }
+            if (qty > sellableForFill) {
+                submit.textContent = `可卖上限 ${sellableForFill} 股`;
+                submit.disabled = true;
+                return;
+            }
+            submit.textContent = '确认记账';
+            submit.disabled = false;
+            return;
+        }
+        submit.textContent = '确认记账';
+        submit.disabled = false;
+    }
+    fillForm.elements.price.addEventListener('input', () => {
+        refreshFillAmount();
+        refreshFillSubmitState();
+    });
+    fillForm.elements.quantity.addEventListener('input', () => {
+        refreshFillAmount();
+        refreshFillSubmitState();
+    });
     function openFill(item) {
         fillItem = item; requestId = newKey(); pendingPayload = null; fillForm.reset();
         document.getElementById('watch-fill-error').textContent = '';
         const direction = ['entry','add'].includes(item.action) ? '买入' : '卖出';
+        const submit = fillForm.querySelector('[type=submit]');
+        const holding = Number(item.holding || 0);
+        const todayBought = Number(item.today_bought || 0);
+        const sellable = Math.max(0, Math.floor(Number(item.sellable_without_tplus1 || 0)));
+        fillDirection = direction;
+        sellableForFill = sellable;
+        if (direction === '卖出') {
+            fillForm.elements.quantity.max = sellable;
+            fillForm.elements.quantity.min = 1;
+            if (sellable > 0) {
+                fillForm.elements.quantity.value = '';
+                fillForm.elements.quantity.placeholder = `1~${sellable} 股`;
+                fillForm.elements.quantity.removeAttribute('readOnly');
+                positionLabel.textContent = `当前持仓 ${holding} 股（今日已买 ${todayBought} 股）；T+1 后可卖 ${sellable} 股`;
+            } else {
+                fillForm.elements.quantity.value = 0;
+                fillForm.elements.quantity.setAttribute('readOnly', 'readonly');
+                fillForm.elements.quantity.placeholder = '无可卖仓位';
+                positionLabel.textContent = `当前持仓 ${holding} 股（今日已买 ${todayBought} 股）；今日买入仓位未能 T+1 出售（可卖 0 股）`;
+                document.getElementById('watch-fill-error').textContent = '当前无可卖仓位（T+1）';
+            }
+        } else {
+            fillForm.elements.quantity.removeAttribute('max');
+            fillForm.elements.quantity.removeAttribute('readOnly');
+            fillForm.elements.quantity.min = 1;
+            fillForm.elements.quantity.value = 1;
+            sellableForFill = 0;
+            fillForm.elements.quantity.placeholder = '';
+            positionLabel.textContent = `当前持仓 ${holding} 股（今日已买 ${todayBought} 股）`;
+        }
         document.getElementById('watch-fill-title').textContent = (item.name || item.code) + ' · ' + direction + '成交';
         fillForm.elements.price.value = item.price;
-        fillForm.elements.trade_time.value = item.triggered_at.replace(' ', 'T').slice(0,16);
-        fillForm.elements.target_quantity.value = item.target_quantity || '';
-        fillForm.elements.target_quantity.readOnly = !!item.target_quantity;
+        refreshFillSubmitState();
+        refreshFillAmount();
         dialog.showModal();
     }
     document.getElementById('watch-fill-cancel').onclick = () => dialog.close();
@@ -140,9 +211,7 @@
         submit.disabled = true;
         pendingPayload = pendingPayload || {action:'fill', request_id:requestId,
             direction:['entry','add'].includes(fillItem.action) ? '买入' : '卖出',
-            price:Number(fillForm.elements.price.value), quantity:Number(fillForm.elements.quantity.value),
-            target_quantity:Number(fillForm.elements.target_quantity.value), fee:Number(fillForm.elements.fee.value),
-            trade_time:fillForm.elements.trade_time.value};
+            price:Number(fillForm.elements.price.value), quantity:Number(fillForm.elements.quantity.value)};
         try {
             const response = await fetch('/api/watch_events/' + fillItem.id + '/feedback', {
                 method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(pendingPayload)});

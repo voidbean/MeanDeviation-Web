@@ -151,6 +151,31 @@ class MonitorRuleTest(unittest.TestCase):
                 conn.close()
                 self.assertEqual((action, state), ("observe", "triggered"))
 
+    def test_exit_rules_blocked_when_no_sellable_tplus1_shares(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "monitor.db")
+            with patch.object(db, "DB_PATH", path), patch.object(monitor, "DB_PATH", path):
+                db.init_db(); db.set_watch_enabled("000001", True)
+                db.save_watch_plans([{
+                    "code":"000001", "name":"测试股", "rules":[{
+                        "type":"breakdown", "price":10, "priority":"risk", "action":"exit", "message":"T+1止损",
+                    }],
+                }], "2026-08-19")
+                db.activate_watch_plans("2026-08-19")
+                db.save_portfolio("000001", 10, 0, 0, 10, 100)
+                with sqlite3.connect(path) as conn:
+                    conn.execute(
+                        "INSERT INTO trade_log(code,name,trade_time,direction,price,volume,thought,emotion)"
+                        " VALUES(?,?,?,?,?,?,?,'冷静')",
+                        ("000001", "测试股", "2026-08-19 10:00:00", "买入", 10, 100, "同日买入"),
+                    )
+                    conn.execute(
+                        "INSERT INTO intraday_snapshots(code,date,time,price,open,high,low,vol,amount) VALUES(?,?,?,?,?,?,?,?,?)",
+                        ("000001", "2026-08-19", "10:01", 9.5, 10, 10.2, 9.4, 100, 1),
+                    )
+                    conn.commit()
+                self.assertEqual(monitor.evaluate_watch_rules("2026-08-19"), [])
+
 
 
 if __name__ == "__main__":

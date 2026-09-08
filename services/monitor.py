@@ -7,6 +7,7 @@ import threading
 
 from core.config import DB_PATH, logger
 from core.db import get_available_cash
+from core.db import get_tplus1_position_snapshot
 from services.watch_plan_context import render_live_rule_message
 from services.watch_features import build_watch_context, evaluate_conditions, shadow_summary
 from core.watch_execution import event_details
@@ -200,8 +201,13 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             if rule["snooze_until"]:
                 conn.execute("UPDATE watch_rules SET snooze_until=NULL WHERE id=?", (rule["id"],))
             held = conn.execute("SELECT COALESCE(quantity,0) FROM portfolio WHERE code=?", (rule["code"],)).fetchone()
-            if held and ((rule["action"] == "entry" and held[0] > 0 and rule["execution_status"] != "partial") or
-                         (rule["action"] in {"add", "reduce", "exit"} and not held[0])):
+            held = int(held[0]) if held else 0
+            tplus1 = get_tplus1_position_snapshot(rule["code"], trade_date)
+            if (rule["action"] == "entry" and held > 0 and rule["execution_status"] != "partial") or \
+                    (rule["action"] in {"add", "reduce", "exit"} and not held):
+                conn.execute("UPDATE watch_rules SET consecutive_hits=0,recovery_hits=0 WHERE id=?", (rule["id"],))
+                continue
+            if rule["action"] in {"reduce", "exit"} and tplus1["sellable_without_tplus1"] <= 0:
                 conn.execute("UPDATE watch_rules SET consecutive_hits=0,recovery_hits=0 WHERE id=?", (rule["id"],))
                 continue  # Known position is incompatible; never invent a fill.
             current_avg = _intraday_avg(conn, rule["code"], trade_date)

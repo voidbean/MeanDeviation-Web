@@ -1,6 +1,7 @@
 import sqlite3
 import time
 import json
+import datetime as _dt
 from core.watch_conditions import validate_conditions, describe_conditions
 from core.watch_actions import ACTIONS, OBSERVE_ONLY_PHRASES, infer_action
 
@@ -439,6 +440,29 @@ def get_available_cash() -> float:
     except Exception as e:
         logger.error("get_available_cash failed: %s", e)
         return 0.0
+
+
+def get_tplus1_position_snapshot(code: str, trade_date: str | None = None) -> dict:
+    """返回可用来判断 T+1 卖出能力的持仓快照。"""
+    trade_date = trade_date or _dt.date.today().isoformat()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        holding_row = conn.execute("SELECT COALESCE(quantity, 0) FROM portfolio WHERE code=?", (code,)).fetchone()
+        today_bought = conn.execute(
+            "SELECT COALESCE(SUM(volume), 0) FROM trade_log WHERE code=? AND direction='买入' AND substr(trade_time,1,10)=?",
+            (code, trade_date),
+        ).fetchone()[0]
+        conn.close()
+        holding = int(holding_row[0]) if holding_row else 0
+        today_bought = int(today_bought or 0)
+        return {
+            "holding": holding,
+            "today_bought": max(0, today_bought),
+            "sellable_without_tplus1": max(0, holding - today_bought),
+        }
+    except Exception as e:
+        logger.error("get_tplus1_position_snapshot failed for %s: %s", code, e)
+        return {"holding": 0, "today_bought": 0, "sellable_without_tplus1": 0}
 
 
 def save_available_cash(amount: float) -> None:
