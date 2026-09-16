@@ -2,6 +2,7 @@
 routes_main.py — 主应用路由
 包含：股票查询、批量分析、持仓更新、AI 分析（含 SSE 流式）、配置管理等路由。
 """
+from services.market_context import MARKET_GUIDANCE
 import asyncio
 import json
 import os
@@ -392,7 +393,7 @@ action须与message一致；首次建仓和补仓必须是独立动作，不能�
             json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
         )
         try:
-            raw = await asyncio.to_thread(call_ai_model, system_prompt, user_prompt)
+            raw = await asyncio.to_thread(call_ai_model, system_prompt + MARKET_GUIDANCE, user_prompt)
             logger.info(
                 "watch plan AI response provider=%s raw_type=%s raw_len=%d raw_preview=%r",
                 _cfg.AI_PROVIDER,

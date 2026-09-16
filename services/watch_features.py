@@ -8,6 +8,7 @@ import math
 import sqlite3
 
 from core.watch_conditions import CONDITION_LABELS
+from services.market_context import build_market_context
 from services.indicators import _compute_macd_from_closes
 
 
@@ -48,7 +49,7 @@ def build_watch_context(conn, code, trade_date, now=None):
     return {"daily": {"bars": bars[-30:], "as_of": rows[-1][0] if rows else None,
                       "volume_ratio_1d_20d": daily_ratio, "macd": macd,
                       "note": "仅已收盘日线；成交量单位股，旧数据未回填为null；MACD仅作背景，不是买卖硬门槛"},
-            "intraday": intraday}
+            "intraday": intraday, "market_context": build_market_context(conn, trade_date, now)}
 
 
 def intraday_context(conn, code, trade_date):

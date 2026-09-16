@@ -1,4 +1,5 @@
 """分钟级次日盯盘规则执行与 SSE 事件分发。"""
+from services.market_context import build_market_context, market_warning_text
 import datetime as dt
 import json
 import queue
@@ -337,7 +338,11 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             event = {"id": cur.lastrowid, "code": rule["code"], "name": rule["name"], "event_type": kind,
                      "priority": rule["priority"], "price": price, "message": message, "triggered_at": now}
             events.append(event)
+        market_note = market_warning_text(build_market_context(conn, trade_date)) if events else ""
         for event in events:
+            if market_note and event["event_type"] != "recovered":
+                event["message"] += market_note
+                conn.execute("UPDATE watch_events SET message=? WHERE id=?", (event["message"], event["id"]))
             # Event dictionaries intentionally do not expose rule_id; resolve through
             # the just-inserted persisted event rather than matching by stock code.
             rule_id = conn.execute("SELECT rule_id FROM watch_events WHERE id=?", (event["id"],)).fetchone()[0]

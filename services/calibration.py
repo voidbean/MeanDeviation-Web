@@ -1,4 +1,5 @@
 """09:35 / 10:00 / 13:05 / 14:35 盘中计划校准。"""
+from services.market_context import MARKET_GUIDANCE
 import datetime as dt
 import json
 import sqlite3
@@ -295,7 +296,7 @@ technical_context含已收盘日K、日线MACD、分钟量价序列与量能比�
 不得因量能或MACD不足而暂停风险退出提醒。
 {slot}校准重点：{focus}。
 """
-    raw = call_ai_model(system_prompt, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    raw = call_ai_model(system_prompt + MARKET_GUIDANCE, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     proposals = _parse_array(raw)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row

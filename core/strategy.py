@@ -63,7 +63,7 @@ _AI_SYSTEM_PREFIX = (
     "只有昨日已有持仓的股票，今日才可以做T（高卖低买）。"
     "在给出买卖建议时必须严格遵守此规则，不得建议投资者当日买入后同日卖出。\n"
     "【盘口资金读法】分析时请主动调用以下工具获取实时数据：\n"
-    "  - get_index_intraday：获取大盘白/黄线 + vol_ratio，判断当前是黄线在上（大资金主导）还是白线在上（个股情绪）\n"
+    "  - get_index_intraday：获取大盘白/黄线 + vol_ratio，比较指数现价与其分时成交均价；不是加权/不加权指数对比，不据此推断大小盘主导\n"
     "  - get_intraday_lines：获取个股白/黄线 + vol_ratio，识别放量智障/缩量/顶级诱多等形态\n"
     "  - get_moneyflow：获取近5日超大单/大单净流入，判断主力资金方向\n"
     "盘中分析必须先调用 get_index_intraday 确认大盘黄白线状态，再做个股判断。\n\n"
@@ -825,6 +825,9 @@ def build_review_prompt(trade: dict, stock_klines: list, index_klines: list) -> 
 
 def build_ai_prompt(result: dict, history: list, mode: str = "intraday", user_hint: str = "", index_data: dict = None, rousu_data: dict = None) -> str:
     """将股票数据 + 持仓参数 + 历史数据 + 大盘指数数据组装成分析 prompt。"""
+    import json
+    from services.market_context import load_market_context, MARKET_GUIDANCE
+    market_context = load_market_context(DB_PATH)
     history_text = "\n".join(
         f"  {r['date']}: 开{r.get('open', r['close'])} 收{r['close']} 高{r['high']} 低{r['low']} 均价{r['avg_price']}"
         for r in history
@@ -1074,6 +1077,10 @@ VWAP均价：{result['avg_price']}
 【近期历史数据（最近60日，按日期倒序）】
 {history_text if history_text else "暂无历史数据"}
 {rousu_block}
+【盘中指数量价与预计全天成交额】
+{json.dumps(market_context, ensure_ascii=False)}
+{MARKET_GUIDANCE}
+
 【大盘风向标（近20日，按日期倒序）】
 {index_text}
 
