@@ -19,6 +19,7 @@ import requests
 import tushare as ts
 
 from core import config, db
+from services.signals55 import analyze
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 PERIODS = {"D": "日线", "15min": "15分钟", "60min": "60分钟"}
@@ -198,7 +199,7 @@ def fetch_snapshot(code, period, now=None, query=safe_query):
                 "adjustment_anchor": api.anchor, "source": "tushare.pro_bar",
                 "fetched_at": now.isoformat(), "requested_end": end.isoformat(),
                 "history_only": True, "signals_enabled": False,
-                "note": "截至昨日的官方历史K线；前复权至最近返回交易日，价格与MA沿用SDK两位小数精度。分钟线保留接口原始开盘记录，未验证与交易软件的口径一致性；不产生交易信号。"}
+                "note": "截至昨日的官方历史K线；前复权至最近返回交易日，价格与MA沿用SDK两位小数精度。分钟线保留接口原始开盘记录；历史信号仅供研究，不产生实时通知或交易指令。"}
     except DataError:
         raise
     except Exception:
@@ -209,7 +210,13 @@ def get_snapshot(code, period, db_path=None):
     code, period = normalize(code, period)
     record = db.load_kline55_snapshot(code, period, db_path)
     payload = record.get("snapshot")
+    daily = (db.load_kline55_snapshot(code, "D", db_path).get("snapshot")
+             if payload and period == "60min" else None)
+    analysis = analyze(payload, daily)
+    if record.get("last_error"):
+        analysis["warnings"].append("最近一次行情刷新失败，当前分析基于上次成功的历史缓存。")
     return {"status": "cached" if payload else "missing", "snapshot": payload,
+            "analysis": analysis,
             "last_error": record.get("last_error"), "message": ERRORS.get(record.get("last_error"), ""),
             "retry_after": max(0, int(COOLDOWN - (time.time() - record.get("attempt_at", 0))))}
 
