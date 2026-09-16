@@ -37,8 +37,8 @@ SKILLS_DIR = _ROOT / "skills"
 TS_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 pro = None
 if TS_TOKEN:
-    ts.set_token(TS_TOKEN)
-    pro = ts.pro_api()
+    # Pass credentials in memory; set_token writes a plaintext ~/tk.csv.
+    pro = ts.pro_api(TS_TOKEN)
 
 # SQLite
 STOCK_NAME_CACHE: dict = {}

@@ -1310,3 +1310,47 @@ def load_ai_conversation(session_id: str) -> list:
     except Exception as e:
         logger.error("load_ai_conversation failed: %s", e)
     return []
+
+
+# Separate versioned, whole-series cache avoids mixing qfq anchors with existing
+# daily_records or intraday snapshots. Schema is also lazy for existing servers.
+def _init_kline55_cache(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS kline55_cache (
+        code TEXT NOT NULL, period TEXT NOT NULL,
+        snapshot_json TEXT, attempt_at REAL NOT NULL DEFAULT 0,
+        last_error TEXT, PRIMARY KEY(code, period))""")
+
+
+def load_kline55_snapshot(code, period, db_path=None):
+    with sqlite3.connect(db_path or DB_PATH, timeout=10) as conn:
+        _init_kline55_cache(conn)
+        row = conn.execute("SELECT snapshot_json,attempt_at,last_error FROM kline55_cache WHERE code=? AND period=?",
+                           (code, period)).fetchone()
+    if not row:
+        return {}
+    return {"snapshot": json.loads(row[0]) if row[0] else None, "attempt_at": row[1], "last_error": row[2]}
+
+
+def claim_kline55_refresh(code, period, cooldown, db_path=None):
+    with sqlite3.connect(db_path or DB_PATH, timeout=10) as conn:
+        _init_kline55_cache(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute("SELECT MAX(attempt_at) FROM kline55_cache").fetchone()[0]
+        now = time.time()
+        # Global persisted throttle also covers multiple workers and page reloads.
+        if latest is not None and now - latest < cooldown:
+            return False
+        conn.execute("""INSERT INTO kline55_cache(code,period,attempt_at) VALUES(?,?,?)
+            ON CONFLICT(code,period) DO UPDATE SET attempt_at=excluded.attempt_at""", (code, period, now))
+    return True
+
+
+def save_kline55_snapshot(code, period, snapshot, error, db_path=None):
+    with sqlite3.connect(db_path or DB_PATH, timeout=10) as conn:
+        _init_kline55_cache(conn)
+        if snapshot is not None:
+            payload = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
+            conn.execute("UPDATE kline55_cache SET snapshot_json=?,last_error=NULL WHERE code=? AND period=?",
+                         (payload, code, period))
+        else:
+            conn.execute("UPDATE kline55_cache SET last_error=? WHERE code=? AND period=?", (error, code, period))

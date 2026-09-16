@@ -28,7 +28,9 @@ templates = Jinja2Templates(directory="templates")
 import routes.main
 import routes.sector
 import routes.review
+import routes.kline
 
 routes.main.register(app, templates)
 routes.sector.register(app, templates)
 routes.review.register(app, templates)
+routes.kline.register(app, templates)

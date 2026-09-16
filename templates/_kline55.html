@@ -1,0 +1,92 @@
+{% if result and result.status == 'success' %}
+<div class="card shadow-sm mt-3" id="kline55-panel" data-code="{{ result.code }}">
+    <div class="card-header bg-white d-flex flex-wrap gap-2 justify-content-between align-items-center">
+        <h6 class="mb-0">多周期55线 <span class="badge bg-secondary">研究预览</span></h6>
+        <div class="d-flex gap-2">
+            <select id="kline55-period" class="form-select form-select-sm" aria-label="55线周期">
+                <option value="D">日线</option><option value="60min">60分钟</option><option value="15min">15分钟</option>
+            </select>
+            <button id="kline55-refresh" class="btn btn-sm btn-outline-primary text-nowrap" type="button">获取 / 更新</button>
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="small text-muted mb-2">仅历史数据，最晚截至昨日；MA由Tushare SDK计算。暂不用于实时买卖通知。首次使用请按周期获取，连续请求至少间隔90秒。</p>
+        <div id="kline55-status" class="small mb-2" role="status" aria-live="polite">正在读取本地缓存…</div>
+        <div id="kline55-summary" class="small mb-2"></div>
+        <div id="kline55-chart" style="width:100%;height:340px;display:none" aria-label="历史K线与MA55及MA233"></div>
+        <div id="kline55-note" class="small text-muted mt-2"></div>
+    </div>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const panel = document.getElementById('kline55-panel');
+    if (!panel) return;
+    const select = document.getElementById('kline55-period');
+    const button = document.getElementById('kline55-refresh');
+    const status = document.getElementById('kline55-status');
+    const summary = document.getElementById('kline55-summary');
+    const note = document.getElementById('kline55-note');
+    const chartDom = document.getElementById('kline55-chart');
+    let chart = null, requestId = 0, refreshing = false;
+    const value = v => v == null ? '数据不足' : Number(v).toFixed(2);
+    const dateLabel = v => String(v).replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
+    function render(data) {
+        const snapshot = data.snapshot;
+        if (!snapshot) {
+            chartDom.style.display = 'none'; summary.textContent = ''; note.textContent = '';
+            status.textContent = data.message || '暂无本地缓存。点击“获取 / 更新”读取此周期历史数据。';
+            return;
+        }
+        status.textContent = (data.message ? data.message + ' 当前展示旧缓存。' : '历史缓存已就绪。') +
+            ' 数据截至 ' + dateLabel(snapshot.as_of) + '；获取时间 ' + snapshot.fetched_at.slice(0, 19).replace('T', ' ') + '（北京时间）。不是当前实时价格。';
+        const last = snapshot.bars[snapshot.bars.length - 1];
+        summary.textContent = snapshot.label + ' · ' + snapshot.samples + '根 · 前复权基准 ' + dateLabel(snapshot.adjustment_anchor) +
+            ' · MA55 ' + value(last.ma55) + ' · MA233 ' + value(last.ma233);
+        note.textContent = snapshot.note;
+        if (typeof echarts === 'undefined') { note.textContent += ' 图表组件未加载，均线数值仍可查看。'; return; }
+        chartDom.style.display = 'block';
+        chart = chart || echarts.init(chartDom, null, {renderer: 'svg'});
+        const bars = snapshot.bars.slice(-300);
+        chart.setOption({
+            animation: false,
+            legend: {data: ['K线', 'MA55', 'MA233'], top: 0},
+            tooltip: {trigger: 'axis'},
+            grid: {left: 55, right: 15, top: 35, bottom: 65},
+            xAxis: {type: 'category', data: bars.map(b => dateLabel(b.time)), boundaryGap: true},
+            yAxis: {scale: true, type: 'value'},
+            dataZoom: [{type: 'inside', start: 65, end: 100}, {type: 'slider', bottom: 5, start: 65, end: 100}],
+            series: [
+                {name: 'K线', type: 'candlestick', data: bars.map(b => [b.open, b.close, b.low, b.high]),
+                 itemStyle: {color: '#dc3545', color0: '#198754', borderColor: '#dc3545', borderColor0: '#198754'}},
+                {name: 'MA55', type: 'line', showSymbol: false, connectNulls: false, data: bars.map(b => b.ma55), itemStyle: {color: '#df9700'}, lineStyle: {color: '#df9700'}},
+                {name: 'MA233', type: 'line', showSymbol: false, connectNulls: false, data: bars.map(b => b.ma233), itemStyle: {color: '#7652b4'}, lineStyle: {color: '#7652b4'}}
+            ]
+        }, true);
+        chart.resize();
+    }
+    async function load(refresh) {
+        if (refreshing) return;
+        const id = ++requestId;
+        if (refresh) { refreshing = true; button.disabled = true; select.disabled = true; }
+        else { chartDom.style.display = 'none'; summary.textContent = ''; note.textContent = ''; }
+        status.textContent = refresh ? '正在获取官方K线与复权因子，请稍候…' : '正在读取本地缓存…';
+        try {
+            const params = new URLSearchParams({code: panel.dataset.code, period: select.value});
+            const response = await fetch('/api/kline55' + (refresh ? '/refresh' : '') + '?' + params,
+                {method: refresh ? 'POST' : 'GET'});
+            const data = await response.json();
+            if (id !== requestId) return;
+            render(data);
+        } catch (_) {
+            if (id === requestId) status.textContent = '读取失败，已显示的图表可能是旧数据，请稍后重试。';
+        } finally {
+            if (refresh) { refreshing = false; button.disabled = false; select.disabled = false; }
+        }
+    }
+    select.addEventListener('change', () => load(false));
+    button.addEventListener('click', () => load(true));
+    window.addEventListener('resize', () => { if (chart) chart.resize(); });
+    load(false);
+});
+</script>
+{% endif %}
