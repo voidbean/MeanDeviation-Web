@@ -19,7 +19,14 @@ async def lifespan(app: FastAPI):
     calibration_thread.start()
     logger.info("lifespan: 后台分时快照线程已启动")
     logger.info("lifespan: 盘中校准线程已启动")
-    yield
+    from services.live55 import background_loop
+    live55_stop = threading.Event()
+    live55_thread = threading.Thread(target=background_loop, args=(live55_stop,), daemon=True, name="ma55-monitor")
+    live55_thread.start()
+    try:
+        yield
+    finally:
+        live55_stop.set()
 
 
 app = FastAPI(lifespan=lifespan)

@@ -299,108 +299,63 @@ def fetch_valuation_one(pro, code: str, limit: int = 10) -> int:
 
 # ── 核心逻辑 ─────────────────────────────────────────────────────────────────
 def get_etf_adj_factors(pro, ts_code: str, limit: int) -> dict[str, float]:
-    """
-    拉取 ETF 复权因子表，返回 {trade_date_str: adj_factor} 字典。
-    前复权计算：price_qfq = price_raw / adj_factor * latest_adj_factor
-    若接口失败则返回空字典（调用方降级为不复权）。
-
-    Tushare fund_daily 不支持 adj 参数，需手动用 fund_adj 复权因子计算前复权价格。
-    """
-    try:
-        df = pro.fund_adj(ts_code=ts_code, limit=limit)
-        if df is None or df.empty:
-            return {}
-        return {str(row["trade_date"]): float(row["adj_factor"]) for _, row in df.iterrows()}
-    except Exception as e:
-        logger.warning("fund_adj %s 失败，降级为不复权：%s", ts_code, e)
-        return {}
+    """缺失因子必须失败，绝不静默切换为不复权。"""
+    df = pro.fund_adj(ts_code=ts_code, limit=limit)
+    if df is None or df.empty:
+        raise ValueError("复权因子缺失")
+    return {str(row["trade_date"]): float(row["adj_factor"]) for _, row in df.iterrows()}
 
 
 def fetch_one(pro, conn: sqlite3.Connection, code: str, limit: int = FETCH_DAYS) -> int:
-    """
-    拉取单只股票或 ETF 的历史日线数据并写入 DB。
-    - 个股：pro.daily(adj='qfq') 直接返回前复权价格
-    - ETF：fund_daily 不支持 adj，手动用 fund_adj 复权因子换算前复权价格
-    返回成功写入的记录条数，失败时抛出异常。
-    """
+    """整只股票原子重建前复权价格；覆盖所有已存日期，避免混合复权基准。"""
+    import math
     ts_code = to_ts_code(code)
     name = get_cached_name(conn, code)
-    use_fund_api = is_etf(ts_code)
-    api_name = "fund_daily" if use_fund_api else "daily"
-
-    logger.info("拉取 %s (%s) via %s，limit=%d", ts_code, name or "未知", api_name, limit)
-    if use_fund_api:
-        df = pro.fund_daily(ts_code=ts_code, limit=limit)
-        # fund_daily 不支持 adj 参数，手动拉取复权因子做前复权换算
-        adj_factors = get_etf_adj_factors(pro, ts_code, limit)
-        latest_adj = max(adj_factors.values()) if adj_factors else 1.0
-        logger.info("%s 复权因子条数=%d，最新因子=%.4f", ts_code, len(adj_factors), latest_adj)
-    else:
-        df = pro.daily(ts_code=ts_code, limit=limit, adj='qfq')
-        adj_factors = {}
-        latest_adj = 1.0
-
+    existing = {r[0].replace("-", "") for r in conn.execute(
+        "SELECT date FROM daily_records WHERE code=?", (code,))}
+    params = {"ts_code": ts_code, "limit": max(limit, len(existing) + limit)}
+    if params["limit"] >= 6000:
+        raise ValueError("历史超过单次安全上限，请分段迁移")
+    use_fund = is_etf(ts_code)
+    df = getattr(pro, "fund_daily" if use_fund else "daily")(**params)
     if df is None or df.empty:
-        logger.warning("%s 返回空数据，可能停牌或代码有误", ts_code)
         return 0
-
-    count = 0
+    dates = [str(v) for v in df["trade_date"]]
+    if len(set(dates)) != len(dates) or not existing.issubset(dates):
+        raise ValueError("返回日线不能覆盖全部旧日期，取消写入，避免混合复权")
+    if "ts_code" in df and set(df["ts_code"]) != {ts_code}:
+        raise ValueError("股票代码不一致")
+    factors = getattr(pro, "fund_adj" if use_fund else "adj_factor")(
+        ts_code=ts_code, start_date=min(dates), end_date=max(dates))
+    if factors is None or factors.empty or factors["trade_date"].duplicated().any():
+        raise ValueError("复权因子缺失或重复")
+    if "ts_code" in factors and set(factors["ts_code"]) != {ts_code}:
+        raise ValueError("复权因子股票代码不一致")
+    mapping = {str(r["trade_date"]): float(r["adj_factor"]) for _, r in factors.iterrows()}
+    if not set(dates).issubset(mapping) or not all(math.isfinite(v) and v > 0 for v in mapping.values()):
+        raise ValueError("复权因子覆盖不足或无效")
+    anchor = mapping[max(dates)]  # 按日期取基准，不能用最大的因子。
+    records = []
     for _, row in df.iterrows():
-        try:
-            trade_date = str(row["trade_date"])
-            close_raw = float(row["close"])
-            high_raw  = float(row["high"])
-            low_raw   = float(row["low"])
-            open_raw  = float(row.get("open", row["close"]) or row["close"])
-            amount = float(row.get("amount", 0) or 0)  # 千元
-            vol    = float(row.get("vol", 0) or 0)     # 手
-
-            # ETF 前复权换算：price_qfq = price_raw * (factor / latest_adj)
-            # 逻辑：除权后 latest_adj 变大，历史 factor 较小，历史价格等比缩小，
-            # 使历史价格与当前价格处于同一尺度。
-            # 例：1拆3后 latest_adj=3，除权前 factor=1，历史价格 × (1/3) 对齐现价。
-            if use_fund_api and adj_factors:
-                factor = adj_factors.get(trade_date, latest_adj)
-                ratio  = factor / latest_adj
-                close = round(close_raw * ratio, 4)
-                high  = round(high_raw  * ratio, 4)
-                low   = round(low_raw   * ratio, 4)
-                open_ = round(open_raw  * ratio, 4)
-            else:
-                close, high, low, open_ = close_raw, high_raw, low_raw, open_raw
-
-            # 均价换算：千元→元，手→股（用原始价格计算，再同步复权）
-            if vol > 0 and amount > 0:
-                avg_price_raw = (amount * 1000) / (vol * 100)
-                if use_fund_api and adj_factors:
-                    factor = adj_factors.get(trade_date, latest_adj)
-                    avg_price = round(avg_price_raw * (factor / latest_adj), 4)
-                else:
-                    avg_price = round(avg_price_raw, 4)
-            else:
-                avg_price = close  # 停牌日 fallback
-
-            upsert_daily_record(
-                conn,
-                date=fmt_date(trade_date),
-                code=code,
-                name=name,
-                close=close,
-                high=high,
-                low=low,
-                avg_price=avg_price,
-                amount=round(amount, 2),
-                open=open_,
-                vol=vol * 100 if row.get("vol") is not None else None,
-            )
-            count += 1
-        except Exception as e:
-            logger.warning("%s 某行数据处理失败：%s", ts_code, e)
-            continue
-
-    conn.commit()
-    logger.info("%s 写入 %d 条记录", ts_code, count)
-    return count
+        day = str(row["trade_date"])
+        ratio = mapping[day] / anchor
+        o, h, l, c = [float(row[k]) * ratio for k in ("open", "high", "low", "close")]
+        amount, vol = float(row["amount"]), float(row["vol"])
+        if not all(math.isfinite(v) and v > 0 for v in (o, h, l, c)) or not (l <= min(o,c) <= max(o,c) <= h):
+            raise ValueError("日线价格无效")
+        if not all(math.isfinite(v) and v >= 0 for v in (amount, vol)):
+            raise ValueError("日线成交量额无效")
+        avg = amount * 10 / vol * ratio if amount > 0 and vol > 0 else c
+        records.append((fmt_date(day), code, name, c, h, l, avg, amount, o, vol * 100))
+    with conn:
+        # A changed adjustment anchor invalidates previously stored price indicators.
+        price_indicators = [col for col, _ in FACTOR_FIELDS if col not in
+                            {'pe', 'pb', 'turnover_rate', 'updays', 'downdays'}]
+        conn.execute('UPDATE daily_records SET ' + ','.join(col + '=NULL' for col in price_indicators) +
+                     ' WHERE code=?', (code,))
+        for record in records:
+            upsert_daily_record(conn, *record)
+    return len(records)
 
 
 def fetch_index_one(pro, conn: sqlite3.Connection, ts_code: str, name: str, limit: int = FETCH_DAYS) -> int:
@@ -495,10 +450,15 @@ def main() -> None:
         print("提示：请通过 --codes 参数或 .env 中的 COMMON_STOCK_CODES 指定股票代码")
         return
 
-    ts.set_token(token)
-    pro = ts.pro_api()
+    pro = ts.pro_api(token)
 
     conn = sqlite3.connect(DB_PATH)
+    # SQLite backup API includes committed WAL data; backup must precede any migration.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='daily_records'").fetchone():
+        backup_path = DB_PATH + ".qfq-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".db"
+        with sqlite3.connect(backup_path) as backup:
+            conn.backup(backup)
+        print("已备份历史数据库，接下来逐股原子重建前复权价格。")
     try:
         ensure_tables(conn)
 

@@ -407,7 +407,7 @@ def finalize_watch_event_outcomes(trade_date: str | None = None) -> int:
     trade_date = trade_date or dt.date.today().isoformat()
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id,code,price,substr(triggered_at,12,5) FROM watch_events WHERE date(triggered_at)=? AND evaluated_at IS NULL",
+        "SELECT id,code,price,substr(triggered_at,12,5) FROM watch_events WHERE date(triggered_at)=? AND evaluated_at IS NULL AND event_type != 'ma55_signal'",
         (trade_date,),
     ).fetchall()
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")

@@ -1254,9 +1254,11 @@ def get_recent_watch_events(limit: int = 50, after_id: int = 0) -> list[dict]:
     rows = conn.execute(
         """SELECT id,code,name,event_type,priority,price,message,triggered_at,read_at,
                   max_gain_pct,max_drawdown_pct,evaluated_at
-           FROM watch_events WHERE id > ? ORDER BY id DESC LIMIT ?""",
+           FROM watch_events WHERE id > ? ORDER BY id """ + ("ASC" if after_id else "DESC") + " LIMIT ?",
         (after_id, limit),
     ).fetchall()
+    if after_id:
+        rows.reverse()
     result = [event_details(conn, row[0]) for row in rows]
     conn.close()
     return result
@@ -1354,3 +1356,135 @@ def save_kline55_snapshot(code, period, snapshot, error, db_path=None):
                          (payload, code, period))
         else:
             conn.execute("UPDATE kline55_cache SET last_error=? WHERE code=? AND period=?", (error, code, period))
+
+
+# MA55 live monitoring is opt-in and independent of executable watch plans.
+def _init_live55(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS ma55_subscriptions (
+            code TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+            enabled_at TEXT NOT NULL, checked_at REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT '等待首次采集', context_json TEXT,
+            watermark TEXT);
+        CREATE TABLE IF NOT EXISTS ma55_raw_bars (
+            code TEXT NOT NULL, period TEXT NOT NULL, time TEXT NOT NULL,
+            payload_json TEXT NOT NULL, source TEXT NOT NULL, fetched_at REAL NOT NULL,
+            PRIMARY KEY(code,period,time));
+        CREATE TABLE IF NOT EXISTS ma55_event_keys (
+            signal_key TEXT PRIMARY KEY, event_id INTEGER NOT NULL, payload_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ma55_worker_lease (
+            id INTEGER PRIMARY KEY CHECK(id=1), until_ts REAL NOT NULL);
+    """)
+
+
+def live55_subscription(code=None, enabled=None):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        if code is not None and enabled is not None:
+            # Re-enabling establishes a new baseline; previously emitted keys survive.
+            conn.execute("""INSERT INTO ma55_subscriptions(code,enabled,enabled_at) VALUES(?,?,?)
+                ON CONFLICT(code) DO UPDATE SET enabled=excluded.enabled,
+                status=CASE WHEN ma55_subscriptions.enabled != excluded.enabled
+                    THEN CASE WHEN excluded.enabled=1 THEN '等待首次采集' ELSE '已停止' END ELSE status END,
+                enabled_at=CASE WHEN ma55_subscriptions.enabled != excluded.enabled
+                    THEN excluded.enabled_at ELSE ma55_subscriptions.enabled_at END,
+                watermark=CASE WHEN ma55_subscriptions.enabled != excluded.enabled
+                    THEN NULL ELSE watermark END""",
+                (code, int(enabled), _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('SELECT * FROM ma55_subscriptions' + (' WHERE code=?' if code else ''),
+                            (code,) if code else ()).fetchall()
+        return [dict(r) for r in rows]
+
+
+def live55_claim(now, lease_seconds=180):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT until_ts FROM ma55_worker_lease WHERE id=1').fetchone()
+        if row and row[0] > now:
+            return None
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM ma55_subscriptions WHERE enabled=1 ORDER BY checked_at,code LIMIT 1').fetchone()
+        if not row:
+            return None
+        conn.execute('INSERT OR REPLACE INTO ma55_worker_lease VALUES(1,?)', (now + lease_seconds,))
+        conn.execute('UPDATE ma55_subscriptions SET checked_at=? WHERE code=?', (now, row['code']))
+        return dict(row)
+
+
+def live55_save_bars(code, period, bars, source, replace_range=None):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        if replace_range:
+            conn.execute('DELETE FROM ma55_raw_bars WHERE code=? AND period=? AND time>=? AND time<=?',
+                         (code, period, *replace_range))
+        conn.executemany('''INSERT INTO ma55_raw_bars VALUES(?,?,?,?,?,?)
+            ON CONFLICT(code,period,time) DO UPDATE SET payload_json=excluded.payload_json,
+            source=excluded.source,fetched_at=excluded.fetched_at''',
+            [(code, period, b['time'], json.dumps(b, allow_nan=False), source, time.time()) for b in bars])
+
+
+def live55_load_bars(code, period):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        return [json.loads(r[0]) for r in conn.execute('''SELECT payload_json FROM ma55_raw_bars
+            WHERE code=? AND period=? ORDER BY time''', (code, period))]
+
+
+def live55_update(code, status, context=None):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        if context is None:
+            conn.execute('UPDATE ma55_subscriptions SET status=? WHERE code=? AND enabled=1', (status, code))
+        else:
+            conn.execute('UPDATE ma55_subscriptions SET status=?,context_json=? WHERE code=? AND enabled=1',
+                         (status, json.dumps(context, allow_nan=False), code))
+
+
+def live55_record(code, analysis, now):
+    """Commit dedup key + notification + watermark in ONE transaction, then publish.
+
+    First valid evaluation only establishes baseline. Stale/gap-recovered signals
+    are not replayed; a same-candle duplicate never receives a new event ID.
+    """
+    emitted = []
+    as_of = analysis.get('as_of')
+    if not as_of:
+        return emitted
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        conn.execute('BEGIN IMMEDIATE')
+        sub = conn.execute('SELECT enabled,watermark,enabled_at FROM ma55_subscriptions WHERE code=?', (code,)).fetchone()
+        if not sub or not sub[0]:
+            return emitted
+        previous = sub[1]
+        if previous and as_of > previous:
+            for event in analysis.get('events', []):
+                if event['time'] != as_of or event['time'] <= sub[2]:
+                    continue
+                stamp = _dt.datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=now.tzinfo)
+                if not 0 <= (now - stamp).total_seconds() <= 600:
+                    continue
+                if conn.execute('SELECT 1 FROM ma55_event_keys WHERE signal_key=?', (event['id'],)).fetchone():
+                    continue
+                message = event['title'] + ' · K线 ' + event['time'] + ' · 已收线形态匹配，仅供观察，不是买卖指令。'
+                # rule_id=0 is reserved for non-executable strategy observations.
+                cur = conn.execute('''INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at)
+                    VALUES(0,?,'','ma55_signal','normal',?,?,?)''',
+                    (code, event['close'], message, now.strftime('%Y-%m-%d %H:%M:%S')))
+                conn.execute('INSERT INTO ma55_event_keys VALUES(?,?,?)',
+                             (event['id'], cur.lastrowid, json.dumps(event, ensure_ascii=False, allow_nan=False)))
+                emitted.append(dict(id=cur.lastrowid, code=code, name='', event_type='ma55_signal',
+                    priority='normal', price=event['close'], message=message,
+                    triggered_at=now.strftime('%Y-%m-%d %H:%M:%S'), strategy_source='ma55',
+                    execution_status='observe', action=None))
+        if previous is None or as_of > previous:
+            conn.execute('UPDATE ma55_subscriptions SET watermark=? WHERE code=?', (as_of, code))
+    return emitted
+
+
+def live55_release(next_at):
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        _init_live55(conn)
+        conn.execute('UPDATE ma55_worker_lease SET until_ts=? WHERE id=1', (next_at,))

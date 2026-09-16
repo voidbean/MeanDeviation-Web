@@ -85,7 +85,7 @@ def _fetch_and_save_intraday_snapshots() -> None:
         conn = sqlite3.connect(DB_PATH)
         try:
             import datetime as _dt
-            cutoff = (_dt.date.today() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+            cutoff = (_dt.date.today() - _dt.timedelta(days=90)).strftime("%Y-%m-%d")
             conn.execute("DELETE FROM intraday_snapshots WHERE date < ?", (cutoff,))
             conn.commit()
         finally:

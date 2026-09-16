@@ -68,6 +68,9 @@ def submit_feedback(db_path, event_id, body):
                     raise ValueError("相同请求编号不能用于不同成交")
                 return {"ok": True, "execution_id": existing["id"], "duplicate": True,
                         "voided": existing["voided_at"] is not None}
+        event_kind = conn.execute('SELECT event_type FROM watch_events WHERE id=?', (event_id,)).fetchone()
+        if event_kind and event_kind[0] == 'ma55_signal':
+            raise ValueError('55线形态观察不关联交易计划，不能记录成交或修改交易动作')
         row = conn.execute("""SELECT r.*,p.code,p.name,p.trade_date,e.event_type FROM watch_events e
             JOIN watch_rules r ON r.id=e.rule_id JOIN watch_plans p ON p.id=r.plan_id WHERE e.id=?""", (event_id,)).fetchone()
         if not row:
@@ -222,6 +225,10 @@ def event_details(conn, event_id):
     if not row:
         return None
     data = dict(zip([c[0] for c in cur.description], row))
+    if data['event_type'] == 'ma55_signal':
+        data.update(strategy_source='ma55', execution_status='observe', action=None,
+                    holding=None, today_bought=None, sellable_without_tplus1=None)
+        return data
     t1_snapshot = get_tplus1_position_snapshot(data["code"], data["trade_date"])
     data["holding"] = t1_snapshot["holding"]
     data["today_bought"] = t1_snapshot["today_bought"]

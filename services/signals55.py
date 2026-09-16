@@ -53,7 +53,7 @@ def _time(bar, period):
     return dt.datetime.strptime(bar["time"], fmt)
 
 
-def _prepare(snapshot, period, today):
+def _prepare(snapshot, period, today, closed_before=None):
     if not isinstance(snapshot, dict) or snapshot.get("period") != period:
         raise ValueError("周期或缓存结构无效")
     if snapshot.get("adjustment") != "qfq" or not snapshot.get("adjustment_anchor"):
@@ -67,7 +67,7 @@ def _prepare(snapshot, period, today):
         if prev is not None and stamp <= prev:
             raise ValueError("K线时间重复或未按升序排列")
         prev = stamp
-        if stamp.date() >= today:
+        if stamp.date() >= today and not (period == "60min" and closed_before is not None and stamp <= closed_before):
             continue  # Today's or future bars never count as historical confirmation.
         b = dict(raw)
         for field in ("open", "high", "low", "close"):
@@ -209,7 +209,7 @@ def _levels(bars, i, setup, continuous_count):
             "invalidation": "跌穿容许深度、连续两根收盘低于MA55、日线背景失效或数据中断时，本轮形态失效；不是自动止损单。"}
 
 
-def analyze(snapshot, daily_snapshot=None, now=None, rules=DEFAULT_RULES):
+def analyze(snapshot, daily_snapshot=None, now=None, rules=DEFAULT_RULES, *, closed_before=None):
     """Pure prefix replay. Only D NEW_TREND and D→60min PULLBACK_ENTRY in v1."""
     period = snapshot.get("period") if isinstance(snapshot, dict) else None
     result = _base(period, rules)
@@ -220,7 +220,12 @@ def analyze(snapshot, daily_snapshot=None, now=None, rules=DEFAULT_RULES):
     now = now or dt.datetime.now(TZ)
     today = now.astimezone(TZ).date() if now.tzinfo else now.date()
     try:
-        bars = _prepare(snapshot, period, today)
+        if closed_before is not None:
+            local_now = now.astimezone(TZ).replace(tzinfo=None) if now.tzinfo else now
+            if closed_before.tzinfo:
+                closed_before = closed_before.astimezone(TZ).replace(tzinfo=None)
+            closed_before = min(closed_before, local_now)
+        bars = _prepare(snapshot, period, today, closed_before)
         if not bars:
             return result
         result["as_of"] = bars[-1]["time"]

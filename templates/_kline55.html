@@ -10,7 +10,13 @@
         </div>
     </div>
     <div class="card-body">
-        <p class="small text-muted mb-2">仅历史数据，最晚截至昨日；MA由Tushare SDK计算。暂不用于实时买卖通知。首次使用请按周期获取，连续请求至少间隔90秒。</p>
+        <p class="small text-muted mb-2">下方图表为历史数据，最晚截至昨日；MA由Tushare SDK计算。实时监控独立采集和校验，不使用图表缓存触发通知。首次使用请按周期获取，连续请求至少间隔90秒。</p>
+        <div class="border border-warning rounded p-2 mb-3">
+            <span class="badge bg-warning text-dark">【55线】实时形态监控</span>
+            <button id="kline55-monitor-toggle" type="button" class="btn btn-sm btn-outline-primary ms-2" disabled>读取中…</button>
+            <div id="kline55-monitor-status" class="small mt-2" role="status"></div>
+            <div class="small text-muted">日线→60分钟回踩转强；首次建立基线不补推旧信号。标准K线缺失、未收线、复权未就绪时仅等待。通知只供观察，不自动交易。</div>
+        </div>
         <div id="kline55-status" class="small mb-2" role="status" aria-live="polite">正在读取本地缓存…</div>
         <div id="kline55-summary" class="small mb-2"></div>
         <section id="kline55-analysis" class="border rounded p-3 mb-2" style="display:none" aria-label="55线历史信号分析">
@@ -150,6 +156,31 @@ document.addEventListener('DOMContentLoaded', function () {
     button.addEventListener('click', () => load(true));
     window.addEventListener('resize', () => { if (chart) chart.resize(); });
     load(false);
+    const monitorButton = document.getElementById('kline55-monitor-toggle');
+    const monitorStatus = document.getElementById('kline55-monitor-status');
+    let monitorEnabled = false, monitorBusy = false;
+    async function monitor55(toggle = false) {
+        if (monitorBusy) return;
+        monitorBusy = true;
+        monitorButton.disabled = true;
+        try {
+            const params = new URLSearchParams({code: panel.dataset.code});
+            if (toggle) params.set('enabled', String(!monitorEnabled));
+            const response = await fetch('/api/kline55/monitor?' + params, {method: toggle ? 'POST' : 'GET'});
+            const data = await response.json();
+            if (!response.ok) throw new Error();
+            monitorEnabled = Boolean(data.enabled);
+            monitorStatus.textContent = data.status || '等待采集';
+            monitorButton.textContent = monitorEnabled ? '停止监控' : '开启监控';
+        } catch (_) {
+            monitorStatus.textContent = '监控状态读取失败，请稍后重试';
+            monitorButton.textContent = '重新读取';
+        } finally { monitorBusy = false; monitorButton.disabled = false; }
+    }
+    monitorButton.addEventListener('click', () => monitor55(monitorButton.textContent !== '重新读取'));
+    monitor55();
+    const monitorTimer = setInterval(() => { if (!document.hidden) monitor55(); }, 30000);
+    window.addEventListener('pagehide', () => clearInterval(monitorTimer), {once:true});
 });
 </script>
 {% endif %}

@@ -186,7 +186,8 @@ class RouteTemplateTest(unittest.TestCase):
         self.assertNotIn('kline55-panel', template.render(result=None))
         html = template.render(result={'code': '600000', 'status': 'success'})
         self.assertIn('kline55-panel', html)
-        self.assertIn('暂不用于实时买卖通知', html)
+        self.assertIn('不使用图表缓存触发通知', html)
+        self.assertIn('【55线】实时形态监控', html)
         self.assertIn('规则来源：55线', html)
         env.get_template('index.html')  # syntax check the integrated page too
 

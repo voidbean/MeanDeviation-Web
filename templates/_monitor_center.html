@@ -67,6 +67,10 @@
             (item.snooze_until ? ` · 暂不执行至 ${item.snooze_until}` : '') +
             (item.ignore_until_recovery ? ' · 本轮已忽略，等待条件解除' : '') +
             (item.repeat_count > 1 ? ` · 已合并 ${item.repeat_count} 次触发，最新 ${item.updated_at}` : '');
+        if (item.event_type === 'ma55_signal') {
+            title.textContent = '【55线】' + title.textContent;
+            status.textContent = '55线规则 · 已收线形态观察 · 不关联交易计划，不提供成交操作';
+        }
         row.append(title, msg, meta, status);
         const buttons = document.createElement('div'); buttons.className = 'd-flex flex-wrap gap-1';
         function button(label, callback) {
