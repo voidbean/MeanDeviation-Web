@@ -9,6 +9,58 @@ import services.monitor as monitor
 
 
 class MonitorRuleTest(unittest.TestCase):
+    def test_effective_threshold_distinguishes_average_from_bands(self):
+        for label in ("分时均价", "黄线", "分时均价114.305", "分时均价（黄线）"):
+            with self.subTest(label=label):
+                rule = {"indicator_label": label, "message": "", "threshold": 106.8616,
+                        "rule_type": "breakdown"}
+                self.assertEqual(monitor._effective_threshold(rule, 114.305), 114.305)
+                self.assertEqual(monitor._effective_threshold(rule, None), 106.8616)
+        for label in ("分时均价下轨106.8616", "分时均价上轨", "黄线下轨", "黄线上轨",
+                      "分时均价下方2%", "MA5"):
+            for explicit in (True, False):
+                # Legacy rows have no indicator label; band inference must not
+                # discard the suffix and turn the band back into the average.
+                with self.subTest(label=label, explicit=explicit):
+                    rule = {"indicator_label": label if explicit else "",
+                            "message": f"跌破{label}执行止损离场", "threshold": 106.8616,
+                            "rule_type": "breakdown"}
+                    self.assertEqual(monitor._effective_threshold(rule, 114.305), 106.8616)
+                    self.assertIn("106.862｜当前价", monitor._evidence(rule, 113.69, 114.305))
+
+    def test_lower_band_does_not_trigger_below_average_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "monitor.db")
+            with patch.object(db, "DB_PATH", path), patch.object(monitor, "DB_PATH", path):
+                db.init_db(); db.set_watch_enabled("000001", True)
+                db.save_portfolio("000001", 110, 0, 0, 115, 100)
+                db.save_watch_plans([{
+                    "code": "000001", "name": "测试股", "rules": [{
+                        "type": "breakdown", "price": 106.8616,
+                        "indicator": "分时均价下轨106.8616", "confirmation_minutes": 2,
+                        "priority": "risk", "action": "exit",
+                        "message": "跌破分时均价下轨106.86执行止损离场",
+                    }],
+                }], "2026-08-19")
+                db.activate_watch_plans("2026-08-19")
+                with sqlite3.connect(path) as conn:
+                    conn.execute(
+                        "INSERT INTO intraday_snapshots(code,date,time,price,open,high,low,vol,amount) VALUES(?,?,?,?,?,?,?,?,?)",
+                        ("000001", "2026-08-19", "11:11", 113.69, 115, 115, 113, 1000, 114.305),
+                    )
+                self.assertEqual(monitor.evaluate_watch_rules("2026-08-19"), [])
+                self.advance(path, "11:12")
+                self.assertEqual(monitor.evaluate_watch_rules("2026-08-19"), [])
+                with sqlite3.connect(path) as conn:
+                    self.assertEqual(conn.execute("SELECT consecutive_hits FROM watch_rules").fetchone()[0], 0)
+                self.advance(path, "11:13", 106.8)
+                self.assertEqual(monitor.evaluate_watch_rules("2026-08-19"), [])
+                self.advance(path, "11:14", 106.8)
+                events = monitor.evaluate_watch_rules("2026-08-19")
+                self.assertEqual(len(events), 1)
+                self.assertIn("建议卖出/止损", events[0]["message"])
+                self.assertIn("106.862｜当前价 106.8", events[0]["message"])
+
     def advance(self, path, minute, price=None):
         conn = sqlite3.connect(path)
         row = list(conn.execute("SELECT code,date,time,price,open,high,low,vol,amount FROM intraday_snapshots ORDER BY time DESC LIMIT 1").fetchone())

@@ -3,6 +3,7 @@ from services.market_context import build_market_context, market_warning_text
 import datetime as dt
 import json
 import queue
+import re
 import sqlite3
 import threading
 
@@ -51,7 +52,11 @@ def _indicator_label(rule: sqlite3.Row) -> str:
     if explicit:
         return explicit
     message = str(rule["message"] or "")
-    known = ("分时均价", "均价", "8848上轨", "8848下轨", "MA5", "MA10", "MA20",
+    derived = re.search(r"(?:分时均价|黄线)\s*(?:上轨|下轨|上方|下方|偏离)", message)
+    if derived:
+        return derived.group(0)
+    known = ("分时均价上轨", "分时均价下轨", "黄线上轨", "黄线下轨", "8848上轨", "8848下轨",
+             "上轨", "下轨", "分时均价", "黄线", "均价", "MA5", "MA10", "MA20",
              "Fibonacci 0.382", "Fibonacci 0.618", "Fibonacci 0.786", "前高", "前低")
     return next((name for name in known if name in message), "计划关键线")
 
@@ -67,9 +72,25 @@ def _intraday_avg(conn: sqlite3.Connection, code: str, trade_date: str) -> float
     return float(row[1]) * 1000 / float(row[0])
 
 
+def _effective_threshold(rule: sqlite3.Row, avg: float | None) -> float:
+    """Only the average itself tracks the yellow line; derived bands stay fixed.
+
+    Labels may include the price recorded when the plan was generated. Match
+    the whole label rather than replacing every indicator containing “分时均价”.
+    """
+    label = _indicator_label(rule)
+    is_average = re.fullmatch(
+        r"(?:分时均价|黄线|分时均价[（(]黄线[）)])(?:\s*[:：=]?\s*\d+(?:\.\d+)?\s*元?)?",
+        label,
+    ) is not None
+    if rule["rule_type"] in {"breakout", "breakdown", "near"} and is_average and avg and avg > 0:
+        return avg
+    return float(rule["threshold"])
+
+
 def _evidence(rule: sqlite3.Row, price: float, avg: float | None) -> str:
     label = _indicator_label(rule)
-    line_value = avg if avg and any(x in label for x in ("分时均价", "黄线")) else float(rule["threshold"])
+    line_value = _effective_threshold(rule, avg)
     parts = [f"{label} {line_value:g}", f"当前价 {price:g}"]
     if avg and avg > 0:
         parts.append(f"当前分时均价 {avg:.3f}")
@@ -212,10 +233,7 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
                 conn.execute("UPDATE watch_rules SET consecutive_hits=0,recovery_hits=0 WHERE id=?", (rule["id"],))
                 continue  # Known position is incompatible; never invent a fill.
             current_avg = _intraday_avg(conn, rule["code"], trade_date)
-            threshold = float(rule["threshold"])
-            # “分时均价/黄线”会随成交持续变化，不能拿生成计划时的旧均价盯一整天。
-            if current_avg and any(x in _indicator_label(rule) for x in ("分时均价", "黄线")):
-                threshold = current_avg
+            threshold = _effective_threshold(rule, current_avg)
             kind = rule["rule_type"]
             hit = _condition(kind, price, threshold, latest_vol, conn, rule["code"], trade_date)
             if rule["ignore_until_recovery"]:
