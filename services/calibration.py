@@ -77,12 +77,14 @@ def _rules(conn: sqlite3.Connection, plan_id: int) -> list[dict]:
     rows = conn.execute(
         """SELECT id,rule_type,threshold,COALESCE(original_threshold,threshold),priority,state,
                   COALESCE(paused,0),message,COALESCE(pause_source,''),COALESCE(indicator_label,''),
-                  conditions_json,shadow_result_json,action,execution_status
+                  conditions_json,shadow_result_json,action,execution_status,triggered_at,
+                  followup_reference_price,followup_notified_at
            FROM watch_rules WHERE plan_id=? AND execution_status IN ('pending','partial') ORDER BY id""",
         (plan_id,),
     ).fetchall()
     keys = ("id", "type", "threshold", "original_threshold", "priority", "state", "paused", "message", "pause_source", "indicator",
-            "conditions_json", "shadow_result_json", "action", "execution_status")
+            "conditions_json", "shadow_result_json", "action", "execution_status", "triggered_at",
+            "followup_reference_price", "followup_notified_at")
     result = [dict(zip(keys, row)) for row in rows]
     for rule in result:
         rule["conditions"] = json.loads(rule.pop("conditions_json"))
@@ -212,7 +214,7 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: floa
             except (TypeError, ValueError):
                 continue
             max_delta = old * 0.01
-            if abs(new_value - old) > max_delta:
+            if new_value == old or abs(new_value - old) > max_delta:
                 continue
             if (rule["priority"] == "risk" or rule["type"] == "breakdown") and new_value < old:
                 continue  # 风险线只允许收紧（上移）
@@ -233,9 +235,18 @@ def _apply_ai_decision(conn, plan, proposal: dict, slot: str, market_price: floa
     priority = "risk" if decision in {"tighten_risk", "invalidate"} else "observe"
     now = _now_text()
     if decision == "continue":
-        message = f"🔄 {slot} 校准恢复：{reason or '此前暂停条件已解除，计划重新进入观察'}"
+        message = f"🔄 {slot} 校准恢复 · AI建议：{reason or '此前暂停条件已解除，计划重新进入观察'}"
     else:
-        message = f"{slot} 校准：{reason or decision}"
+        message = f"{slot} 校准 · AI建议（非规则触发）：{reason or decision}"
+    changes = []
+    for change in applied:
+        if change["action"] == "update":
+            changes.append(f"规则 #{change['rule_id']} 关键价 {change['from']:g} → {change['to']:g}")
+        else:
+            label = {"pause": "暂停", "resume": "恢复", "invalidate": "失效"}[change["action"]]
+            changes.append(f"规则 #{change['rule_id']} {label}")
+    result = "；".join(changes) if changes else "未修改任何规则，原规则未变（未实际收紧风险线）"
+    message += f"。实际执行结果：{result}。本通知不是买卖规则触发确认，也不代表已成交。"
     cur = conn.execute(
         """INSERT INTO watch_events(rule_id,code,name,event_type,priority,price,message,triggered_at)
            VALUES(?,?,?,?,?,?,?,?)""",
@@ -294,6 +305,10 @@ technical_context含已收盘日K、日线MACD、分钟量价序列与量能比�
 也不能仅因影子条件未满足或数据不足暂停机会或作废计划，以免间接把影子条件变成硬门槛。
 如依据原有风控逻辑调整，reason必须引用实际数据；不要根据累计成交量单个数字断言放量。
 不得因量能或MACD不足而暂停风险退出提醒。
+state=triggered代表此前已确认，不是此刻首次触发；execution_status=pending仅表示尚未记录成交，不能推断实际未交易。
+triggered_at及followup_reference_price/followup_notified_at提供既有触发和持续走强观察背景；后者只是通知基准，不是新买卖价。
+持续站上原上轨不等于每次校准都重新触发减仓；请结合触发后的走势说明原防守判断是否仍适用。
+reason是AI建议，不得将建议表述为新的规则触发或已经执行的成交；没有有效adjustments时不得声称风险线已收紧。
 {slot}校准重点：{focus}。
 """
     raw = call_ai_model(system_prompt + MARKET_GUIDANCE, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

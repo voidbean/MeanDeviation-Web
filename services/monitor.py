@@ -21,6 +21,11 @@ _subscribers_lock = threading.Lock()
 # 短促刺穿，滞回区间负责过滤 0.999/1.001 一类贴线抖动。
 PRICE_RECOVERY_HYSTERESIS = 0.002
 
+# Notification cadence only, not additional trading/position-sizing conditions.
+BREAKOUT_FOLLOWUP_ADVANCE = 0.01
+BREAKOUT_FOLLOWUP_MINUTES = 3
+BREAKOUT_FOLLOWUP_COOLDOWN = 15 * 60
+
 
 def _action_direction(message: str) -> str:
     text = message or ""
@@ -176,6 +181,82 @@ def _recovered(kind: str, price: float, threshold: float, hit: bool) -> bool:
     if kind == "near":
         return abs(price - threshold) / threshold >= 0.007
     return not hit
+
+
+def _start_breakout_followup(conn, rule_id, price, snapshot_time):
+    conn.execute("""UPDATE watch_rules SET followup_reference_price=?,followup_hits=0,
+        followup_snapshot_time=?,followup_notified_at=NULL WHERE id=?""", (price, snapshot_time, rule_id))
+
+
+def _evaluate_breakout_followups(conn, trade_date):
+    """Observe price progress independently of whether the original action was filled.
+
+    Called inside the monitor transaction, after normal rule events. Never changes
+    trading thresholds, execution state, active_event_id or recovery counters.
+    """
+    events = []
+    rules = conn.execute("""SELECT r.*,p.code,p.name,COALESCE(h.quantity,0) AS held
+        FROM watch_rules r JOIN watch_plans p ON p.id=r.plan_id
+        JOIN stock_watchlist w ON w.code=p.code AND w.enabled=1
+        LEFT JOIN portfolio h ON h.code=p.code
+        WHERE p.trade_date=? AND p.status='active' AND r.rule_type='breakout'
+        AND r.state='triggered' AND r.paused=0
+        AND r.execution_status IN ('pending','partial','completed')
+        AND r.action IN ('entry','add','reduce','exit','observe')""", (trade_date,)).fetchall()
+    for rule in rules:
+        snap = conn.execute("""SELECT time,price FROM intraday_snapshots
+            WHERE code=? AND date=? ORDER BY time DESC LIMIT 1""", (rule["code"], trade_date)).fetchone()
+        if not snap or not snap[1] or snap[1] <= 0:
+            continue
+        minute, price = str(snap[0]), float(snap[1])
+        captured = dt.datetime.strptime(f"{trade_date} {minute}", "%Y-%m-%d %H:%M")
+        if trade_date == dt.date.today().isoformat() and not 0 <= (dt.datetime.now() - captured).total_seconds() <= 150:
+            continue
+        previous = rule["followup_snapshot_time"]
+        if previous and minute <= previous:
+            continue
+        # Existing triggered rules on upgrade start from the first fresh snapshot;
+        # do not replay old advances or use a merged event's stale trigger price.
+        reference = rule["followup_reference_price"]
+        if not reference or not previous:
+            _start_breakout_followup(conn, rule["id"], price, minute)
+            continue
+        consecutive = (captured - dt.datetime.strptime(f"{trade_date} {previous}", "%Y-%m-%d %H:%M")).total_seconds() == 60
+        eligible = not rule["ignore_until_recovery"] and not (
+            rule["snooze_until"] and captured.strftime("%Y-%m-%d %H:%M:%S") < rule["snooze_until"])
+        # After a full exit there is no position left to follow. A completed buy
+        # may still be T+1 locked: observation must not depend on sellable shares.
+        if (rule["action"] in {"add", "reduce", "exit"} or rule["execution_status"] == "completed") and not rule["held"]:
+            eligible = False
+        avg = _intraday_avg(conn, rule["code"], trade_date)
+        advanced = price >= float(reference) * (1 + BREAKOUT_FOLLOWUP_ADVANCE)
+        hit = eligible and advanced and price >= _effective_threshold(rule, avg)
+        hits = (int(rule["followup_hits"]) if consecutive else 0) + 1 if hit else 0
+        conn.execute("UPDATE watch_rules SET followup_hits=?,followup_snapshot_time=? WHERE id=?",
+                     (hits, minute, rule["id"]))
+        notified = rule["followup_notified_at"]
+        cooling = notified and (captured - dt.datetime.strptime(notified, "%Y-%m-%d %H:%M:%S")).total_seconds() < BREAKOUT_FOLLOWUP_COOLDOWN
+        if hits < BREAKOUT_FOLLOWUP_MINUTES or cooling:
+            continue
+        status = {"pending": "尚未记录成交，实际执行情况未知", "partial": "已记录部分成交",
+                  "completed": "已记录动作完成"}[rule["execution_status"]]
+        if rule["action"] == "observe":
+            status = "仅观察，无成交动作"
+        intent = {"entry": "建仓", "add": "补仓", "reduce": "减仓", "exit": "退出", "observe": "观察"}[rule["action"]]
+        message = (f"📈 突破后持续走强（状态观察，非买卖信号）：{minute} 当前价 {price:g}，"
+                   f"较跟踪基准 {reference:g} 上涨 {(price / reference - 1) * 100:.2f}%，"
+                   f"连续 {BREAKOUT_FOLLOWUP_MINUTES} 分钟达到至少 {BREAKOUT_FOLLOWUP_ADVANCE * 100:g}% 的推进幅度。"
+                   f"{_evidence(rule, price, avg)}。原{intent}动作：{status}；账面持仓 {rule['held']} 股。"
+                   "原计划条件未修改，本条不重复确认买卖，也不表示应追买或撤销原风控。")
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        event_id = conn.execute("""INSERT INTO watch_events(
+            rule_id,code,name,event_type,priority,price,message,triggered_at)
+            VALUES(?,?,?,'breakout_followup','observe',?,?,?)""",
+            (rule["id"], rule["code"], rule["name"], price, message, now)).lastrowid
+        conn.execute("""UPDATE watch_rules SET followup_reference_price=?,followup_hits=0,
+            followup_notified_at=? WHERE id=?""", (price, captured.strftime("%Y-%m-%d %H:%M:%S"), rule["id"]))
+        events.append(event_details(conn, event_id))
+    return events
 
 
 def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
@@ -353,6 +434,8 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             next_state = "observing" if kind == "near" and _rule_direction(rule) else "triggered"
             conn.execute("""UPDATE watch_rules SET state=?,consecutive_hits=0,recovery_hits=0,
                          triggered_at=?,state_changed_at=? WHERE id=?""", (next_state, now, now, rule["id"]))
+            if kind == "breakout":
+                _start_breakout_followup(conn, rule["id"], price, snap_time)
             event = {"id": cur.lastrowid, "code": rule["code"], "name": rule["name"], "event_type": kind,
                      "priority": rule["priority"], "price": price, "message": message, "triggered_at": now}
             events.append(event)
@@ -385,6 +468,17 @@ def evaluate_watch_rules(trade_date: str | None = None) -> list[dict]:
             else:
                 event["silent_update"] = True
             event.update(event_details(conn, event["id"]))
+        # Optional observations must not roll back confirmed trading/risk events.
+        conn.execute("SAVEPOINT breakout_followups")
+        try:
+            followups = _evaluate_breakout_followups(conn, trade_date)
+        except Exception:
+            conn.execute("ROLLBACK TO breakout_followups")
+            logger.exception("breakout followup observation failed")
+        else:
+            events.extend(followups)
+        finally:
+            conn.execute("RELEASE breakout_followups")
         conn.commit()
     except Exception:
         conn.rollback()

@@ -236,6 +236,10 @@ def init_db():
                 ("ALTER TABLE watch_rules ADD COLUMN ignore_until_recovery INTEGER NOT NULL DEFAULT 0", "watch_rules.ignore_until_recovery"),
                 ("ALTER TABLE watch_rules ADD COLUMN last_snapshot_time TEXT", "watch_rules.last_snapshot_time"),
                 ("ALTER TABLE watch_rules ADD COLUMN active_event_id INTEGER", "watch_rules.active_event_id"),
+                ("ALTER TABLE watch_rules ADD COLUMN followup_reference_price REAL", "watch_rules.followup_reference_price"),
+                ("ALTER TABLE watch_rules ADD COLUMN followup_hits INTEGER NOT NULL DEFAULT 0", "watch_rules.followup_hits"),
+                ("ALTER TABLE watch_rules ADD COLUMN followup_snapshot_time TEXT", "watch_rules.followup_snapshot_time"),
+                ("ALTER TABLE watch_rules ADD COLUMN followup_notified_at TEXT", "watch_rules.followup_notified_at"),
                 ("ALTER TABLE watch_events ADD COLUMN updated_at TEXT", "watch_events.updated_at"),
                 ("ALTER TABLE watch_events ADD COLUMN repeat_count INTEGER NOT NULL DEFAULT 1", "watch_events.repeat_count"),
             ]:

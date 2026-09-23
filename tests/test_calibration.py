@@ -106,6 +106,36 @@ class CalibrationTest(unittest.TestCase):
         self.assertTrue(calibration._claim_run("2026-08-19", "10:00"))
         self.assertFalse(calibration._claim_run("2026-08-19", "10:00"))
 
+    def test_advice_without_applied_change_explicitly_preserves_original_rules(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            plan = conn.execute("SELECT * FROM watch_plans").fetchone()
+            conn.execute("UPDATE watch_rules SET state='triggered' WHERE rule_type='breakout'")
+            rules = calibration._rules(conn, plan["id"])
+            event = calibration._apply_ai_decision(conn, plan, {
+                "decision": "tighten_risk", "reason": "站上上轨，建议减仓",
+                "adjustments": [{"rule_id": rules[0]["id"], "action": "update", "threshold": 10.6},
+                                {"rule_id": rules[1]["id"], "action": "update", "threshold": 9.5}],
+            }, "13:05", market_price=11)
+            self.assertIn("AI建议（非规则触发）", event["message"])
+            self.assertIn("未修改任何规则", event["message"])
+            self.assertIn("未实际收紧风险线", event["message"])
+            self.assertEqual(conn.execute("SELECT applied_rules_json FROM watch_plan_revisions").fetchone()[0], "[]")
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM watch_events WHERE event_type='breakout'").fetchone()[0], 0)
+
+    def test_calibration_reports_only_accepted_changes(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            plan = conn.execute("SELECT * FROM watch_plans").fetchone()
+            risk = conn.execute("SELECT id FROM watch_rules WHERE priority='risk'").fetchone()[0]
+            event = calibration._apply_ai_decision(conn, plan, {
+                "decision": "tighten_risk", "reason": "建议上移风险线",
+                "adjustments": [{"rule_id": risk, "action": "update", "threshold": 9.55}],
+            }, "13:05", market_price=11)
+            self.assertIn(f"规则 #{risk} 关键价 9.5 → 9.55", event["message"])
+            self.assertNotIn("未修改任何规则", event["message"])
+            self.assertIn("不是买卖规则触发确认", event["message"])
+
     def test_close_calibration_receives_position_and_cash_context(self):
         self._insert_market()
         db.save_portfolio("000001", 9.8, 11, 9, 10.6, 200)
@@ -127,6 +157,8 @@ class CalibrationTest(unittest.TestCase):
         self.assertEqual(item["account"]["available_cash"], 2500)
         self.assertEqual(item["account"]["max_buy_lots_at_current_price"], 2)
         self.assertIn("尾盘隔夜决策", captured["system"])
+        self.assertIn("不得将建议表述为新的规则触发", captured["system"])
+        self.assertIn("followup_reference_price", item["rules"][0])
         conn = sqlite3.connect(self.path)
         event = conn.execute(
             "SELECT event_type,priority,message FROM watch_events ORDER BY id DESC LIMIT 1"

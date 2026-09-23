@@ -71,13 +71,18 @@
             title.textContent = '【55线】' + title.textContent;
             status.textContent = '55线规则 · 已收线形态观察 · 不关联交易计划，不提供成交操作';
         }
+        const followup = item.event_type === 'breakout_followup';
+        if (followup) {
+            title.textContent = '【持续走强】' + title.textContent;
+            status.textContent = '仅状态观察，不是新的买卖确认。' + status.textContent;
+        }
         row.append(title, msg, meta, status);
         const buttons = document.createElement('div'); buttons.className = 'd-flex flex-wrap gap-1';
         function button(label, callback) {
             const b = document.createElement('button'); b.type = 'button'; b.className = 'btn btn-sm btn-outline-secondary';
             b.textContent = label; b.onclick = callback; buttons.append(b);
         }
-        const active = ['pending','partial'].includes(item.execution_status);
+        const active = !followup && ['pending','partial'].includes(item.execution_status);
         if (active && ['entry','add','reduce','exit'].includes(item.action) && !['near','recovered','calibration'].includes(item.event_type)) {
             button('记录成交', () => openFill(item));
         }
@@ -88,7 +93,7 @@
             }
             button('今日停用', () => feedback(item, 'disable'));
         }
-        if (item.last_execution_id) button('撤销最近成交', () => undo(item));
+        if (!followup && item.last_execution_id) button('撤销最近成交', () => undo(item));
         row.append(buttons);
         const old = document.getElementById(row.id);
         if (old) old.replaceWith(row); else document.getElementById('monitor-event-list').prepend(row);

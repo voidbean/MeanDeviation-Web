@@ -87,7 +87,8 @@ class EventConsumer:
             self.cursor = max(self.cursor, event_id)
             _save_cursor(self.cursor)
         name = item.get("name") or item.get("code") or "未知标的"
-        event_type = "校准" if item.get("event_type") == "calibration" else "规则触发"
+        event_type = {"calibration": "AI校准", "breakout_followup": "持续走强·状态观察"}.get(
+            item.get("event_type"), "规则触发")
         priority = str(item.get("priority") or "observe")
         price = item.get("price")
         title = f"8848 · {name} · {event_type}"

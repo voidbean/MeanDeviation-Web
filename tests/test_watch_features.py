@@ -139,6 +139,7 @@ class WatchFeaturesTest(unittest.TestCase):
 
     def test_technical_failure_does_not_block_risk_exit(self):
         self.plan(priority="risk", conditions=[], kind="breakdown")
+        db.save_portfolio("000001", 10, 0, 0, 10, 100)  # 无持仓时不会产生退出动作。
         self.minutes()
         self.conn.execute("UPDATE intraday_snapshots SET price=9.8")
         self.conn.commit()

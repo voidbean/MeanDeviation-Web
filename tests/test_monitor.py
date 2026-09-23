@@ -146,6 +146,7 @@ class MonitorRuleTest(unittest.TestCase):
             path = str(Path(folder) / "monitor.db")
             with patch.object(db, "DB_PATH", path), patch.object(monitor, "DB_PATH", path):
                 db.init_db(); db.set_watch_enabled("000001", True); db.save_available_cash(50_000)
+                db.save_portfolio("000001", 10, 0, 0, 10, 100)  # 补仓规则需要已有持仓。
                 db.save_watch_plans([{
                     "code": "000001", "name": "测试股", "rules": [{
                         "type": "near", "price": 10, "indicator": "分时均价",
