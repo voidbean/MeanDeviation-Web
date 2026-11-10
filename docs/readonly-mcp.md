@@ -2,7 +2,8 @@
 
 只读 MCP 复用现有 SQLite 数据、8848 策略计算和持仓汇总计算，独立监听本机 8849。
 现有网页继续在 8848 运行，MCP 不导入网页应用、不启动后台抓取线程，也不公开网页写接口。
-公网域名通过 Cloudflare Tunnel 转发到 8849，账户数据由 OAuth 保护，无需另开 Auth0 等身份服务。
+公网域名通过 Cloudflare Tunnel 转发到 8849，账户数据由固定 Bearer Token 或 OAuth 保护，无需另开身份服务。
+个人自用、固定几个客户端时优先使用下面的固定 Token 方式，不需要账户授权密码、回调地址或修改本机 OAuth 配置。
 
 ## 能读取什么
 
@@ -15,7 +16,8 @@
 | `get_service_status()` | 缓存最新日期、分钟快照时间、最新事件 ID、数据库可读性 |
 
 所有工具均需 `stocks:read` 权限。没有写入工具、任意 SQL、下单、行情强制刷新或 AI 调用。
-业务数据库使用 SQLite `mode=ro` 和 `query_only`，不存在时不会创建文件；只有独立的 OAuth 数据库需要写权限。
+业务数据库使用 SQLite `mode=ro` 和 `query_only`，不存在时不会创建文件；启用 OAuth 时独立的 OAuth 数据库需要写权限。
+仅固定 Token 模式不会创建或使用 OAuth 数据库。
 MCP 不执行业务库迁移，升级部署时应先让主 Web 服务正常启动并完成原有初始化。
 
 返回中的 `generated_at` 是响应生成时间，**不是行情时间**。必须结合 `source`、`observed_at`、`stale` 使用：
@@ -29,7 +31,67 @@ MCP 不执行业务库迁移，升级部署时应先让主 Web 服务正常启�
 - 自选股列表每次读取项目根 `.env`，网页增删自选股后不需要重启 MCP；OAuth 配置变更则需要重启。
 - `get_service_status` 不声称知道另一个进程里的后台线程是否存活。
 
-## 一 配置服务器上的根环境文件
+## 个人自用最快连接方式
+
+在服务器项目根目录生成一个随机 Token，每个客户端可单独生成一个：
+
+```bash
+uv run python -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+编辑项目根 `.env`，保留原来其他业务配置，增加或修改以下项。域名换成实际 Tunnel 域名，Token 换成上面输出的完整值：
+
+```dotenv
+MCP_PUBLIC_URL=https://mcp.example.com
+MCP_BEARER_TOKENS=替换为真实随机Token
+
+# 仅固定 Token 模式不需要 OAuth；清空旧的这三项，避免残留半套配置
+MCP_CLIENT_SECRET=
+MCP_REDIRECT_URIS=
+MCP_OWNER_PASSWORD_HASH=
+```
+
+多个 Token 使用英文逗号分隔，每个32–256字符，仅含字母、数字、下划线或短横线。
+它们都只能调用同样的5个只读工具，没有写权限，不是用户/角色权限系统。
+固定 Token 没有自动过期；从此列表删除对应值并重启 MCP 即撤销，其他 Token 不受影响。
+如仍需要 ChatGPT OAuth，可保留原来完整的 OAuth 三项，和固定 Token 同时生效；不能只保留半套 OAuth 配置。
+修改固定 Token 列表不会让已有 OAuth 授权失效。不要把 OAuth 客户端密钥复用为固定 Token。
+
+按后面的启动与 Tunnel 步骤让服务运行后，在 DOT/桌面端“连接至自定义 MCP”的界面填写：
+
+| 字段 | 填写 |
+|---|---|
+| 名称 | `stock8848` |
+| 类型 | 流式 HTTP |
+| URL | `https://mcp.example.com/mcp` |
+| Bearer 令牌环境变量 | 留空（使用下面的固定标头即可） |
+| 标头的键 | `Authorization` |
+| 标头的值 | `Bearer 真实Token`（Bearer后面一个空格，只选列表中的一个Token） |
+| 来自环境变量的标头 | 留空 |
+
+保存并重新加载连接，**不需要点 OAuth 登录，也不需要18849回调**。如果之前加过本机 OAuth 子段，固定标头方式不需要它。
+“Bearer 令牌环境变量”字段接收的是客户端进程里的环境变量**名字**，不是 Token 本身；服务器 `.env` 不会自动成为 Mac 应用的环境变量。
+为了避免桌面应用环境变量继承问题，个人自用直接用上述固定标头最省事。不要同时配置两个 Authorization 来源。
+标头值会保存在客户端配置中，应像密码一样保管；Token 不放 URL、不放任务提示词、不提交到 Git。
+
+要做命令行验收，可先在自己的终端安全输入 Token，再请求工具列表（不会把 Token 字面值写入命令历史）：
+
+```bash
+read -r -s -p 'Bearer Token: ' MCP_TEST_TOKEN; echo
+curl --config - <<EOF
+url = "https://mcp.example.com/mcp"
+header = "Authorization: Bearer ${MCP_TEST_TOKEN}"
+header = "Accept: application/json, text/event-stream"
+header = "Content-Type: application/json"
+data = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}"
+EOF
+unset MCP_TEST_TOKEN
+```
+
+上例使用 Bash 的 `read` 语法；可在服务器 Bash 终端执行。预期返回5个工具；无 Token 或错误 Token 应返回401。
+后文第一节和第四节的 OAuth 配置，只在需要 OAuth 客户端时操作，**固定 Token 用户可跳过**。
+
+## 一 可选的 OAuth 根环境配置
 
 以下 `/opt/8848` 是**服务器部署目录示例**，全部替换成实际目录。不要覆盖已有 `.env`，也不要写到 `routes/.env`。
 
@@ -81,7 +143,7 @@ cd /opt/8848
 uv run uvicorn mcp_app:create_app --factory --host 127.0.0.1 --port 8849 --workers 1 --no-access-log --no-proxy-headers
 ```
 
-**不要使用 `0.0.0.0`，不要对公网开放 8849。** 缺少密钥、密码哈希或回调时，进程会拒绝启动，而不是退化成匿名访问。
+**不要使用 `0.0.0.0`，不要对公网开放 8849。** 没有有效固定 Token 或完整 OAuth 配置时，进程会拒绝启动，不会退化成匿名访问。
 关闭访问日志是为了避免授权请求参数进入常规 URL 日志；不要开启 HTTP 调试抓包或记录表单、Cookie、Authorization。
 
 本机检查需要显式使用公网 Host（代码会验证 Host）：
@@ -270,11 +332,13 @@ codex mcp login stock8848 --scopes stocks:read
 再测试一次短期定时任务。普通聊天能调用不代表该账号的后台任务权限已验证；确认无人操作时也能读取，再改为正式收盘任务。
 桌面本地任务仍可能依赖本机和客户端在线，云端任务则依赖账号/工作区可用的已连接工具权限。
 
-DOT 需要支持远程 Streamable HTTP、预注册 OAuth 客户端及 PKCE，才能复用此连接；不要将只支持匿名或静态 Bearer 的客户端当作已兼容。
+DOT 可直接用固定 Bearer 标头连接；只有选择本节 OAuth 方式时，才需要预注册 OAuth 客户端及 PKCE。
 这个实现面向个人私用，不是公开多用户股票数据服务，也没有公开发布插件的相关页面和审核配置。
 
 ## 五 授权有效期与撤销
 
+- 固定 Bearer Token 不自动过期；从根 `.env` 的 `MCP_BEARER_TOKENS` 中移除对应值并重启 MCP，即可撤销。
+  下面的期限与撤销命令只针对 OAuth，不影响固定 Token。
 - 授权请求5分钟有效，授权码2分钟且只能用一次，必须通过 S256 PKCE 校验。
 - Access Token 有效1小时；Refresh Token 每次刷新轮换，整个授权自首次签发起最多30天，然后需要重新授权。
   这意味着长期定时任务要留意授权到期，不是永久无人维护。

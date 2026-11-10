@@ -1,7 +1,7 @@
-"""Single-owner OAuth provider for the SDK: pre-registered client, PKCE and durable grants.
+"""Personal Bearer keys and single-owner OAuth: pre-registered client, PKCE and durable grants.
 
-No anonymous registration or external identity service. Only the separate auth DB is writable;
-bearer/refresh tokens and authorization codes are stored as SHA-256 digests, never plaintext.
+No anonymous registration or external identity service. OAuth access/refresh tokens and codes
+are stored as SHA-256 digests in a separate auth DB. Personal keys come from the root .env.
 """
 import asyncio
 import hashlib
@@ -14,7 +14,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -51,6 +51,7 @@ class MCPConfig:
     redirect_uris: tuple[str, ...]
     owner_password_hash: str
     auth_db: Path
+    bearer_tokens: tuple[str, ...] = field(default=(), repr=False)
 
     def __post_init__(self):
         url = urlsplit(self.base_url)
@@ -58,6 +59,13 @@ class MCPConfig:
         if (not url.hostname or (url.scheme != "https" and not (local and url.scheme == "http"))
                 or url.username or url.password or url.path not in {"", "/"} or url.query or url.fragment):
             raise ValueError("MCP_PUBLIC_URL 必须是无路径的 HTTPS 域名（仅本机测试允许 HTTP）")
+        for token in self.bearer_tokens:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token) or token == self.client_secret:
+                raise ValueError("MCP_BEARER_TOKENS 须为独立的32–256字符随机令牌，仅含字母、数字、下划线或短横线")
+        if not self.oauth_enabled:
+            if not self.bearer_tokens:
+                raise ValueError("至少配置 MCP_BEARER_TOKENS 或完整的 OAuth 鉴权，不能匿名启动")
+            return
         if not self.client_id or len(self.client_secret) < 32:
             raise ValueError("必须设置 MCP_CLIENT_ID 和至少32字符的 MCP_CLIENT_SECRET")
         if not re.fullmatch(r"scrypt\$[0-9a-f]{32}\$[0-9a-f]{64}", self.owner_password_hash):
@@ -84,7 +92,13 @@ class MCPConfig:
             redirect_uris=tuple(x.strip() for x in os.getenv("MCP_REDIRECT_URIS", "").split(",") if x.strip()),
             owner_password_hash=os.getenv("MCP_OWNER_PASSWORD_HASH", ""),
             auth_db=Path(os.getenv("MCP_AUTH_DB", str(_ROOT / "mcp_auth.db"))).absolute(),
+            bearer_tokens=tuple(dict.fromkeys(x.strip() for x in os.getenv("MCP_BEARER_TOKENS", "").split(",") if x.strip())),
         )
+
+    @property
+    def oauth_enabled(self):
+        # A leftover client ID is harmless; partially configured OAuth must still fail closed.
+        return bool(self.client_secret or self.owner_password_hash or self.redirect_uris)
 
     @property
     def issuer(self):
@@ -313,3 +327,26 @@ class OwnerOAuthProvider:
             data = self.store.get(conn, kind, token.token)
             if data:
                 conn.execute("DELETE FROM grants WHERE family=?", (data["family"],))
+
+
+class ReadOnlyTokenVerifier:
+    """Accept configured personal keys or OAuth access tokens, never OAuth client secrets."""
+    def __init__(self, config: MCPConfig, oauth_provider: OwnerOAuthProvider | None = None):
+        self.resource = config.resource
+        self.digests = tuple(hashlib.sha256(token.encode()).digest() for token in config.bearer_tokens)
+        self.oauth_provider = oauth_provider
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if len(token) > 256:
+            return None
+        digest = hashlib.sha256(token.encode()).digest()
+        matched = False
+        for expected in self.digests:
+            # Check every digest; don't compare raw keys or leak the matching key's position.
+            matched |= hmac.compare_digest(digest, expected)
+        if matched:
+            return AccessToken(token=token, client_id="personal-bearer", subject="key:" + digest.hex()[:12],
+                               resource=self.resource, scopes=[SCOPE])
+        if self.oauth_provider:
+            return await self.oauth_provider.load_access_token(token)
+        return None

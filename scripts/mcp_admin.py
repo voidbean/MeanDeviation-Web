@@ -19,12 +19,17 @@ def main():
         print("MCP_OWNER_PASSWORD_HASH=" + password_hash(password))
     else:
         settings = MCPConfig.from_env()
+        if not settings.oauth_enabled:
+            print("当前仅使用固定 Bearer Token；请从根 .env 的 MCP_BEARER_TOKENS 移除对应值并重启 MCP。")
+            return
         # mode=rw refuses a typo/missing file instead of creating an empty auth store.
         conn = sqlite3.connect(settings.auth_db.as_uri() + "?mode=rw", uri=True)
         try:
             with conn:
                 conn.execute("DELETE FROM grants")
-            print("全部授权请求、授权码、访问和刷新令牌已撤销；客户端需重新授权。")
+            print("全部 OAuth 授权请求、授权码、访问和刷新令牌已撤销；OAuth 客户端需重新授权。")
+            if settings.bearer_tokens:
+                print("固定 Bearer Token 不受影响；如需撤销，请从根 .env 移除对应值并重启 MCP。")
         finally:
             conn.close()
 

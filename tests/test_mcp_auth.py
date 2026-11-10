@@ -1,6 +1,7 @@
 import base64
 from dataclasses import replace
 import hashlib
+import os
 import re
 import secrets
 import sqlite3
@@ -16,6 +17,7 @@ from starlette.testclient import TestClient
 from mcp_app import create_app
 from services.mcp_auth import MCPConfig, OwnerOAuthProvider, SCOPE, password_hash
 from services.mcp_data import SnapshotReader
+from scripts.mcp_admin import main as admin_main
 
 
 class OAuthMCPTest(unittest.TestCase):
@@ -253,6 +255,100 @@ class OAuthMCPTest(unittest.TestCase):
                 replace(self.config, **values)
         with self.assertRaises(ValueError):
             create_app(replace(self.config, auth_db=self.reader.db_path), self.reader)
+
+    def test_static_bearer_tokens_work_alongside_oauth_and_keep_tools_read_only(self):
+        fixed = ("fixed-token-one-" + "a" * 32, "fixed-token-two-" + "b" * 32)
+        client = self.open_client(replace(self.config, bearer_tokens=fixed))
+        try:
+            for token in fixed:
+                result = self.rpc("tools/list", token=token, client=client)
+                self.assertEqual(result.status_code, 200, result.text)
+                tools = result.json()["result"]["tools"]
+                self.assertEqual(len(tools), 5)
+                self.assertTrue(all(t["annotations"]["readOnlyHint"] for t in tools))
+                expected = self.reader.envelope({"database_readable": True})
+                with patch.object(self.reader, "status", return_value=expected):
+                    result = self.rpc("tools/call", {"name": "get_service_status", "arguments": {}}, token, client).json()["result"]
+                self.assertEqual(result["structuredContent"], expected)
+            oauth = self.tokens()
+            self.assertEqual(self.rpc("tools/list", token=oauth["access_token"], client=client).status_code, 200)
+            for token in (None, "wrong-token", self.config.client_secret):
+                self.assertEqual(self.rpc("tools/list", token=token, client=client).status_code, 401)
+            self.assertEqual(client.get("/mcp", params={"access_token": fixed[0]}).status_code, 401)
+            self.assertEqual(client.post("/update_portfolio", headers={"Authorization": "Bearer " + fixed[0]}).status_code, 404)
+            # A static key is not an OAuth refresh token and must never enter the grant exchange.
+            response = client.post("/token", data={"grant_type": "refresh_token", "refresh_token": fixed[0],
+                                   "client_id": self.config.client_id, "client_secret": self.config.client_secret})
+            self.assertEqual(response.status_code, 400)
+            with patch("scripts.mcp_admin.MCPConfig.from_env", return_value=replace(self.config, bearer_tokens=fixed)), \
+                    patch("sys.argv", ["mcp_admin", "revoke"]), patch("builtins.print"):
+                admin_main()
+            self.assertEqual(self.rpc("tools/list", token=oauth["access_token"], client=client).status_code, 401)
+            self.assertEqual(self.rpc("tools/list", token=fixed[0], client=client).status_code, 200)
+        finally:
+            client.__exit__(None, None, None)
+
+    def test_token_only_configuration_needs_no_password_callback_or_auth_database(self):
+        token = "standalone-token-" + "c" * 32
+        path = Path(self.tmp.name) / "unused-auth.db"
+        config = replace(self.config, client_secret="", owner_password_hash="", redirect_uris=(),
+                         bearer_tokens=(token,), auth_db=path)
+        client = self.open_client(config)
+        try:
+            self.assertFalse(path.exists())
+            self.assertEqual(self.rpc("tools/list", token=token, client=client).status_code, 200)
+            self.assertEqual(self.rpc("tools/list", client=client).status_code, 401)
+            for path_ in ("/authorize", "/consent", "/token", "/revoke", "/.well-known/oauth-authorization-server"):
+                self.assertEqual(client.get(path_).status_code, 404)
+            metadata = client.get("/.well-known/oauth-protected-resource/mcp").json()
+            self.assertEqual(metadata["resource"], config.resource)
+            self.assertNotIn("authorization_servers", metadata)
+            tools = self.rpc("tools/list", token=token, client=client).json()["result"]["tools"]
+            self.assertTrue(all("securitySchemes" not in tool for tool in tools))
+            with patch("scripts.mcp_admin.MCPConfig.from_env", return_value=config), \
+                    patch("sys.argv", ["mcp_admin", "revoke"]), patch("builtins.print"):
+                admin_main()
+            self.assertFalse(path.exists())
+        finally:
+            client.__exit__(None, None, None)
+
+    def test_static_token_rotation_does_not_invalidate_oauth_or_other_tokens(self):
+        first, second = "rotated-token-" + "a" * 32, "retained-token-" + "b" * 32
+        oauth = self.tokens()
+        before = self.open_client(replace(self.config, bearer_tokens=(first, second)))
+        try:
+            self.assertEqual(self.rpc("tools/list", token=first, client=before).status_code, 200)
+        finally:
+            before.__exit__(None, None, None)
+        after = self.open_client(replace(self.config, bearer_tokens=(second,)))
+        try:
+            self.assertEqual(self.rpc("tools/list", token=first, client=after).status_code, 401)
+            for token in (second, oauth["access_token"]):
+                self.assertEqual(self.rpc("tools/list", token=token, client=after).status_code, 200)
+        finally:
+            after.__exit__(None, None, None)
+
+    def test_static_tokens_reject_weak_values_reused_oauth_secrets_and_partial_oauth(self):
+        for tokens in (("short",), ("Bearer " + "x" * 43,), (self.config.client_secret,), ("x" * 300,)):
+            with self.subTest(tokens=tokens), self.assertRaises(ValueError):
+                replace(self.config, bearer_tokens=tokens)
+        with self.assertRaises(ValueError):
+            replace(self.config, client_secret="", owner_password_hash="", redirect_uris=(), bearer_tokens=())
+        with self.assertRaises(ValueError):
+            replace(self.config, owner_password_hash="", bearer_tokens=("valid-token-" + "z" * 32,))
+
+    def test_token_only_environment_parses_multiple_keys_without_oauth_credentials(self):
+        first, second = "environment-key-" + "d" * 32, "environment-key-" + "e" * 32
+        with patch.dict(os.environ, {"MCP_PUBLIC_URL": self.config.base_url, "MCP_CLIENT_ID": "8848-chatgpt",
+                                     "MCP_CLIENT_SECRET": "", "MCP_OWNER_PASSWORD_HASH": "", "MCP_REDIRECT_URIS": "",
+                                     "MCP_AUTH_DB": str(Path(self.tmp.name) / "unused-env-auth.db"),
+                                     "MCP_BEARER_TOKENS": f" {first}, , {second}, {first} "}):
+            config = MCPConfig.from_env()
+            self.assertEqual(config.bearer_tokens, (first, second))
+            self.assertFalse(config.oauth_enabled)
+            self.assertNotIn(first, repr(config))
+            with patch.dict(os.environ, {"MCP_BEARER_TOKENS": ", ,"}), self.assertRaises(ValueError):
+                MCPConfig.from_env()
 
 
 if __name__ == "__main__":
