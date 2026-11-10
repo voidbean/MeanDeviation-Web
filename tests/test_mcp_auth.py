@@ -58,7 +58,8 @@ class OAuthMCPTest(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("Secure", page.headers["set-cookie"])
         self.assertEqual(page.headers["cache-control"], "no-store")
-        self.assertIn("form-action 'self' https://chatgpt.com;", page.headers["content-security-policy"])
+        self.assertIn("form-action 'self' ", page.headers["content-security-policy"])
+        self.assertIn("https://chatgpt.com", page.headers["content-security-policy"])
         fields = dict(re.findall(r'name="(request|csrf)" value="([^"]+)"', page.text))
         return {**fields, "password": self.password, "decision": "allow"}, verifier
 
@@ -221,6 +222,28 @@ class OAuthMCPTest(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(self.client.post("/consent", data={**form, "password": "wrong"}).status_code, 403)
         self.assertEqual(self.client.post("/consent", data=form).status_code, 429)
+
+    def test_desktop_loopback_callback_with_public_https_issuer(self):
+        callback = "http://127.0.0.1:18849/callback"
+        self.config = replace(self.config, redirect_uris=(callback, *self.config.redirect_uris))
+        desktop = self.open_client()
+        self.client = desktop
+        try:
+            tokens = self.tokens()
+            self.assertEqual(self.rpc("tools/list", token=tokens["access_token"]).status_code, 200)
+            for unregistered in ("http://127.0.0.1:18850/callback", "http://127.0.0.1:18849/other"):
+                response, _ = self.start_authorization(redirect_uri=unregistered)
+                self.assertEqual(response.status_code, 400)
+                self.assertNotIn("location", response.headers)
+        finally:
+            desktop.__exit__(None, None, None)
+
+    def test_http_callback_exception_is_only_explicit_loopback(self):
+        for callback in ("http://evil.test/callback", "http://192.168.1.1:18849/callback",
+                         "http://127.0.0.1.evil.test/callback", "http://127.1:18849/callback",
+                         "http://127.0.0.1:18849/callback#fragment", "http://user@127.0.0.1:18849/callback"):
+            with self.subTest(callback=callback), self.assertRaises(ValueError):
+                replace(self.config, redirect_uris=(callback,))
 
     def test_missing_or_unsafe_configuration_refuses_to_start(self):
         for values in ({"base_url": "http://public.test"}, {"client_secret": "short"},

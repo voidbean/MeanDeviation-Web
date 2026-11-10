@@ -66,10 +66,13 @@ class MCPConfig:
             raise ValueError("必须设置 MCP_REDIRECT_URIS 为客户端展示的精确 OAuth 回调地址")
         for callback in self.redirect_uris:
             parsed = urlsplit(callback)
+            # Desktop OAuth returns to the CLIENT's loopback listener, not to this server.
+            # Keep an exact URI/port allowlist; never permit arbitrary HTTP/private-network redirects.
+            loopback = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1"}
+            local_dev = local and parsed.scheme == "http" and parsed.hostname == "localhost"
             if (not parsed.hostname or parsed.fragment or parsed.query or parsed.username or parsed.password
-                    or (parsed.scheme != "https" and not (local and parsed.scheme == "http"
-                                                          and parsed.hostname in {"localhost", "127.0.0.1"}))):
-                raise ValueError("MCP_REDIRECT_URIS 必须是精确的 HTTPS 地址，不能含查询或片段")
+                    or (parsed.scheme != "https" and not loopback and not local_dev)):
+                raise ValueError("MCP_REDIRECT_URIS 须为精确 HTTPS 地址或本机回环 HTTP 地址，不能含查询或片段")
 
     @classmethod
     def from_env(cls):

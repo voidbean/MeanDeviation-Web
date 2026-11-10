@@ -185,22 +185,81 @@ curl -i -X POST https://mcp.example.com/update_portfolio
 
 ## 四 在 ChatGPT 配置连接
 
-在账号可用的自定义 MCP/插件连接入口中新增私人连接（界面名称可能不同）：
+### ChatGPT 网页插件连接
+
+在账号可用的自定义 MCP/插件连接入口中新增私人连接。
+下表说明需要对应的配置，不表示不同版本界面都会逐项提供同名输入框：
 
 | 字段 | 值 |
 |---|---|
 | Server URL | `https://mcp.example.com/mcp` |
 | Authentication | OAuth |
-| OAuth client registration | 预注册 / 手动提供客户端凭据，不选 DCR 或 CIMD |
 | Client ID | 根 `.env` 中的 `MCP_CLIENT_ID` |
 | Client Secret | 根 `.env` 中的 `MCP_CLIENT_SECRET`，不是账户授权密码 |
 | Scope（如有字段） | `stocks:read` |
 
 服务会提供端点发现元数据，不需要手工把端点改成其他路径。Token endpoint 使用 `client_secret_post`。
+此服务使用预注册客户端，不支持 DCR/CIMD；需要能提供客户端凭据的连接方式。
 先核对连接页面显示的回调地址与根 `.env` 完全一致；修改配置后重启 `8848-mcp` 并刷新客户端连接。
 
 点击连接会在浏览器打开你自己的 `mcp.example.com` 授权页。检查域名与所列只读权限，输入账户授权密码并允许访问。
 密码只发送给自己的服务器；ChatGPT 保存 OAuth 令牌，不需要知道这个密码。后续读取不需要每次再输入密码。
+
+### 桌面端自定义 MCP 配置
+
+如果界面只显示“名称、STDIO/流式 HTTP、URL、Bearer 令牌环境变量、标头、来自环境变量的标头”，
+这是传输配置表单，不是上面的网页插件 OAuth 表单。它不能直接填写本服务要求的预注册客户端凭据。
+`MCP_CLIENT_SECRET` 是 OAuth 客户端密钥，**不是 Bearer Access Token**，不能混填。
+
+在该表单先保存：
+
+| 界面字段 | 填写 |
+|---|---|
+| 名称 | `stock8848`（后续配置段使用相同名称） |
+| 类型 | 流式 HTTP |
+| URL | `https://mcp.example.com/mcp` |
+| Bearer 令牌环境变量 | 留空，`MCP_BEARER_TOKEN` 如为灰色占位提示不必填写 |
+| 标头 / 来自环境变量的标头 | 留空 |
+
+此时可能显示未认证或连接错误，不代表只需再找一个客户端密钥输入框。
+接下来在**运行桌面应用的电脑**补充本机 Codex 配置，不是在服务器执行：
+
+1. 打开本机 Codex 的 `config.toml`，macOS 默认路径示例为 `/Users/你的用户名/.codex/config.toml`。
+2. 找到刚保存的 `[mcp_servers.stock8848]` 段，不要重复创建同名段，也不要覆盖其他配置。
+3. 为它添加以下 OAuth 子段，密钥与服务器根 `.env` 相同：
+
+```toml
+[mcp_servers.stock8848.oauth]
+client_id = "8848-chatgpt"
+client_secret = "替换为服务器的MCP_CLIENT_SECRET"
+callback_url = "http://127.0.0.1:18849/callback"
+callback_port = 18849
+```
+
+`callback_url` 的端口与 `callback_port` 必须相同。18849是桌面电脑的本机回调监听端口，
+**不是服务器8849，不需要新增 Tunnel，也不要对公网开放**。不要把这个回调当成 MCP 的服务地址。
+
+服务器的根 `.env` 保留原 ChatGPT 回调，并追加这个精确桌面回调：
+
+```dotenv
+MCP_REDIRECT_URIS=https://chatgpt.com/connector_platform_oauth_redirect,http://127.0.0.1:18849/callback
+```
+
+重启服务器 MCP，再在桌面端重新加载 MCP 配置，选择 Authenticate/认证；或在本机终端执行：
+
+```bash
+codex mcp login stock8848 --scopes stocks:read
+```
+
+浏览器打开的是服务器 HTTPS 授权页，输入账户授权密码后才回到本机监听地址；原始密码不填写到本机配置中。
+客户端密钥以明文保存在本机 `config.toml`，需要限制该文件权限，不能提交或贴到聊天中。
+本服务始终精确匹配白名单中的回调 URI/端口，不接受随机端口；因此这里显式固定18849。
+新增回调会改变授权配置，原有连接需要重新授权一次。
+
+官方文档区分了[桌面传输配置与 OAuth 预注册客户端配置](https://learn.chatgpt.com/docs/extend/mcp#oauth-client-registration-and-callbacks)。
+仅本机 MCP 连接成功，不等于 Dot 云端已获得该连接；还需在实际运行环境检查可用工具。
+
+### 功能验收
 
 先测试三个请求：
 
