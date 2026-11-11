@@ -1337,6 +1337,38 @@ def load_kline55_snapshot(code, period, db_path=None):
     return {"snapshot": json.loads(row[0]) if row[0] else None, "attempt_at": row[1], "last_error": row[2]}
 
 
+def claim_etf_kline_refresh(code, now, db_path=None, cooldown=90):
+    """Explicit collector only. Global lease/rate gate; MCP must never call this."""
+    import secrets
+    with sqlite3.connect(db_path or DB_PATH, timeout=10) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS etf_kline_cache(
+            code TEXT PRIMARY KEY,payload_json TEXT,last_error TEXT,attempt_at REAL NOT NULL DEFAULT 0,
+            lease_until REAL NOT NULL DEFAULT 0,lease_id TEXT)""")
+        conn.execute("BEGIN IMMEDIATE")
+        lease, attempt = conn.execute("SELECT MAX(lease_until),MAX(attempt_at) FROM etf_kline_cache").fetchone()
+        row = conn.execute("SELECT payload_json FROM etf_kline_cache WHERE code=?", (code,)).fetchone()
+        old = json.loads(row[0]) if row and row[0] else None
+        if lease and lease > now:
+            return "busy", None, old
+        if attempt and now - attempt < cooldown:
+            return "cooldown", None, old
+        key = secrets.token_urlsafe(24)
+        conn.execute("""INSERT INTO etf_kline_cache(code,attempt_at,lease_until,lease_id) VALUES(?,?,?,?)
+            ON CONFLICT(code) DO UPDATE SET attempt_at=excluded.attempt_at,
+            lease_until=excluded.lease_until,lease_id=excluded.lease_id""", (code, now, now + 600, key))
+        return "claimed", key, old
+
+
+def publish_etf_kline(code, lease_id, payload, error=None, db_path=None, completed_at=None):
+    """One atomic whole-symbol publication: all periods, raw bars, factors and calendar."""
+    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False) if payload is not None else None
+    with sqlite3.connect(db_path or DB_PATH, timeout=10) as conn:
+        changed = conn.execute("""UPDATE etf_kline_cache SET payload_json=COALESCE(?,payload_json),
+            last_error=?,attempt_at=COALESCE(?,attempt_at),lease_until=0,lease_id=NULL WHERE code=? AND lease_id=?""",
+            (encoded, error, completed_at, code, lease_id)).rowcount
+    return bool(changed)
+
+
 def claim_kline55_refresh(code, period, cooldown, db_path=None):
     with sqlite3.connect(db_path or DB_PATH, timeout=10) as conn:
         _init_kline55_cache(conn)

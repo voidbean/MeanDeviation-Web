@@ -150,7 +150,7 @@ class OAuthMCPTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         tools = response.json()["result"]["tools"]
         self.assertEqual({t["name"] for t in tools}, {"get_stock_snapshot", "get_watchlist_snapshot",
-                         "get_portfolio_overview", "get_watch_events", "get_service_status"})
+                         "get_portfolio_overview", "get_watch_events", "get_service_status", "get_kline_data"})
         for tool in tools:
             self.assertTrue(tool["annotations"]["readOnlyHint"])
             self.assertFalse(tool["annotations"]["destructiveHint"])
@@ -264,7 +264,7 @@ class OAuthMCPTest(unittest.TestCase):
                 result = self.rpc("tools/list", token=token, client=client)
                 self.assertEqual(result.status_code, 200, result.text)
                 tools = result.json()["result"]["tools"]
-                self.assertEqual(len(tools), 5)
+                self.assertEqual(len(tools), 6)
                 self.assertTrue(all(t["annotations"]["readOnlyHint"] for t in tools))
                 expected = self.reader.envelope({"database_readable": True})
                 with patch.object(self.reader, "status", return_value=expected):
@@ -327,6 +327,35 @@ class OAuthMCPTest(unittest.TestCase):
                 self.assertEqual(self.rpc("tools/list", token=token, client=after).status_code, 200)
         finally:
             after.__exit__(None, None, None)
+
+    def test_fixed_bearer_reads_real_etf_cache_with_no_refresh_or_writes(self):
+        from core import db
+        from tests.test_etf_kline import document, CODE, NOW
+        from services.etf_kline import TZ
+        import datetime as dt
+
+        _, lease, _ = db.claim_etf_kline_refresh(CODE, NOW.timestamp(), str(self.reader.db_path))
+        db.publish_etf_kline(CODE, lease, document(now=dt.datetime.now(TZ)), db_path=str(self.reader.db_path))
+        before = self.reader.db_path.read_bytes()
+        token = "kline-test-token-" + "k" * 32
+        config = replace(self.config, client_secret="", owner_password_hash="", redirect_uris=(), bearer_tokens=(token,))
+        client = self.open_client(config)
+        try:
+            with patch("services.etf_kline_feed.OfficialQuery", side_effect=AssertionError("network forbidden")):
+                result = self.rpc("tools/call", {"name": "get_kline_data", "arguments": {
+                    "code": CODE, "period": "15min", "limit": 3}}, token, client).json()["result"]
+            self.assertFalse(result.get("isError", False), result)
+            data = result["structuredContent"]
+            self.assertEqual(data["returned_samples"], 3)
+            self.assertEqual(data["code"], CODE)
+            self.assertTrue(all(b["is_closed"] for b in data["bars"]))
+            self.assertEqual(self.reader.db_path.read_bytes(), before)
+            invalid = self.rpc("tools/call", {"name": "get_kline_data", "arguments": {
+                "code": CODE, "period": "5min"}}, token, client).json()["result"]
+            self.assertTrue(invalid["isError"])
+            self.assertEqual(self.rpc("tools/call", {"name": "get_kline_data", "arguments": {"code": CODE}}, client=client).status_code, 401)
+        finally:
+            client.__exit__(None, None, None)
 
     def test_static_tokens_reject_weak_values_reused_oauth_secrets_and_partial_oauth(self):
         for tokens in (("short",), ("Bearer " + "x" * 43,), (self.config.client_secret,), ("x" * 300,)):

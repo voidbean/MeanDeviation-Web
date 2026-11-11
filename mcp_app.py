@@ -1,7 +1,7 @@
 """Isolated read-only MCP with personal Bearer keys and optional private OAuth."""
 import asyncio
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import parse_qs, urlsplit
 
 from mcp.server.auth.provider import construct_redirect_uri
@@ -162,6 +162,19 @@ def create_app(settings=None, reader=None):
     async def get_service_status() -> dict[str, object]:
         """读取数据库可读性、最新缓存时间和最新事件ID；不冒充主服务后台线程健康检查。"""
         return await read(reader.status)
+
+    @mcp.tool(**options)
+    async def get_kline_data(code: Annotated[str, Field(max_length=12)], period: Literal["D", "60min", "15min"] = "D",
+                             start_at: Annotated[str, Field(max_length=40)] | None = None,
+                             end_at: Annotated[str, Field(max_length=40)] | None = None,
+                             limit: Annotated[int, Field(ge=1, le=500)] = 300,
+                             cursor: Annotated[str, Field(max_length=2048)] | None = None,
+                             snapshot_id: Annotated[str, Field(max_length=64)] | None = None,
+                             closed_only: bool = True) -> dict[str, object]:
+        """只读ETF日线/60/15分钟缓存。先D再60min再15min，用snapshot_id保持同一复权快照。
+        bars仅含已确认收线；检查analysis_ready/stale/missing_reasons。warmup_bars供MA复算，forming不参与确认。
+        本工具不抓行情、不补库、不启动监控、不发买卖指令。"""
+        return await read(reader.kline, code, period, start_at, end_at, limit, cursor, snapshot_id, closed_only)
 
     app = mcp.streamable_http_app()
     if provider:

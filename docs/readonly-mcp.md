@@ -14,6 +14,9 @@
 | `get_portfolio_overview()` | 持仓、现金、缓存估值、盈亏；不含券商可卖数量 |
 | `get_watch_events(after_id=0, limit=30)` | 按 ID 升序读取提醒，单页最多100条，不标记已读 |
 | `get_service_status()` | 缓存最新日期、分钟快照时间、最新事件 ID、数据库可读性 |
+| `get_kline_data(code, period, ...)` | ETF D/60min/15min 独立缓存、前复权 SMA55/233 与原始审计字段；不抓行情 |
+
+ETF K 线需要显式运行独立采集器，详见 [ETF K线数据与验收边界](etf-kline-mcp.md)。未初始化或权限不足时明确返回未就绪，不从旧分钟报价表补造。
 
 所有工具均需 `stocks:read` 权限。没有写入工具、任意 SQL、下单、行情强制刷新或 AI 调用。
 业务数据库使用 SQLite `mode=ro` 和 `query_only`，不存在时不会创建文件；启用 OAuth 时独立的 OAuth 数据库需要写权限。
@@ -52,7 +55,7 @@ MCP_OWNER_PASSWORD_HASH=
 ```
 
 多个 Token 使用英文逗号分隔，每个32–256字符，仅含字母、数字、下划线或短横线。
-它们都只能调用同样的5个只读工具，没有写权限，不是用户/角色权限系统。
+它们都只能调用同样的6个只读工具，没有写权限，不是用户/角色权限系统。
 固定 Token 没有自动过期；从此列表删除对应值并重启 MCP 即撤销，其他 Token 不受影响。
 如仍需要 ChatGPT OAuth，可保留原来完整的 OAuth 三项，和固定 Token 同时生效；不能只保留半套 OAuth 配置。
 修改固定 Token 列表不会让已有 OAuth 授权失效。不要把 OAuth 客户端密钥复用为固定 Token。
@@ -88,7 +91,7 @@ EOF
 unset MCP_TEST_TOKEN
 ```
 
-上例使用 Bash 的 `read` 语法；可在服务器 Bash 终端执行。预期返回5个工具；无 Token 或错误 Token 应返回401。
+上例使用 Bash 的 `read` 语法；可在服务器 Bash 终端执行。预期返回6个工具；无 Token 或错误 Token 应返回401。
 后文第一节和第四节的 OAuth 配置，只在需要 OAuth 客户端时操作，**固定 Token 用户可跳过**。
 
 ## 一 可选的 OAuth 根环境配置

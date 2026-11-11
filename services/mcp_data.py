@@ -99,6 +99,14 @@ class SnapshotReader:
         with self.connect() as conn:
             return self.envelope(self._stock(conn, code))
 
+    def kline(self, code, period="D", start_at=None, end_at=None, limit=300,
+              cursor=None, snapshot_id=None, closed_only=True):
+        from services.etf_kline import read_kline_data
+        if not self.db_path.exists():
+            return read_kline_data(None, code, period, start_at, end_at, limit, cursor, snapshot_id, closed_only)
+        with self.connect() as conn:
+            return read_kline_data(conn, code, period, start_at, end_at, limit, cursor, snapshot_id, closed_only)
+
     def watchlist(self, offset=0, limit=30):
         if not 0 <= offset <= 10000 or not 1 <= limit <= 50:
             raise ValueError("offset 范围 0–10000，limit 范围 1–50")
